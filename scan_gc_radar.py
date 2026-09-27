@@ -245,7 +245,7 @@ def enrich_row_tier_category(row: dict, narrative_set: set, mcap_map: dict | Non
     row["category"] = primary
     row["categories"] = cats
     row["reason_tags"] = reason_tags(row, cats)
-    row["cat_tags"] = " ".join(row["reason_tags"])  # CAT display: "N C CR" (blank if none)
+    row["cat_tags"] = " ".join(row["reason_tags"])  # CAT display: "N C V" (blank if none)
     row["category_label"] = row["cat_tags"]  # same short codes (no long "Narrative + Cemetery" strings)
 
 
@@ -260,21 +260,37 @@ def _is_cemetery_1d(row: dict) -> bool:
         return False
 
 
-CAT_CODE_ORDER = ("N", "C", "CR")
-_LEGACY_CAT = {"NARRATIVE": "N", "Narrative": "N", "CEMETERY": "C", "Cemetery": "C", "P/CR": "CR"}
+CAT_CODE_ORDER = ("N", "C", "V")
+_LEGACY_CAT = {"NARRATIVE": "N", "Narrative": "N", "CEMETERY": "C", "Cemetery": "C"}
+
+
+def passes_volume_rule(row: dict) -> bool:
+    """V: passes the universe volume rule = HL dayNtlVlm >= MIN_DAY_NTL_VLM ($75k) AND open interest > 0 when known
+    (same floor as load_universe). Rows added only as Narrative/Cemetery below the floor, volume-pad fillers and
+    rows without dayNtlVlm get no V."""
+    try:
+        vlm = float(row.get("day_ntl_vlm"))
+    except (TypeError, ValueError):
+        return False
+    oi = row.get("open_interest")
+    try:
+        oi_ok = (not REQUIRE_OI_POSITIVE) or oi is None or float(oi) > 0
+    except (TypeError, ValueError):
+        oi_ok = True
+    return vlm >= MIN_DAY_NTL_VLM and oi_ok
 
 
 def reason_tags(row: dict, cats: Optional[List[str]] = None) -> List[str]:
     """CAT short codes (display only), fixed order: N (narrative watchlist), C (cemetery: >=70% below the 1D ATH;
-    4H/1H use the 1D status), CR (cemetery revival = C AND closed-bar dual_cross_up on this TF). Plain coins -> []."""
+    4H/1H use the 1D status), V (passes the universe volume rule, see passes_volume_rule). Plain coins -> []."""
     cats = cats if cats is not None else (row.get("categories") or [])
     tags = []
     if "Narrative" in cats:
         tags.append("N")
     if _is_cemetery_1d(row):
         tags.append("C")
-        if row.get("dual_cross_up"):
-            tags.append("CR")
+    if passes_volume_rule(row):
+        tags.append("V")
     return tags
 
 
