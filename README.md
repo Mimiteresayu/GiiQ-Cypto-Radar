@@ -281,7 +281,10 @@ Trimmed radar feed for public consumption (e.g., giiqquant site):
 | `EXEC_ENTRY_SLIPPAGE_PCT` | No | `0.5` | IOC entry limit = live mid × (1 + x%) (max 2) |
 | `EXEC_MAX_CANDIDATE_AGE_H` | No | `3` | Executor fails closed if candidates are older / not from today (HKT) / `stale` |
 | `OTR_SCHED_LOCK_WAIT_S` | No | `1200` | Scheduled jobs wait this long for the scan lock instead of skipping |
-| `DESK_DATA_CHUNK_BYTES` | No | `60000` | Max bytes per `[DESK_DATA]` log line before splitting into `[DESK_DATA i/n]` |
+| `DESK_DATA_CHUNK_BYTES` | No | `32000` | Max bytes per `[DESK_DATA]` log line before splitting into `[DESK_DATA i/n]` (32 KB lines verified intact in Railway logs) |
+| `OTR_LIVE_MINUTES` | No | `3-59/10` | APScheduler cron minutes (HKT) for the LIVE radar loop |
+| `OTR_LIVE_LOCK_WAIT_S` | No | `240` | LIVE loop waits this long for the scan lock, else skips one cycle |
+| `DESK_FULL_EVERY_S` | No | `3300` | A live cycle logs the FULL DESK_DATA set if none was logged for this long |
 
 **Existing variables:**
 - `COCKPIT_PASSWORD`: Password gate for UI and `/api/desk-data`
@@ -296,6 +299,19 @@ Trimmed radar feed for public consumption (e.g., giiqquant site):
 - **Hourly :07**: 1H scan + Small/Tiny exits + Hard SL align → `[DESK_DATA]`
 - **Every 4h :10** (00, 04, 08, 12, 16, 20 HKT): 4H scan + Mega/Large exits + Hard SL align → `[DESK_DATA]`
 - **08:55 HKT daily**: Auto-executor (executes approved candidates; fails closed without fresh candidates + approvals)
+- **Every 10 min (:03/:13/:23/:33/:43/:53 HKT)**: LIVE radar 1D/4H/1H (`live_radar.py`) → rebuild entry candidates
+  (ENTRY tab == `/api/ai/candidates`) → `[DESK_DATA]` (compact). First run ~30 s after boot; if a TF has no candle
+  cache yet it runs one closed-bar scan for it first (scan only — no exits, no orders).
+
+**LIVE vs CLOSED (SoT):** in `gc_radar_{tf}.json` the top-level row fields (`close/filter/upper/lower/trend/
+above_upper/dual_cross_up/dual_cross_down_filter/bar_time`) are the **last closed bar** and are the ONLY signal input
+(candidates Base/Chase, exits, Hard SL, executor). `row.live` = forming bar (`close/filter/upper/lower/trend/
+above_upper/cross_up/bar_time/forming`) — display only. Radar-level: `ts` (closed scan), `live_ts`,
+`closed_bar_open_ms`, `closed_bar_close_ms`, `forming_bar_open_ms`, `next_close_ms`, `live_breadth`, `live_flags`.
+The live loop costs ONE HL request (`allMids`): closed bars come from `out/candles_{tf}.json.gz` (written by every
+closed-bar scan) and the forming bar is updated with the mid (close=mid, high/low extended). Limit: forming-bar
+high/low are sampled every 10 min, so live GC is a close approximation until the closed-bar scan re-fetches the bar.
+The closed-bar scan jobs above are unchanged and also rebuild candidates after every 1H/4H scan.
 
 **Live execution (EXEC_DRY_RUN=0 + key):** isolated margin; set leverage (≤5x and ≤ coin maxLeverage) →
 IOC limit buy at live mid + slippage → reduce-only stop-market Hard SL for the filled size
@@ -303,8 +319,17 @@ IOC limit buy at live mid + slippage → reduce-only stop-market Hard SL for the
 Exits: reduce-only IOC close on primary exit, then SL triggers cancelled; held positions get their SL
 re-aligned (new SL placed before the old one is cancelled; never at/below liquidation).
 
-**`[DESK_DATA]` log line:** single-line `[DESK_DATA] {json}` on stdout with `ts`, `candidates` (today's, with
-tier/type/SL/size/lev/liq), `gc_radar_1d/4h/1h` (trimmed rows + breadth + flags.dual_cross_up), `hl_perp`, `hl_spot`.
+**`[DESK_DATA]` log line:** `[DESK_DATA] {json}` on stdout with `ts`, `event`, `kind` (`full`|`live`),
+`timing.{1d,4h,1h}` (HKT ISO: `closed_scan_ts`, `last_closed_bar_open`, `last_closed_bar_close`, `live_ts`,
+`forming_bar_open`, `next_close`, `next_closed_scan`, `next_live_update`), `candidates_meta`, `candidates` (today's,
+with tier/type/is_base/is_chase/entry_ref/SL/size/lev/liq), `entry_tab.{base,chase}` (ENTRY tab lists),
+`narrative` (NARRATIVE watchlist; compact on live), `hl_open_orders` (incl. `isTrigger/triggerPx/triggerCondition/
+reduceOnly/isPositionTpsl` for Hard SL checks), `hl_perp`, `hl_spot`, `gc_radar_1d/4h/1h` (rows: closed
+`close/filter/upper/lower/trend/dual_cross_up/dual_cross_down` + `live_close/live_filter/live_upper/live_lower/
+live_trend/live_above_upper/live_cross_up`; radar `breadth`/`flags` = closed, `live_breadth`/`live_flags` = live).
+**Volume:** `full` (all rows, ~185 KB → ~6–7 lines) after every closed-bar job (≥ hourly via 1H :07) and at least every
+`DESK_FULL_EVERY_S`; other 10-min live cycles log `live` (~6–10 KB, 1 line): rows only for focus symbols
+(candidates, positions, open-order coins, BTC/ETH, narrative tickers on HL; `focus_only: true`, `n_total`).
 If larger than `DESK_DATA_CHUNK_BYTES` it is split into self-contained `[DESK_DATA i/n] {json}` chunks sharing `ts`
 (big radars are split by rows with `rows_offset`; concatenate rows in part order).
 

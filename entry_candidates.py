@@ -183,6 +183,13 @@ def build_candidates(
             "lower_1d": lower_1d,
             "filter_4h": filter_4h,
             "lower_4h": lower_4h,
+            "upper_4h": r4h.get("upper") if r4h else None,
+            "close_4h": r4h.get("close") if r4h else None,
+            "category": r1d.get("category"),
+            "is_base": bool(base),
+            "is_chase": bool(chase),
+            # ENTRY ref: Base = 1D Upper, Chase = 4H Upper (closed bars)
+            "entry_ref": (r4h.get("upper") if (chase and r4h) else upper_1d),
             "hard_sl_dist_pct": hard_sl_dist_pct,
             "dayNtlVlm": day_ntl_vlm,
             "already_held": already_held,

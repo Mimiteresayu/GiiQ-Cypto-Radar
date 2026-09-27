@@ -18,7 +18,7 @@ import sys
 import threading
 import time
 import urllib.request as _url_req
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.cookies import SimpleCookie
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -61,7 +61,19 @@ _scan_lock = threading.Lock()
 # Scheduled jobs WAIT for the scan lock (instead of skipping) so e.g. the 08:05 1D+4H scan
 # never makes the 08:07 1H exit job skip.  Manual /api/rescan still returns 409 when busy.
 SCHED_LOCK_WAIT_S = int(os.environ.get("OTR_SCHED_LOCK_WAIT_S") or "1200")
-DESK_DATA_CHUNK_BYTES = int(os.environ.get("DESK_DATA_CHUNK_BYTES") or "60000")
+# 32000: largest line size verified intact in Railway logs (PR #8 check: 3x~32.8KB lines)
+DESK_DATA_CHUNK_BYTES = int(os.environ.get("DESK_DATA_CHUNK_BYTES") or "32000")
+# LIVE radar loop (APScheduler cron minutes, HKT). :03/:13/... sits after the :07 1H and
+# :10 4H closed-bar jobs so it never races them (it also takes the scan lock).
+LIVE_RADAR_MINUTES = (os.environ.get("OTR_LIVE_MINUTES") or "3-59/10").strip()
+LIVE_LOCK_WAIT_S = int(os.environ.get("OTR_LIVE_LOCK_WAIT_S") or "240")
+# DESK_DATA volume: full set on every closed-bar job + at least every DESK_FULL_EVERY_S;
+# other 10-min live cycles log a compact set (focus rows only).
+DESK_FULL_EVERY_S = int(os.environ.get("DESK_FULL_EVERY_S") or "3300")
+# Closed-bar job offset after bar close (min): 1H :07, 4H :10, 1D 08:05 HKT (= 00:05 UTC)
+CLOSED_SCAN_OFFSET_MIN = {"1h": 7, "4h": 10, "1d": 5}
+TF_BAR_MS = {"1h": 3600_000, "4h": 4 * 3600_000, "1d": 86400_000}
+HKT = timezone(timedelta(hours=8))
 SCHEDULER_STATUS_PATH = os.path.join(OUT_DIR, "scheduler_status.json")
 _last_scan: dict[str, str] = {}  # tf -> slot key
 _last_failsafe: str = ""  # last failsafe run slot key (hour)
@@ -80,6 +92,11 @@ from exec_common import (  # noqa: E402
     parse_ts,
     sig,
 )
+
+try:
+    import live_radar  # 10-min LIVE radar (display only; 1 HL request per cycle)
+except ImportError:
+    live_radar = None  # type: ignore
 
 try:
     from decisions import store_decisions, get_decisions_for_today
@@ -292,7 +309,21 @@ def _fetch_hl_live() -> dict:
             result[key] = {"error": str(e)}
             result["fetch_error"] = True
             sys.stderr.write(f"[HL_FETCH] {req_type} failed: {e}\n")
-    
+
+    # Open orders incl. trigger/reduce-only stops (Hard SL verification). Non-fatal.
+    try:
+        req = _url_req.Request(
+            HL_API_URL,
+            data=json.dumps({"type": "frontendOpenOrders", "user": HL_ADDRESS}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with _url_req.urlopen(req, timeout=15) as resp:
+            result["hl_open_orders"] = json.loads(resp.read())
+    except Exception as e:
+        result["hl_open_orders"] = {"error": str(e)}
+        sys.stderr.write(f"[HL_FETCH] frontendOpenOrders failed: {e}\n")
+
     return result
 
 
@@ -642,30 +673,6 @@ def _enhance_candidates(candidates: list, account: dict, meta: dict) -> list:
     return out
 
 
-_DESK_ROW_KEYS = ("symbol", "trend", "close", "filter", "upper", "lower")
-
-
-def _trim_radar(radar: dict) -> dict:
-    if not isinstance(radar, dict) or "rows" not in radar:
-        return {"error": (radar or {}).get("error", "missing") if isinstance(radar, dict) else "missing"}
-    rows = []
-    for r in radar.get("rows") or []:
-        row = {k: sig(r.get(k)) for k in _DESK_ROW_KEYS}
-        row["dual_cross_up"] = bool(r.get("dual_cross_up"))
-        row["dual_cross_down"] = bool(r.get("dual_cross_down_filter", r.get("dual_cross_down")))
-        row["tier"] = r.get("tier")
-        mc = r.get("mcap_usd", r.get("mcap"))
-        row["mcap"] = int(mc) if isinstance(mc, (int, float)) else None
-        rows.append(row)
-    return {
-        "ts": radar.get("ts"),
-        "n": len(rows),
-        "breadth": radar.get("breadth"),
-        "flags": {"dual_cross_up": (radar.get("flags") or {}).get("dual_cross_up", [])},
-        "rows": rows,
-    }
-
-
 def _trim_hl_perp(perp: dict) -> dict:
     if not isinstance(perp, dict) or "error" in perp:
         return {"error": (perp or {}).get("error", "missing") if isinstance(perp, dict) else "missing"}
@@ -705,8 +712,187 @@ def _trim_hl_spot(spot: dict) -> dict:
     return {"usdc_total": 0.0, "usdc_hold": 0.0}
 
 
-def _build_desk_data_payload(event: str = "", now: datetime | None = None) -> dict:
-    """Compact desk snapshot for the [DESK_DATA] log line."""
+_DESK_ROW_KEYS = ("symbol", "trend", "close", "filter", "upper", "lower")
+_DESK_LIVE_KEYS = ("close", "filter", "upper", "lower", "trend", "above_upper", "cross_up")
+
+
+def _hkt_iso(ms) -> str | None:
+    """epoch ms (UTC) -> ISO string in HKT (+08:00)."""
+    if not isinstance(ms, (int, float)):
+        return None
+    return datetime.fromtimestamp(ms / 1000, tz=HKT).isoformat(timespec="seconds")
+
+
+def _next_live_update(now: datetime) -> str:
+    """Next LIVE radar cron slot (default :03/:13/…/:53 HKT)."""
+    try:
+        start, step = LIVE_RADAR_MINUTES.split("/")[0].split("-")[0], LIVE_RADAR_MINUTES.split("/")[1]
+        mins = list(range(int(start), 60, int(step)))
+    except Exception:
+        mins = list(range(3, 60, 10))
+    t = now.astimezone(HKT).replace(second=0, microsecond=0)
+    for _ in range(0, 120):
+        t += timedelta(minutes=1)
+        if t.minute in mins:
+            return t.isoformat(timespec="seconds")
+    return t.isoformat(timespec="seconds")
+
+
+def _tf_timing(tf: str, radar: dict, now: datetime) -> dict:
+    """Per-TF timestamps (HKT ISO): closed-bar scan + bar, live scan, next close / updates."""
+    bar_ms = TF_BAR_MS[tf]
+    now_ms = int(now.timestamp() * 1000)
+    closed_open = radar.get("closed_bar_open_ms") if isinstance(radar, dict) else None
+    if closed_open is None and isinstance(radar, dict):
+        bts = [r.get("bar_time") for r in radar.get("rows") or [] if isinstance(r.get("bar_time"), int)]
+        closed_open = max(bts) if bts else None
+    forming = now_ms - now_ms % bar_ms
+    nxt = forming + bar_ms
+    ts_dt = parse_ts((radar or {}).get("ts")) if isinstance(radar, dict) else None
+    live_dt = parse_ts((radar or {}).get("live_ts")) if isinstance(radar, dict) else None
+    return {
+        "closed_scan_ts": ts_dt.astimezone(HKT).isoformat(timespec="seconds") if ts_dt else None,
+        "last_closed_bar_open": _hkt_iso(closed_open),
+        "last_closed_bar_close": _hkt_iso(closed_open + bar_ms) if closed_open else None,
+        "live_ts": live_dt.astimezone(HKT).isoformat(timespec="seconds") if live_dt else None,
+        "forming_bar_open": _hkt_iso(forming),
+        "next_close": _hkt_iso(nxt),
+        "next_closed_scan": _hkt_iso(nxt + CLOSED_SCAN_OFFSET_MIN[tf] * 60_000),
+        "next_live_update": _next_live_update(now),
+    }
+
+
+def _trim_radar(radar: dict, focus: set | None = None) -> dict:
+    """Radar for DESK_DATA. Row keys w/o prefix = LAST CLOSED bar (signal SoT);
+    live_* = forming bar (display only). focus: keep only these symbols (compact log)."""
+    if not isinstance(radar, dict) or "rows" not in radar:
+        return {"error": (radar or {}).get("error", "missing") if isinstance(radar, dict) else "missing"}
+    rows = []
+    for r in radar.get("rows") or []:
+        if focus is not None and r.get("symbol") not in focus:
+            continue
+        row = {k: sig(r.get(k)) for k in _DESK_ROW_KEYS}
+        row["dual_cross_up"] = bool(r.get("dual_cross_up"))
+        row["dual_cross_down"] = bool(r.get("dual_cross_down_filter", r.get("dual_cross_down")))
+        row["tier"] = r.get("tier")
+        mc = r.get("mcap_usd", r.get("mcap"))
+        row["mcap"] = int(mc) if isinstance(mc, (int, float)) else None
+        lv = r.get("live") if isinstance(r.get("live"), dict) else {}
+        for k in _DESK_LIVE_KEYS:
+            v = lv.get(k)
+            row[f"live_{k}"] = sig(v) if isinstance(v, float) else v
+        rows.append(row)
+    out = {
+        "ts": radar.get("ts"),
+        "closed_bar_open": _hkt_iso(radar.get("closed_bar_open_ms")),
+        "live_ts": radar.get("live_ts"),
+        "n": len(rows),
+        "breadth": radar.get("breadth"),
+        "live_breadth": radar.get("live_breadth"),
+        "flags": {"dual_cross_up": (radar.get("flags") or {}).get("dual_cross_up", [])},
+        "live_flags": {"cross_up": (radar.get("live_flags") or {}).get("cross_up", [])},
+        "rows": rows,
+    }
+    if focus is not None:
+        out["focus_only"] = True
+        out["n_total"] = len(radar.get("rows") or [])
+    return out
+
+
+def _trim_open_orders(orders) -> list | dict:
+    """HL frontendOpenOrders -> compact list (trigger/reduce-only stops kept for Hard SL checks)."""
+    if isinstance(orders, dict):
+        return {"error": orders.get("error", "missing")}
+    out = []
+    for o in orders or []:
+        out.append({
+            "coin": o.get("coin"),
+            "side": o.get("side"),
+            "sz": o.get("sz"),
+            "limitPx": o.get("limitPx"),
+            "orderType": o.get("orderType"),
+            "isTrigger": o.get("isTrigger"),
+            "triggerPx": o.get("triggerPx"),
+            "triggerCondition": o.get("triggerCondition"),
+            "reduceOnly": o.get("reduceOnly"),
+            "isPositionTpsl": o.get("isPositionTpsl"),
+            "tif": o.get("tif"),
+            "oid": o.get("oid"),
+            "timestamp": o.get("timestamp"),
+        })
+    return out
+
+
+def _load_candidates_file() -> dict:
+    try:
+        with open(os.path.join(OUT_DIR, "entry_candidates_latest.json")) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+_ENTRY_TAB_KEYS = ("symbol", "tier", "category", "trend_1d", "trend_4h", "close_1d", "upper_1d",
+                   "filter_1d", "close_4h", "upper_4h", "filter_4h", "lower_4h", "entry_ref", "hard_sl_dist_pct")
+
+
+def _entry_tab(cd: dict) -> dict:
+    """ENTRY tab lists (same source as /api/ai/candidates: entry_candidates_latest.json)."""
+    base, chase = [], []
+    for c in cd.get("candidates") or []:
+        row = {k: (sig(c.get(k)) if isinstance(c.get(k), float) else c.get(k)) for k in _ENTRY_TAB_KEYS}
+        is_chase = c.get("is_chase", c.get("type") == "Chase")
+        is_base = c.get("is_base", c.get("type") == "Base")
+        if is_base:
+            base.append(row)
+        if is_chase:
+            chase.append(row)
+    return {"generated_at": cd.get("generated_at"), "base": base, "chase": chase}
+
+
+def _load_narrative(radar_1d: dict | None = None) -> dict:
+    """NARRATIVE tab watchlist (out/narrative_watchlist.json) + Bitunix 1D GC / HL 1D radar row."""
+    try:
+        with open(os.path.join(OUT_DIR, "narrative_watchlist.json")) as f:
+            wl = json.load(f)
+    except Exception as e:
+        return {"error": str(e), "items": []}
+    gc_by: dict = {}
+    try:
+        with open(os.path.join(OUT_DIR, "bitunix_gc_1d.json")) as f:
+            for g in (json.load(f) or {}).get("items") or []:
+                if g.get("ticker"):
+                    gc_by[str(g["ticker"]).upper()] = g
+    except Exception:
+        pass
+    hl_by = {r.get("symbol"): r for r in (radar_1d or {}).get("rows") or []} if isinstance(radar_1d, dict) else {}
+    items = []
+    for it in wl.get("items") or []:
+        t = str(it.get("ticker") or "").upper()
+        g = gc_by.get(t) or {}
+        h = hl_by.get(t) or {}
+        items.append({
+            "ticker": t,
+            "sector": it.get("sector"),
+            "venue": it.get("venue"),
+            "gc_scan": it.get("gc_scan"),
+            "narrative": (it.get("narrative") or "")[:80],
+            "last_seen": it.get("last_seen"),
+            "on_hl": bool(h),
+            "trend_1d": h.get("trend") or g.get("trend"),
+            "close_1d": sig(h.get("close") if h else g.get("close")),
+            "upper_1d": sig(h.get("upper") if h else g.get("upper")),
+            "dual_cross_up_1d": bool(h.get("dual_cross_up") if h else g.get("dual_cross_up")),
+        })
+    return {"updated": wl.get("updated"), "n": len(items), "items": items}
+
+
+def _build_desk_data_payload(event: str = "", now: datetime | None = None, kind: str = "full") -> dict:
+    """Desk snapshot for the [DESK_DATA] log line(s).
+
+    kind="full": all radar rows (closed + live_*) + narrative.
+    kind="live": compact — radar rows only for focus symbols (candidates, positions, open
+    orders, BTC/ETH, narrative tickers on HL); everything else identical.
+    """
     now = now or datetime.now(timezone.utc)
     radars = {}
     for tf in ("1d", "4h", "1h"):
@@ -723,39 +909,60 @@ def _build_desk_data_payload(event: str = "", now: datetime | None = None) -> di
 
     cands: list = []
     cand_meta: dict = {"generated_at": None, "stale": None, "today": False}
+    cd = _load_candidates_file()
     try:
-        with open(os.path.join(OUT_DIR, "entry_candidates_latest.json")) as f:
-            cd = json.load(f)
-        gen = parse_ts(cd.get("generated_at"))
-        cand_meta = {"generated_at": cd.get("generated_at"), "stale": cd.get("stale"),
-                     "today": bool(gen and hkt_date(gen) == hkt_date(now))}
-        if cand_meta["today"]:
-            for c in _enhance_candidates(cd.get("candidates") or [], account, _get_hl_meta_cached()):
-                cands.append({
-                    "symbol": c.get("symbol"), "type": c.get("type"), "tier": c.get("tier"),
-                    "trend_1d": c.get("trend_1d"), "trend_4h": c.get("trend_4h"),
-                    "close": sig(c.get("close_1d")), "hard_sl": sig(c.get("hard_sl")),
-                    "hard_sl_label": c.get("hard_sl_label"), "sl_pct": sig(c.get("hard_sl_dist_pct"), 4),
-                    "size_pct": c.get("suggested_size_pct"), "lev": c.get("suggested_leverage"),
-                    "max_lev": c.get("coin_max_leverage"), "liq": sig(c.get("estimated_liq_price")),
-                    "liq_beyond_sl": c.get("liq_beyond_sl"), "held": c.get("already_held"),
-                })
-    except FileNotFoundError:
-        pass
+        if cd:
+            gen = parse_ts(cd.get("generated_at"))
+            cand_meta = {"generated_at": cd.get("generated_at"), "stale": cd.get("stale"),
+                         "today": bool(gen and hkt_date(gen) == hkt_date(now)),
+                         "radar_1d_asof": cd.get("radar_1d_asof"), "radar_4h_asof": cd.get("radar_4h_asof"),
+                         "count": cd.get("count")}
+            if cand_meta["today"]:
+                for c in _enhance_candidates(cd.get("candidates") or [], account, _get_hl_meta_cached()):
+                    cands.append({
+                        "symbol": c.get("symbol"), "type": c.get("type"), "tier": c.get("tier"),
+                        "is_base": c.get("is_base"), "is_chase": c.get("is_chase"),
+                        "trend_1d": c.get("trend_1d"), "trend_4h": c.get("trend_4h"),
+                        "close": sig(c.get("close_1d")), "entry_ref": sig(c.get("entry_ref")),
+                        "hard_sl": sig(c.get("hard_sl")),
+                        "hard_sl_label": c.get("hard_sl_label"), "sl_pct": sig(c.get("hard_sl_dist_pct"), 4),
+                        "size_pct": c.get("suggested_size_pct"), "lev": c.get("suggested_leverage"),
+                        "max_lev": c.get("coin_max_leverage"), "liq": sig(c.get("estimated_liq_price")),
+                        "liq_beyond_sl": c.get("liq_beyond_sl"), "held": c.get("already_held"),
+                    })
     except Exception as e:
         cand_meta["error"] = str(e)
 
-    return {
+    perp = _trim_hl_perp(hl_data.get("hl_perp", {}))
+    orders = _trim_open_orders(hl_data.get("hl_open_orders", {"error": "not fetched"}))
+    narrative = _load_narrative(radars.get("1d"))
+    focus = None
+    if kind != "full":
+        focus = {"BTC", "ETH"} | {c.get("symbol") for c in cd.get("candidates") or []}
+        focus |= {p.get("coin") for p in perp.get("positions") or []} if isinstance(perp, dict) else set()
+        focus |= {o.get("coin") for o in orders} if isinstance(orders, list) else set()
+        focus |= {i["ticker"] for i in narrative.get("items") or [] if i.get("on_hl")}
+
+    payload = {
         "ts": now.isoformat(),
         "event": event,
+        "kind": kind,
+        "timing": {tf: _tf_timing(tf, radars[tf], now) for tf in ("1d", "4h", "1h")},
         "candidates_meta": cand_meta,
         "candidates": cands,
+        "entry_tab": _entry_tab(cd) if cand_meta.get("today") else {"generated_at": cd.get("generated_at"), "base": [], "chase": []},
         "hl_spot": _trim_hl_spot(hl_data.get("hl_spot", {})),
-        "hl_perp": _trim_hl_perp(hl_data.get("hl_perp", {})),
-        "gc_radar_1d": _trim_radar(radars["1d"]),
-        "gc_radar_4h": _trim_radar(radars["4h"]),
-        "gc_radar_1h": _trim_radar(radars["1h"]),
+        "hl_perp": perp,
+        "hl_open_orders": orders,
     }
+    if kind == "full":
+        payload["narrative"] = narrative
+    else:
+        payload["narrative"] = {"updated": narrative.get("updated"), "n": narrative.get("n"),
+                                "dual_cross_up_1d": [i["ticker"] for i in narrative.get("items") or [] if i.get("dual_cross_up_1d")]}
+    for tf in ("1d", "4h", "1h"):
+        payload[f"gc_radar_{tf}"] = _trim_radar(radars[tf], focus)
+    return payload
 
 
 def _dumps(obj: dict) -> str:
@@ -815,10 +1022,18 @@ def _desk_data_lines(payload: dict, max_bytes: int | None = None) -> list:
     return [f"[DESK_DATA {i}/{n}] " + _dumps({"ts": ts, "part": i, "parts": n, **c}) for i, c in enumerate(chunks, 1)]
 
 
-def _log_desk_data(event: str = "") -> None:
-    """Emit the [DESK_DATA] JSON line(s) to stdout (Railway deploy logs)."""
+_last_full_desk = {"t": 0.0}
+
+
+def _log_desk_data(event: str = "", kind: str = "full") -> None:
+    """Emit the [DESK_DATA] JSON line(s) to stdout (Railway deploy logs).
+    kind="live" is upgraded to "full" if no full set was logged for DESK_FULL_EVERY_S."""
     try:
-        for line in _desk_data_lines(_build_desk_data_payload(event)):
+        if kind != "full" and time.time() - _last_full_desk["t"] > DESK_FULL_EVERY_S:
+            kind = "full"
+        if kind == "full":
+            _last_full_desk["t"] = time.time()
+        for line in _desk_data_lines(_build_desk_data_payload(event, kind=kind)):
             sys.stdout.write(line + "\n")
         sys.stdout.flush()
     except Exception as e:
@@ -926,6 +1141,9 @@ def _scan_and_exits(job_name: str, tf: str, max_symbols: int, exit_arg: str, man
             _update_job_status(job_name, "error", "", note)
             sys.stderr.write(f"[SCHEDULER] {job_name} scan failed: {note[:200]}\n")
             return
+        # Keep ENTRY tab == AI candidates list (never stale/empty while radar is fresh)
+        count = _generate_entry_candidates()
+        note = f"{note}; candidates={count}"
         try:
             rc, out, err = _run_worker("exit_worker.py", [exit_arg], timeout=300, force_dry_run=manual)
         except Exception as e:
@@ -961,6 +1179,47 @@ def _scheduled_4h_scan_exits(manual: bool = False) -> None:
     _scan_and_exits("manual_4h_scan_exits" if manual else "4h_scan_exits", "4h", SCAN_MAX, "4h", manual)
 
 
+def _candles_cache_missing() -> list:
+    return [tf for tf in ("1d", "4h", "1h") if not os.path.isfile(os.path.join(OUT_DIR, f"candles_{tf}.json.gz"))]
+
+
+def _scheduled_live_radar(manual: bool = False) -> None:
+    """Every 10 min (:03/:13/… HKT): LIVE radar for 1D/4H/1H from allMids (1 HL request) on
+    top of the cached closed bars, then regenerate entry candidates (ENTRY == AI list) and log
+    [DESK_DATA] (compact, or full if a boot scan ran / none logged for DESK_FULL_EVERY_S).
+    Boot: any TF without a candle cache gets one closed-bar scan first (no exits/orders).
+    Closed-bar signals are untouched (top-level row fields)."""
+    job_name = "manual_live_radar" if manual else "live_radar"
+    if live_radar is None:
+        _update_job_status(job_name, "error", "", "live_radar module missing")
+        return
+    if not _scan_lock.acquire(timeout=LIVE_LOCK_WAIT_S):
+        _update_job_status(job_name, "skipped", f"scan lock busy > {LIVE_LOCK_WAIT_S}s")
+        return
+    kind = "live"
+    try:
+        boot = []
+        for tf in _candles_cache_missing():
+            ok, note = _run_scan([tf], max_symbols=SCAN_MAX_1H if tf == "1h" else SCAN_MAX)
+            boot.append(f"{tf}:{'ok' if ok else 'fail'}")
+            sys.stderr.write(f"[LIVE] boot closed-bar scan {tf} ok={ok} {note[:200]}\n")
+            kind = "full"
+        res = live_radar.refresh_live()
+        count = _generate_entry_candidates()
+        parts = [f"{tf}={r.get('n_live', 0)}/{r.get('n_rows', 0)}" if r.get("ok") else f"{tf}=ERR({r.get('error', '')[:60]})"
+                 for tf, r in (res.get("tfs") or {}).items()]
+        msg = (f"live mids={res.get('n_mids')} {' '.join(parts)} in {res.get('elapsed_s')}s; candidates={count}"
+               + (f"; boot_scan={','.join(boot)}" if boot else ""))
+        _update_job_status(job_name, "success" if res.get("ok") else "partial", msg)
+        sys.stderr.write(f"[LIVE] {msg}\n")
+    except Exception as e:
+        _update_job_status(job_name, "error", "", str(e))
+        sys.stderr.write(f"[LIVE] exception: {e}\n")
+    finally:
+        _scan_lock.release()
+    _log_desk_data(job_name, kind=kind)
+
+
 def _scheduled_executor(manual: bool = False) -> None:
     """08:55 HKT: execute AI-approved candidates (manual runs are always DRY_RUN)."""
     job_name = "manual_executor" if manual else "executor"
@@ -992,6 +1251,7 @@ MANUAL_JOBS = {
     "1h": _scheduled_1h_scan_exits,
     "4h": _scheduled_4h_scan_exits,
     "executor": _scheduled_executor,
+    "live": _scheduled_live_radar,
 }
 _manual_running: set = set()
 _manual_lock = threading.Lock()
@@ -1017,6 +1277,23 @@ def _start_manual_job(job: str) -> tuple[bool, str]:
     return True, "started"
 
 
+_SCHED_REF: dict = {}
+
+
+def _next_runs() -> dict:
+    s = _SCHED_REF.get("s")
+    if not s:
+        return {}
+    out = {}
+    try:
+        for j in s.get_jobs():
+            nrt = getattr(j, "next_run_time", None)
+            out[j.id] = nrt.astimezone(HKT).isoformat(timespec="seconds") if nrt else None
+    except Exception:
+        pass
+    return out
+
+
 def _init_scheduler() -> BackgroundScheduler | None:
     """APScheduler cron jobs (Asia/Hong_Kong):
     08:05 1D+4H scan + candidates · hourly :07 1H + Small/Tiny exits ·
@@ -1040,13 +1317,19 @@ def _init_scheduler() -> BackgroundScheduler | None:
                           id="4h_scan_exits", name="4H Scan + Mega/Large Exits", **common)
         scheduler.add_job(_scheduled_executor, CronTrigger(hour=8, minute=55, timezone=hkt),
                           id="executor", name="Auto-Executor", **common)
+        # LIVE radar every 10 min; first run ~30s after boot (does boot scans if cache missing)
+        scheduler.add_job(_scheduled_live_radar, CronTrigger(minute=LIVE_RADAR_MINUTES, timezone=hkt),
+                          id="live_radar", name="LIVE radar 1D/4H/1H + candidates sync",
+                          next_run_time=datetime.now(hkt) + timedelta(seconds=30), **common)
         scheduler.start()
+        _SCHED_REF["s"] = scheduler
         sys.stderr.write(
             "[SCHEDULER] APScheduler started (Asia/Hong_Kong)\n"
             "  - 08:05 HKT: 1D+4H scan + entry candidates\n"
             "  - Hourly :07: 1H scan + Small/Tiny exits\n"
             "  - Every 4h :10: 4H scan + Mega/Large exits\n"
             "  - 08:55 HKT: Auto-executor\n"
+            f"  - cron minute {LIVE_RADAR_MINUTES}: LIVE radar 1D/4H/1H + candidates sync + DESK_DATA\n"
         )
         return scheduler
     except Exception as e:
@@ -1380,7 +1663,12 @@ class Handler(SimpleHTTPRequestHandler):
         positions = _compute_positions_with_stops(hl_data, radar_1h or {}, radar_4h or {})
         result["positions"] = positions
         
-        # 5) Scheduler status (if enabled)
+        # 5) ENTRY tab list = entry_candidates_latest.json (same source as /api/ai/candidates)
+        cd = _load_candidates_file()
+        result["entry_candidates"] = cd
+        result["entry_tab"] = _entry_tab(cd)
+
+        # 6) Scheduler status (if enabled)
         if SCHEDULER_ENABLED:
             result["scheduler"] = _get_scheduler_status()
         
@@ -1548,6 +1836,7 @@ class Handler(SimpleHTTPRequestHandler):
         self._send_json(200, {
             "enabled": True,
             "jobs": status,
+            "next_runs_hkt": _next_runs(),
             "ts": datetime.now(timezone.utc).isoformat(),
         })
 
