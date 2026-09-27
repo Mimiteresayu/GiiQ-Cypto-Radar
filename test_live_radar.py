@@ -150,7 +150,7 @@ class TestDeskDataLiveFields(unittest.TestCase):
         self.assertEqual(p["narrative"]["items"][0]["venue"], "HL")
         self.assertEqual(p["narrative"]["items"][1]["venue"], "bitunix")  # non-HL ticker kept
         self.assertFalse(p["narrative"]["items"][1]["on_hl"])
-        self.assertEqual(row["cat"], "Narrative + Cemetery")
+        self.assertEqual(row["cat"], "N C")
 
     def test_live_payload_is_compact_focus(self):
         p = self.serve._build_desk_data_payload("live_radar", now=self.now, kind="live")
@@ -333,18 +333,22 @@ class TestReasonTagsAndCemetery(unittest.TestCase):
     def test_reason_tags(self):
         r = {"symbol": "X", "dual_cross_up": True, "drop_from_ath_pct": 80, "in_floor": True}
         sgr.enrich_row_tier_category(r, {"X"}, {})
-        self.assertEqual(r["cat_tags"], "NARRATIVE, CEMETERY, GC, P/CR")
+        self.assertEqual(r["cat_tags"], "N C CR")
+        self.assertEqual(r["category_label"], "N C CR")
         r2 = {"symbol": "Y", "dual_cross_up": False, "drop_from_ath_pct": 90, "in_floor": False}
         sgr.enrich_row_tier_category(r2, set(), {})
-        self.assertEqual(r2["reason_tags"], ["CEMETERY"])
-        r3 = {"symbol": "Z", "dual_cross_up": True, "drop_from_ath_pct": 40}  # GC but not cemetery -> no P/CR
+        self.assertEqual(r2["reason_tags"], ["C"])
+        r3 = {"symbol": "Z", "dual_cross_up": True, "drop_from_ath_pct": 40}  # GC but not cemetery -> blank
         sgr.enrich_row_tier_category(r3, set(), {})
-        self.assertEqual(r3["cat_tags"], "GC")
+        self.assertEqual(r3["cat_tags"], "")
         r4 = {"symbol": "W", "dual_cross_up": True, "drop_from_ath_pct": 10, "cemetery_1d": True}  # 4H row, 1D cem
         sgr.enrich_row_tier_category(r4, set(), {})
-        self.assertEqual(r4["cat_tags"], "CEMETERY, GC, P/CR")
+        self.assertEqual(r4["cat_tags"], "C CR")
         r5 = {"symbol": "V", "dual_cross_up": True, "drop_from_ath_pct": 90, "cemetery_1d": False}  # 1D not cem
-        self.assertNotIn("P/CR", sgr.reason_tags(r5, []))
+        self.assertEqual(sgr.reason_tags(r5, []), [])
+        self.assertEqual(sgr.cat_codes({"cat_tags": "NARRATIVE, CEMETERY, GC, P/CR"}), "N C CR")
+        self.assertEqual(sgr.cat_codes({"categories": ["Narrative", "Cemetery"]}), "N C")
+        self.assertEqual(sgr.cat_codes({"categories": ["Price"]}), "")
 
     def test_1d_probe_keeps_only_cemetery_or_narrative(self):
         tmp = tempfile.mkdtemp()
@@ -361,8 +365,8 @@ class TestReasonTagsAndCemetery(unittest.TestCase):
             p = sgr.scan_tf("1d", ["A"], "test", concurrency=1, universe_meta=meta)
         by = {r["symbol"]: r for r in p["rows"]}
         self.assertEqual(set(by), {"A", "LOWCEM"})
-        self.assertEqual(by["LOWCEM"]["cat_tags"], "CEMETERY")
-        self.assertNotIn("P/CR", by["A"]["cat_tags"])  # no volume-floor tag
+        self.assertEqual(by["LOWCEM"]["cat_tags"], "C")
+        self.assertEqual(by["A"]["cat_tags"], "")  # plain coin -> blank
         self.assertEqual(p["cemetery_forced"], ["LOWCEM"])
 
     def test_live_sync_adds_cemetery_on_4h(self):
@@ -379,6 +383,6 @@ class TestReasonTagsAndCemetery(unittest.TestCase):
             self.assertEqual(res["added"], ["DEAD"])
             row = [r for r in radar["rows"] if r["symbol"] == "DEAD"][0]
             self.assertTrue(row["cemetery_forced"])
-            self.assertEqual(row["reason_tags"], ["CEMETERY"])
+            self.assertEqual(row["reason_tags"], ["C"])
             res1d = live_radar.sync_narrative("1d", {"rows": []}, {}, {})
             self.assertEqual(res1d["added"], [])  # 1D cemetery comes from the probe scan

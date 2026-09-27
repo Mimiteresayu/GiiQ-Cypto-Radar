@@ -329,9 +329,10 @@ SPX6900→SPX`, …) → `k`+symbol. Radar JSON: `narrative_map` {ticker: HL nam
 
 **Cemetery-only coins:** the 1D scan also probes every other live HL perp below the floor/max and keeps rows that are
 Cemetery (≥70% below ATH) or Narrative; 4H/1H scans and the live loop force-include the last 1D cemetery set
-(`cemetery_forced`, `cemetery_1d`). **CAT column / `cat_tags`** (`reason_tags` list, display only): `NARRATIVE`
-(watchlist), `CEMETERY` (1D cemetery status), `GC` (closed-bar dual_cross_up on that TF), `P/CR` (cemetery ignition =
-Primary + Cemetery Revival: 1D ↓ATH% ≥ 70 AND closed-bar dual_cross_up on that TF; 4H/1H use the 1D cemetery status), e.g. `NARRATIVE, CEMETERY, GC, P/CR`.
+(`cemetery_forced`, `cemetery_1d`). **CAT column** (`cat_tags` string = `category_label` = DESK_DATA `cat`; `reason_tags` list; display only): short codes,
+fixed order, space-separated, blank if none: `N` (narrative watchlist), `C` (cemetery: ≥70% below the 1D ATH; 4H/1H use the
+1D status), `CR` (cemetery revival = C AND closed-bar dual_cross_up on that TF), e.g. `N C CR`. `category`/`categories`
+(Narrative/Cemetery/Price) are kept unchanged as machine fields; "Price" is just the default (neither N nor C) and is not shown.
 
 **Live execution (EXEC_DRY_RUN=0 + key):** isolated margin; set leverage (≤5x and ≤ coin maxLeverage) →
 IOC limit buy at live mid + slippage → reduce-only stop-market Hard SL for the filled size
