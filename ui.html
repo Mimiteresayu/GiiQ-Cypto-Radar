@@ -360,6 +360,8 @@
   .bool-n   { color: #3a4656; }
   .bool-bad { color: var(--red); }
 
+  .closed-col { background: rgba(120,120,160,0.08); }
+  .tf-time { font-size: 0.72rem; color: var(--muted); }
   /* ───── ENTRY tab ───── */
   .entry-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
   @media (max-width: 900px) { .entry-grid { grid-template-columns: 1fr; } }
@@ -671,15 +673,16 @@
           <th data-k="symbol">Symbol <span class="arrow">↕</span></th>
           <th data-k="tier">Tier <span class="arrow">↕</span></th>
           <th data-k="category">Cat <span class="arrow">↕</span></th>
-          <th data-k="trend">Trend <span class="arrow">↕</span></th>
-          <th data-k="close">Close <span class="arrow">↕</span></th>
-          <th data-k="filter">Filter <span class="arrow">↕</span></th>
-          <th data-k="upper">Upper <span class="arrow">↕</span></th>
-          <th data-k="lower">Lower <span class="arrow">↕</span></th>
-          <th data-k="above_upper">Above Upper <span class="arrow">↕</span></th>
-          <th data-k="dual_cross_up">Cross Up <span class="arrow">↕</span></th>
+          <th data-k="lv_trend" title="forming bar (live)">Trend·live <span class="arrow">↕</span></th>
+          <th data-k="lv_close" title="live price">Close·live <span class="arrow">↕</span></th>
+          <th data-k="lv_filter">Filter·live <span class="arrow">↕</span></th>
+          <th data-k="lv_upper">Upper·live <span class="arrow">↕</span></th>
+          <th data-k="lv_lower">Lower·live <span class="arrow">↕</span></th>
+          <th data-k="lv_above_upper">Above·live <span class="arrow">↕</span></th>
           <th data-k="upper_status">Upper Status <span class="arrow">↕</span></th>
-          <th data-k="dual_cross_down_filter">Cross Down <span class="arrow">↕</span></th>
+          <th data-k="trend" class="closed-col" title="LAST CLOSED bar — signal input">Trend·closed <span class="arrow">↕</span></th>
+          <th data-k="dual_cross_up" class="closed-col" title="LAST CLOSED bar — signal input">Cross Up·closed <span class="arrow">↕</span></th>
+          <th data-k="dual_cross_down_filter" class="closed-col" title="LAST CLOSED bar — signal input">Cross Dn·closed <span class="arrow">↕</span></th>
           <th data-k="rvol">RVOL <span class="arrow">↕</span></th>
           <th data-k="mom_score">mom_score <span class="arrow">↕</span></th>
           <th data-k="mom_rank">mom_rank <span class="arrow">↕</span></th>
@@ -822,6 +825,28 @@
   }
 
   // ── Canvas helpers ─────────────────────────────────────────────────────
+  // HKT HH:MM from epoch ms or ISO string
+  function hktHM(v) {
+    if (v == null) return "—";
+    const d = typeof v === "number" ? new Date(v) : new Date(v);
+    if (isNaN(d)) return "—";
+    return d.toLocaleTimeString("en-GB",{timeZone:"Asia/Hong_Kong",hour:"2-digit",minute:"2-digit",hour12:false});
+  }
+  const TF_BAR_MS = {"1h":3600e3,"4h":4*3600e3,"1d":86400e3};
+  // "live @ HH:MM · closed HH:MM · next close HH:MM" (all HKT). closed = close time of last closed bar.
+  function tfTiming(tf) {
+    const d = radar[tf];
+    if (!d) return "—";
+    const bar = TF_BAR_MS[tf];
+    const now = Date.now();
+    const nextClose = now - (now % bar) + bar;
+    const closedOpen = d.closed_bar_open_ms != null ? d.closed_bar_open_ms
+      : (Array.isArray(d.rows) && d.rows.length ? Math.max(...d.rows.map(r=>r.bar_time||0)) : null);
+    const closedClose = closedOpen ? closedOpen + bar : null;
+    return `live @ ${hktHM(d.live_ts||d.ts)} · last closed bar ${hktHM(closedClose)} / next close ${hktHM(nextClose)} HKT`;
+  }
+  function liveOf(r) { return (r && r.live) || {}; }
+
   function drawDonut(canvas, parts) {
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
@@ -917,8 +942,10 @@
       const ts = d && d.ts;
       const span = el("fr"+tf);
       if (!span) return;
-      span.textContent = ts ? ageStr(ts) : "—";
-      span.className = ts ? ageCls(ts, tf==="1d"?1200:25, tf==="1d"?2880:90) : "err";
+      const lts = d && (d.live_ts || d.ts);
+      span.textContent = d ? tfTiming(tf) : "—";
+      span.title = ts ? "closed-bar scan "+ageStr(ts) : "";
+      span.className = lts ? ageCls(lts, 15, 40) : "err";
     });
     
     // HL data freshness
@@ -943,6 +970,7 @@
   async function fullRefresh() {
     refreshTimer = REFRESH_MS/1000;
     await Promise.all([refreshAllRadar(), refreshDeskData()]);
+    renderCurrentView();  // ENTRY/cockpit lists come from deskData.entry_tab
   }
   setInterval(fullRefresh, REFRESH_MS);
 
@@ -1068,15 +1096,10 @@
     const d4hMap = {};
     if (d4h && d4h.rows) d4h.rows.forEach(r => { d4hMap[r.symbol] = r; });
 
-    const baseCands   = d1d && d1d.flags && d1d.flags.dual_cross_up || [];
-    const chaseCands  = [];
-    if (d1d && d1d.rows) {
-      d1d.rows.filter(r => r.trend==="Green").forEach(r => {
-        const r4 = d4hMap[r.symbol];
-        if (r4 && r4.dual_cross_up) chaseCands.push(r);
-      });
-    }
-
+    // Same list as /api/ai/candidates (server: entry_candidates_latest.json)
+    const et = (deskData && deskData.entry_tab) || {base:[], chase:[]};
+    const baseCands  = (et.base||[]).map(c => c.symbol);
+    const chaseCands = (et.chase||[]).map(c => ({...(d1d&&d1d.rows?d1d.rows.find(r=>r.symbol===c.symbol):null)||{}, symbol:c.symbol, tier:c.tier, close:c.close_1d}));
     el("entryCount").textContent = baseCands.length;
     el("chaseCount").textContent = chaseCands.length;
 
@@ -1115,45 +1138,39 @@
     const d4h = radar["4h"];
     if (!d1d) { el("baseEntryList").innerHTML='<div class="empty">1D radar not loaded</div>'; return; }
 
-    el("entryTsLabel").textContent = "1D scan: "+(d1d.ts ? ageStr(d1d.ts) : "—");
-
     const d4hMap = {};
     if (d4h && d4h.rows) d4h.rows.forEach(r => { d4hMap[r.symbol] = r; });
 
-    // Base entries
-    const baseCross = d1d.flags && d1d.flags.dual_cross_up || [];
-    el("baseEntryBadge").textContent = baseCross.length;
-    el("baseEntryList").innerHTML = baseCross.length
-      ? baseCross.map(sym => {
-          const row = d1d.rows ? d1d.rows.find(r => r.symbol===sym) : null;
-          const tier = (row&&row.tier||"tiny").toLowerCase();
-          const cat  = row&&row.category||"";
+    // Base / Chase = server list (entry_candidates_latest.json) == /api/ai/candidates
+    const et = (deskData && deskData.entry_tab) || {base:[], chase:[]};
+    el("entryTsLabel").textContent = "1D scan: "+(d1d.ts ? ageStr(d1d.ts) : "—")+" · list built "+(et.generated_at ? ageStr(et.generated_at) : "—");
+    const base = et.base || [];
+    el("baseEntryBadge").textContent = base.length;
+    el("baseEntryList").innerHTML = base.length
+      ? base.map(c => {
+          const tier = (c.tier||"tiny").toLowerCase();
+          const cat  = c.category||"";
           return `<div class="entry-row">
-            <span class="er-coin">${esc(sym)}</span>
+            <span class="er-coin">${esc(c.symbol)}</span>
             <span class="cand-tier tier-${tier}">${tier}</span>
             <span class="cat-${cat}" style="font-size:0.68rem">${cat}</span>
-            <span class="er-price">${row?fmtNum(row.upper):"—"}</span>
-            <span class="er-note">1D cross_up · fill N+1 · entry=Upper ${row&&row.upper?">"+fmtNum(row.upper):""}</span>
+            <span class="er-price">${fmtNum(c.upper_1d)}</span>
+            <span class="er-note">1D cross_up + 1D Green (closed) · fill N+1 · entry=Upper ${c.upper_1d?">"+fmtNum(c.upper_1d):""}</span>
           </div>`;
         }).join("")
-      : '<div class="empty">No 1D dual_cross_up today</div>';
+      : '<div class="empty">No Base candidates (1D dual_cross_up + 1D Green)</div>';
 
-    // Chase entries
-    const chaseCands = [];
-    d1d.rows.filter(r => r.trend==="Green").forEach(r => {
-      const r4 = d4hMap[r.symbol];
-      if (r4 && r4.dual_cross_up) chaseCands.push({d1:r, d4:r4});
-    });
-    el("chaseEntryBadge").textContent = chaseCands.length;
-    el("chaseEntryList").innerHTML = chaseCands.length
-      ? chaseCands.slice(0,30).map(({d1,d4}) => {
-          const tier = (d1.tier||"tiny").toLowerCase();
+    const chase = et.chase || [];
+    el("chaseEntryBadge").textContent = chase.length;
+    el("chaseEntryList").innerHTML = chase.length
+      ? chase.slice(0,30).map(c => {
+          const tier = (c.tier||"tiny").toLowerCase();
           return `<div class="entry-row">
-            <span class="er-coin">${esc(d1.symbol)}</span>
+            <span class="er-coin">${esc(c.symbol)}</span>
             <span class="cand-tier tier-${tier}">${tier}</span>
             <span class="cand-type" style="font-size:0.65rem">CHASE</span>
-            <span class="er-price">4H:${fmtNum(d4.upper)}</span>
-            <span class="er-note">1D green · 4H cross_up · entry=4H Upper ${d4.upper?">"+fmtNum(d4.upper):""}</span>
+            <span class="er-price">4H:${fmtNum(c.upper_4h)}</span>
+            <span class="er-note">1D green · 4H green + cross_up (closed) · entry=4H Upper ${c.upper_4h?">"+fmtNum(c.upper_4h):""}</span>
           </div>`;
         }).join("")
       : '<div class="empty">No chase candidates</div>';
@@ -1201,14 +1218,19 @@
     el("rNCount").textContent = b.n??"—";
     el("rTfLabel").textContent= radarTf;
     el("rBarFill").style.width = (b.green_pct!=null ? Math.max(0,Math.min(100,b.green_pct)):0)+"%";
-    el("rScanTs").textContent  = d.ts ? ageStr(d.ts) : "—";
+    el("rScanTs").innerHTML  = `<span class="tf-time">${esc(tfTiming(radarTf))} · closed-bar scan ${d.ts ? ageStr(d.ts) : "—"}</span>`;
     const f = d.flags||{};
     const up = (f.dual_cross_up||[]).map(s=>`<span class="chip up">${esc(s)}</span>`).join(" ")||"<span>—</span>";
     const dn = (f.dual_cross_down_filter||[]).map(s=>`<span class="chip down">${esc(s)}</span>`).join(" ")||"<span>—</span>";
     el("rFlagLine").innerHTML = `cross_up: ${up} &nbsp; cross_down: ${dn}`;
 
     // Table
-    let rows = Array.isArray(d.rows) ? [...d.rows] : [];
+    let rows = Array.isArray(d.rows) ? d.rows.map(r => {
+      const lv = liveOf(r);
+      return {...r, lv_close: lv.close ?? r.close, lv_filter: lv.filter ?? r.filter, lv_upper: lv.upper ?? r.upper,
+              lv_lower: lv.lower ?? r.lower, lv_trend: lv.trend ?? r.trend, lv_above_upper: lv.above_upper ?? r.above_upper,
+              lv_cross_up: !!lv.cross_up};
+    }) : [];
     switch (radarFilter) {
       case "green": rows=rows.filter(r=>r.trend==="Green"); break;
       case "red":   rows=rows.filter(r=>r.trend==="Red"); break;
@@ -1233,15 +1255,16 @@
         <td>${esc(r.symbol)}</td>
         <td class="tier-${tier}">${tier}</td>
         <td class="cat-${r.category||""}">${r.category||"—"}</td>
-        <td class="${tCls}">${r.trend}</td>
-        <td>${fmtNum(r.close)}</td>
-        <td>${fmtNum(r.filter)}</td>
-        <td>${fmtNum(r.upper)}</td>
-        <td>${fmtNum(r.lower)}</td>
-        <td>${boolCell(r.above_upper)}</td>
-        <td>${boolCell(r.dual_cross_up)}</td>
+        <td class="${r.lv_trend==="Green"?"trend-g":"trend-r"}">${r.lv_trend}${r.lv_cross_up?" ↑":""}</td>
+        <td>${fmtNum(r.lv_close)}</td>
+        <td>${fmtNum(r.lv_filter)}</td>
+        <td>${fmtNum(r.lv_upper)}</td>
+        <td>${fmtNum(r.lv_lower)}</td>
+        <td>${boolCell(r.lv_above_upper)}</td>
         <td class="us-${r.upper_status||"below"}">${r.upper_status||"—"}</td>
-        <td>${boolCell(r.dual_cross_down_filter,true)}</td>
+        <td class="closed-col ${tCls}">${r.trend}</td>
+        <td class="closed-col">${boolCell(r.dual_cross_up)}</td>
+        <td class="closed-col">${boolCell(r.dual_cross_down_filter,true)}</td>
         <td>${r.rvol!=null?Number(r.rvol).toFixed(2):(r.vol_accel!=null?Number(r.vol_accel).toFixed(2):"—")}</td>
         <td>${r.mom_score!=null?Number(r.mom_score).toFixed(3):"—"}</td>
         <td>${r.mom_rank??"—"}</td>

@@ -18,11 +18,13 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gzip
 import json
 import math
 import os
 import shutil
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -601,6 +603,69 @@ def compute_gc(
 
 
 # ---------------------------------------------------------------------------
+# Live (forming-bar) values + candle cache (display only; signals stay closed-bar)
+# ---------------------------------------------------------------------------
+_BARS_CACHE: Dict[Tuple[str, str], List[dict]] = {}
+_BARS_LOCK = threading.Lock()
+
+
+def candles_cache_path(tf: str) -> str:
+    return os.path.join(OUT_DIR, f"candles_{tf}.json.gz")
+
+
+def live_values(bars: List[dict], gc: List[Dict[str, float]], live_i: int, now_ms: int, bar_ms: int) -> dict:
+    """GC values on the latest (possibly forming) bar. DISPLAY ONLY — never a signal input."""
+    li = live_i
+    close = bars[li]["close"]
+    filt, upper, lower = gc[li]["filter"], gc[li]["upper"], gc[li]["lower"]
+    pf = gc[li - 1]["filter"] if li >= 1 else filt
+    pu = gc[li - 1]["upper"] if li >= 1 else upper
+    pc = bars[li - 1]["close"] if li >= 1 else close
+    return {
+        "close": round(close, 8),
+        "filter": round(filt, 8),
+        "upper": round(upper, 8),
+        "lower": round(lower, 8),
+        "trend": "Green" if filt > pf else "Red",
+        "above_upper": close > upper,
+        "cross_up": close > upper and pc <= pu,
+        "bar_time": bars[li]["t"],
+        "forming": bars[li]["t"] + bar_ms > now_ms,
+    }
+
+
+def write_candles_cache(tf: str, symbols: List[str]) -> Optional[str]:
+    """Persist bars (t,o,h,l,c,v) per coin so the live loop only needs allMids (1 HL request)."""
+    with _BARS_LOCK:
+        data = {s: [[b["t"], b["open"], b["high"], b["low"], b["close"], b["volume"]]
+                    for b in _BARS_CACHE.get((tf, s), [])] for s in symbols}
+    data = {k: v for k, v in data.items() if v}
+    if not data:
+        return None
+    path = candles_cache_path(tf)
+    tmp = path + ".tmp"
+    with gzip.open(tmp, "wt", encoding="utf-8") as f:
+        json.dump({"tf": tf, "ts": datetime.now(timezone.utc).isoformat(), "bars": data}, f, separators=(",", ":"))
+    os.replace(tmp, path)
+    return path
+
+
+def radar_timing(tf: str, rows: List[dict], now_ms: Optional[int] = None) -> dict:
+    """Closed/forming bar timestamps (ms, UTC) for a radar payload."""
+    bar_ms = int(TF_CONFIG[tf]["bar_ms"])
+    now_ms = now_ms or int(time.time() * 1000)
+    closed = [r.get("bar_time") for r in rows if isinstance(r.get("bar_time"), int)]
+    closed_open = max(closed) if closed else None
+    forming_open = now_ms - now_ms % bar_ms
+    return {
+        "closed_bar_open_ms": closed_open,
+        "closed_bar_close_ms": closed_open + bar_ms if closed_open else None,
+        "forming_bar_open_ms": forming_open,
+        "next_close_ms": forming_open + bar_ms,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Per-symbol scan row
 # ---------------------------------------------------------------------------
 def _median(xs: List[float]) -> Optional[float]:
@@ -736,6 +801,9 @@ def scan_symbol(coin: str, tf: str, ctx: Optional[Dict[str, Any]] = None) -> Opt
     from_atl_pct = round((close - atl) / atl * 100, 2) if atl else None
 
     mom = compute_vol_momentum(bars, i)
+    live = live_values(bars, gc, live_i, now_ms, bar_ms)
+    with _BARS_LOCK:
+        _BARS_CACHE[(tf, coin)] = bars
     ctx = ctx or {}
     day_ntl = ctx.get("day_ntl_vlm")
     oi = ctx.get("open_interest")
@@ -765,7 +833,10 @@ def scan_symbol(coin: str, tf: str, ctx: Optional[Dict[str, Any]] = None) -> Opt
         "from_atl_pct": from_atl_pct,
         "last_cross_up_at": last_cross_up_at,
         "bars": len(bars),
-        "bar_time": bars[i]["t"],
+        "bar_time": bars[i]["t"],  # open time of the LAST CLOSED bar (top-level = closed SoT)
+        # live = forming bar at scan time (display only; never a signal input).
+        # serve.py live_radar refreshes it every 10 min from allMids.
+        "live": live,
         # momentum / liquidity observe-only (ranking; not entry gates)
         "day_ntl_vlm": round(day_ntl_f, 2) if day_ntl_f is not None else None,
         "open_interest": round(oi_f, 4) if oi_f is not None else None,
@@ -916,6 +987,9 @@ def scan_tf(
             "green_pct": green_pct,
             "n": n,
         },
+        "row_semantics": "top-level row fields = LAST CLOSED bar (signal SoT); row.live = forming bar (display only)",
+        "live_ts": ts,
+        **radar_timing(tf, rows),
         "flags": {
             "dual_cross_up": dual_up,
             "dual_cross_down_filter": dual_dn,
@@ -946,6 +1020,12 @@ def scan_tf(
         shutil.copy2(json_path, alias_json)
         shutil.copy2(csv_path, alias_csv)
         print(f"[done] alias {alias_json} / {alias_csv}")
+
+    try:
+        cp = write_candles_cache(tf, [r["symbol"] for r in rows])
+        print(f"[done] candle cache {cp}")
+    except Exception as e:  # cache is an optimisation; never fail the scan
+        print(f"[warn] candle cache write failed: {e}", file=sys.stderr)
 
     elapsed = time.time() - t0
     print(f"[done] wrote {json_path}")

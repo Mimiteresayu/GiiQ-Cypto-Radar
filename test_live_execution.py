@@ -589,7 +589,8 @@ class TestDeskDataLog(unittest.TestCase):
             self.assertIn(k, p)
         row = p["gc_radar_1h"]["rows"][0]
         self.assertEqual(set(row), {"symbol", "trend", "close", "filter", "upper", "lower", "dual_cross_up",
-                                    "dual_cross_down", "tier", "mcap"})
+                                    "dual_cross_down", "tier", "mcap", "live_close", "live_filter", "live_upper",
+                                    "live_lower", "live_trend", "live_above_upper", "live_cross_up"})
         self.assertEqual(row["close"], 1.23457)  # rounded
         self.assertEqual(p["gc_radar_1d"]["flags"], {"dual_cross_up": ["C0"]})
         self.assertEqual(p["hl_spot"]["usdc_total"], 1711.01)
