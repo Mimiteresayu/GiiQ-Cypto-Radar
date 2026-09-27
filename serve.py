@@ -762,6 +762,14 @@ def _tf_timing(tf: str, radar: dict, now: datetime) -> dict:
     }
 
 
+def _cat_label(r: dict) -> str | None:
+    """ALL category labels joined (e.g. "Narrative + Cemetery"); falls back to primary."""
+    cats = r.get("categories")
+    if isinstance(cats, list) and cats:
+        return " + ".join(str(c) for c in cats)
+    return r.get("category_label") or r.get("category")
+
+
 def _trim_radar(radar: dict, focus: set | None = None) -> dict:
     """Radar for DESK_DATA. Row keys w/o prefix = LAST CLOSED bar (signal SoT);
     live_* = forming bar (display only). focus: keep only these symbols (compact log)."""
@@ -775,6 +783,7 @@ def _trim_radar(radar: dict, focus: set | None = None) -> dict:
         row["dual_cross_up"] = bool(r.get("dual_cross_up"))
         row["dual_cross_down"] = bool(r.get("dual_cross_down_filter", r.get("dual_cross_down")))
         row["tier"] = r.get("tier")
+        row["cat"] = _cat_label(r)
         mc = r.get("mcap_usd", r.get("mcap"))
         row["mcap"] = int(mc) if isinstance(mc, (int, float)) else None
         lv = r.get("live") if isinstance(r.get("live"), dict) else {}
@@ -831,7 +840,7 @@ def _load_candidates_file() -> dict:
         return {}
 
 
-_ENTRY_TAB_KEYS = ("symbol", "tier", "category", "trend_1d", "trend_4h", "close_1d", "upper_1d",
+_ENTRY_TAB_KEYS = ("symbol", "tier", "category", "category_label", "trend_1d", "trend_4h", "close_1d", "upper_1d",
                    "filter_1d", "close_4h", "upper_4h", "filter_4h", "lower_4h", "entry_ref", "hard_sl_dist_pct")
 
 
@@ -873,7 +882,7 @@ def _load_narrative(radar_1d: dict | None = None) -> dict:
         items.append({
             "ticker": t,
             "sector": it.get("sector"),
-            "venue": it.get("venue"),
+            "venue": "HL" if h else (it.get("venue") or "unknown"),  # HL or spot venue; non-HL kept
             "gc_scan": it.get("gc_scan"),
             "narrative": (it.get("narrative") or "")[:80],
             "last_seen": it.get("last_seen"),
@@ -884,6 +893,74 @@ def _load_narrative(radar_1d: dict | None = None) -> dict:
             "dual_cross_up_1d": bool(h.get("dual_cross_up") if h else g.get("dual_cross_up")),
         })
     return {"updated": wl.get("updated"), "n": len(items), "items": items}
+
+
+NARRATIVE_MAX_ITEMS = 300
+_narrative_lock = threading.Lock()
+
+
+def _read_narrative_watchlist() -> dict:
+    try:
+        with open(os.path.join(OUT_DIR, "narrative_watchlist.json")) as f:
+            wl = json.load(f)
+        return wl if isinstance(wl, dict) else {"items": wl if isinstance(wl, list) else []}
+    except Exception:
+        return {"items": []}
+
+
+def _clean_str(v, n: int) -> str:
+    return str(v or "").strip()[:n]
+
+
+def update_narrative_watchlist(body: dict, now: datetime | None = None) -> dict:
+    """Merge/replace out/narrative_watchlist.json (atomic). Raises ValueError on bad input.
+    merge: upsert items by ticker (keeps first_seen/notes/other fields), then drop `remove`.
+    replace: list becomes exactly `items`. Marks managed_by="api" so the scanner uses only this file."""
+    if not isinstance(body, dict):
+        raise ValueError("body must be an object")
+    mode = str(body.get("mode") or "merge").lower()
+    if mode not in ("merge", "replace"):
+        raise ValueError("mode must be merge|replace")
+    items = body.get("items") or []
+    remove = body.get("remove") or []
+    if not isinstance(items, list) or not isinstance(remove, list):
+        raise ValueError("items/remove must be lists")
+    now = now or datetime.now(timezone.utc)
+    today = now.astimezone(HKT).strftime("%Y-%m-%d")
+    clean = []
+    for it in items:
+        if not isinstance(it, dict):
+            raise ValueError("each item must be an object")
+        t = _clean_str(it.get("ticker") or it.get("symbol"), 20).upper().lstrip("$")
+        if not t:
+            raise ValueError("item missing ticker")
+        row = {"ticker": t}
+        for k, n in (("sector", 40), ("venue", 40), ("narrative", 300), ("asset_type", 20), ("notes", 300)):
+            if it.get(k) is not None:
+                row[k] = _clean_str(it.get(k), n)
+        clean.append(row)
+    with _narrative_lock:
+        wl = _read_narrative_watchlist()
+        old = {str(i.get("ticker") or "").upper(): i for i in wl.get("items") or [] if isinstance(i, dict)}
+        merged = {} if mode == "replace" else dict(old)
+        for row in clean:
+            prev = old.get(row["ticker"], {})
+            merged[row["ticker"]] = {**prev, **row, "first_seen": prev.get("first_seen") or today, "last_seen": today}
+        for t in remove:
+            merged.pop(_clean_str(t, 20).upper().lstrip("$"), None)
+        if len(merged) > NARRATIVE_MAX_ITEMS:
+            raise ValueError(f"max {NARRATIVE_MAX_ITEMS} items")
+        wl["items"] = list(merged.values())
+        wl["updated"] = now.isoformat()
+        wl["managed_by"] = "api"
+        os.makedirs(OUT_DIR, exist_ok=True)
+        path = os.path.join(OUT_DIR, "narrative_watchlist.json")
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(wl, f, indent=2)
+        os.replace(tmp, path)
+    return {"mode": mode, "count": len(wl["items"]), "updated": wl["updated"],
+            "tickers": [i["ticker"] for i in wl["items"]]}
 
 
 def _build_desk_data_payload(event: str = "", now: datetime | None = None, kind: str = "full") -> dict:
@@ -1478,6 +1555,9 @@ class Handler(SimpleHTTPRequestHandler):
         if path == "/api/entry-candidates":
             self._entry_candidates(parsed.query)
             return
+        if path == "/api/ai/narrative":
+            self._ai_narrative()
+            return
         if path == "/api/ai/candidates":
             self._ai_candidates(parsed.query)
             return
@@ -1519,6 +1599,9 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if path == "/api/ai/decision":
             self._ai_decision()
+            return
+        if path == "/api/ai/narrative":
+            self._ai_narrative()
             return
         if path == "/api/jobs/run":
             # Password-gated manual trigger. executor/exit workers are FORCED DRY_RUN here.
@@ -1744,6 +1827,35 @@ class Handler(SimpleHTTPRequestHandler):
         }
         
         self._send_json(200, response)
+
+    def _ai_narrative(self) -> None:
+        """GET/POST /api/ai/narrative — keyed (X-AI-Key header or ?key=, same key as /api/ai/candidates).
+        GET: current watchlist. POST: {"mode": "merge"|"replace", "items": [{ticker, sector, venue,
+        narrative}], "remove": [tickers]} -> persisted to out/narrative_watchlist.json (used by next scan)."""
+        provided = self.headers.get("X-AI-Key") or (parse_qs(urlparse(self.path).query).get("key") or [""])[0]
+        if not AI_DECISION_KEY:
+            self._send_json(404, {"ok": False, "error": "AI endpoints disabled"})
+            return
+        if not provided or not hmac.compare_digest(provided, AI_DECISION_KEY):
+            self._send_json(403, {"ok": False, "error": "forbidden"})
+            return
+        if self.command == "GET":
+            self._send_json(200, {"ok": True, **_read_narrative_watchlist()})
+            return
+        length = int(self.headers.get("Content-Length") or 0)
+        if length > 512_000:
+            self._send_json(413, {"ok": False, "error": "body too large"})
+            return
+        try:
+            body = json.loads((self.rfile.read(length) if length else b"{}").decode())
+            res = update_narrative_watchlist(body)
+        except ValueError as e:
+            self._send_json(400, {"ok": False, "error": str(e)})
+            return
+        except Exception as e:
+            self._send_json(500, {"ok": False, "error": str(e)})
+            return
+        self._send_json(200, {"ok": True, **res})
 
     def _ai_decision(self) -> None:
         """POST /api/ai/decision: store AI approval/veto decisions.

@@ -186,6 +186,8 @@ def build_candidates(
             "upper_4h": r4h.get("upper") if r4h else None,
             "close_4h": r4h.get("close") if r4h else None,
             "category": r1d.get("category"),
+            "categories": r1d.get("categories") or ([r1d["category"]] if r1d.get("category") else []),
+            "category_label": " + ".join(r1d.get("categories") or []) or r1d.get("category"),
             "is_base": bool(base),
             "is_chase": bool(chase),
             # ENTRY ref: Base = 1D Upper, Chase = 4H Upper (closed bars)

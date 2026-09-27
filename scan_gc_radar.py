@@ -99,7 +99,15 @@ def _sym_aliases(sym: str) -> set:
 def load_narrative_tickers() -> set:
     """Union of tickers from narrative watchlist JSON files (graceful if missing)."""
     tickers: set = set()
-    for rel in NARRATIVE_PATHS:
+    paths = NARRATIVE_PATHS
+    # Watchlist maintained via POST /api/ai/narrative is authoritative (removals must stick)
+    try:
+        api_wl = json.loads(Path(os.path.join(ROOT, "out/narrative_watchlist.json")).read_text(encoding="utf-8"))
+        if isinstance(api_wl, dict) and api_wl.get("managed_by") == "api":
+            paths = ("out/narrative_watchlist.json",)
+    except (OSError, json.JSONDecodeError):
+        pass
+    for rel in paths:
         path = rel if os.path.isabs(rel) else os.path.join(ROOT, rel)
         if not os.path.isfile(path):
             continue
@@ -176,6 +184,7 @@ def enrich_row_tier_category(row: dict, narrative_set: set, mcap_map: dict | Non
     primary, cats = classify_category(sym, row.get("drop_from_ath_pct"), narrative_set)
     row["category"] = primary
     row["categories"] = cats
+    row["category_label"] = " + ".join(cats) if cats else primary  # ALL labels, e.g. "Narrative + Cemetery"
 
 
 MAX_SYMBOLS = 280  # expanded liquid HL universe (~250–300; --max overrides)
