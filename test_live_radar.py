@@ -211,3 +211,52 @@ class TestSchedulerLiveJob(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestNarrativeEndpoint(unittest.TestCase):
+    def setUp(self):
+        import serve
+        self.serve = serve
+        self.tmp = tempfile.mkdtemp()
+        patch.object(serve, "OUT_DIR", self.tmp).start()
+        json.dump({"sot": "x", "items": [{"ticker": "OLD", "sector": "ai", "first_seen": "2026-09-01", "notes": "n"}]},
+                  open(os.path.join(self.tmp, "narrative_watchlist.json"), "w"))
+
+    def tearDown(self):
+        patch.stopall()
+
+    def _wl(self):
+        return json.load(open(os.path.join(self.tmp, "narrative_watchlist.json")))
+
+    def test_merge_upsert_and_remove(self):
+        r = self.serve.update_narrative_watchlist(
+            {"items": [{"ticker": "$new", "sector": "rwa", "venue": "HL", "narrative": "n" * 400},
+                       {"ticker": "OLD", "venue": "bitunix"}], "remove": []})
+        self.assertEqual(r["count"], 2)
+        wl = self._wl()
+        by = {i["ticker"]: i for i in wl["items"]}
+        self.assertEqual(by["OLD"]["first_seen"], "2026-09-01")  # kept
+        self.assertEqual(by["OLD"]["sector"], "ai")
+        self.assertEqual(by["OLD"]["venue"], "bitunix")
+        self.assertEqual(len(by["NEW"]["narrative"]), 300)
+        self.assertEqual(wl["managed_by"], "api")
+        self.assertEqual(wl["sot"], "x")
+        self.serve.update_narrative_watchlist({"remove": ["old"]})
+        self.assertEqual([i["ticker"] for i in self._wl()["items"]], ["NEW"])
+
+    def test_replace_and_validation(self):
+        self.serve.update_narrative_watchlist({"mode": "replace", "items": [{"ticker": "AAA"}]})
+        self.assertEqual([i["ticker"] for i in self._wl()["items"]], ["AAA"])
+        for bad in ({"mode": "x"}, {"items": [{"sector": "no ticker"}]}, {"items": "AAA"}):
+            with self.assertRaises(ValueError):
+                self.serve.update_narrative_watchlist(bad)
+
+    def test_scanner_uses_only_api_list(self):
+        self.serve.update_narrative_watchlist({"mode": "replace", "items": [{"ticker": "ZZTOP"}]})
+        with patch.object(sgr, "ROOT", self.tmp):
+            os.makedirs(os.path.join(self.tmp, "out"), exist_ok=True)
+            os.replace(os.path.join(self.tmp, "narrative_watchlist.json"),
+                       os.path.join(self.tmp, "out", "narrative_watchlist.json"))
+            os.makedirs(os.path.join(self.tmp, "narrative"), exist_ok=True)
+            json.dump({"items": [{"ticker": "BAKED"}]}, open(os.path.join(self.tmp, "narrative", "watchlist.json"), "w"))
+            self.assertEqual(sgr.load_narrative_tickers(), {"ZZTOP"})

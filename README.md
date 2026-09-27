@@ -154,6 +154,12 @@ Fetch today's entry candidates with enhanced data for AI decision-making.
 }
 ```
 
+#### Narrative watchlist: GET/POST `/api/ai/narrative` (same key: `X-AI-Key` header or `?key=`)
+GET returns the current list. POST body: `{"mode": "merge"|"replace", "items": [{"ticker": "WORM", "sector": "agent",
+"venue": "HL", "narrative": "short note"}], "remove": ["OLD"]}` (merge = upsert by ticker keeping first_seen/notes;
+replace = list becomes exactly `items`; max 300). Persisted to `out/narrative_watchlist.json` with
+`managed_by: "api"`, which the scanner then uses as the ONLY narrative source (next scan / live cycle).
+
 #### 2. POST `/api/ai/decision`
 
 Submit approval/veto decisions for entry candidates.

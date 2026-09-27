@@ -99,7 +99,15 @@ def _sym_aliases(sym: str) -> set:
 def load_narrative_tickers() -> set:
     """Union of tickers from narrative watchlist JSON files (graceful if missing)."""
     tickers: set = set()
-    for rel in NARRATIVE_PATHS:
+    paths = NARRATIVE_PATHS
+    # Watchlist maintained via POST /api/ai/narrative is authoritative (removals must stick)
+    try:
+        api_wl = json.loads(Path(os.path.join(ROOT, "out/narrative_watchlist.json")).read_text(encoding="utf-8"))
+        if isinstance(api_wl, dict) and api_wl.get("managed_by") == "api":
+            paths = ("out/narrative_watchlist.json",)
+    except (OSError, json.JSONDecodeError):
+        pass
+    for rel in paths:
         path = rel if os.path.isabs(rel) else os.path.join(ROOT, rel)
         if not os.path.isfile(path):
             continue
