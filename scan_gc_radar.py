@@ -96,18 +96,76 @@ def _sym_aliases(sym: str) -> set:
     return out
 
 
-def load_narrative_tickers() -> set:
-    """Union of tickers from narrative watchlist JSON files (graceful if missing)."""
-    tickers: set = set()
-    paths = NARRATIVE_PATHS
+# Narrative ticker -> HL perp name (HL lists 1000x memes with a k-prefix, SPX6900 as SPX).
+NARRATIVE_HL_ALIASES = {
+    "BONK": "kBONK", "PEPE": "kPEPE", "SHIB": "kSHIB", "FLOKI": "kFLOKI", "SPX6900": "SPX",
+    "LUNC": "kLUNC", "NEIRO": "kNEIRO", "DOGS": "kDOGS",
+}
+
+
+def resolve_hl_name(ticker: str, hl_names) -> Optional[str]:
+    """Map a narrative ticker to its HL perp name, or None if not listed on HL perps.
+    Order: exact, case-insensitive, alias map, 'k'+symbol."""
+    raw = str(ticker or "").strip().lstrip("$")
+    if not raw:
+        return None
+    names = set(hl_names)
+    if raw in names:
+        return raw
+    lower = {n.lower(): n for n in names}
+    if raw.lower() in lower:
+        return lower[raw.lower()]
+    alias = NARRATIVE_HL_ALIASES.get(raw.upper())
+    if alias and alias in names:
+        return alias
+    k = "k" + raw.upper()
+    if k in names:
+        return k
+    return None
+
+
+def resolve_narrative(hl_names) -> Dict[str, Optional[str]]:
+    """{narrative ticker: HL perp name | None} for the current narrative list."""
+    return {t: resolve_hl_name(t, hl_names) for t in load_narrative_items()}
+
+
+def load_narrative_items() -> List[str]:
+    """Raw narrative tickers (original case) from the active watchlist file(s)."""
+    out: List[str] = []
+    seen: set = set()
+    for rel in _narrative_paths():
+        path = rel if os.path.isabs(rel) else os.path.join(ROOT, rel)
+        if not os.path.isfile(path):
+            continue
+        try:
+            raw = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        items = (raw.get("items") or raw.get("watchlist") or raw.get("symbols") or []) if isinstance(raw, dict) else (raw if isinstance(raw, list) else [])
+        for it in items:
+            t = it if isinstance(it, str) else ((it.get("ticker") or it.get("symbol") or it.get("coin") or "") if isinstance(it, dict) else "")
+            t = str(t).strip().lstrip("$")
+            if t and t.upper() not in seen:
+                seen.add(t.upper())
+                out.append(t)
+    return out
+
+
+def _narrative_paths() -> tuple:
     # Watchlist maintained via POST /api/ai/narrative is authoritative (removals must stick)
     try:
         api_wl = json.loads(Path(os.path.join(ROOT, "out/narrative_watchlist.json")).read_text(encoding="utf-8"))
         if isinstance(api_wl, dict) and api_wl.get("managed_by") == "api":
-            paths = ("out/narrative_watchlist.json",)
+            return ("out/narrative_watchlist.json",)
     except (OSError, json.JSONDecodeError):
         pass
-    for rel in paths:
+    return NARRATIVE_PATHS
+
+
+def load_narrative_tickers() -> set:
+    """Union of tickers from narrative watchlist JSON files (graceful if missing)."""
+    tickers: set = set()
+    for rel in _narrative_paths():
         path = rel if os.path.isabs(rel) else os.path.join(ROOT, rel)
         if not os.path.isfile(path):
             continue
@@ -131,6 +189,8 @@ def load_narrative_tickers() -> set:
             if not t:
                 continue
             tickers.add(t)
+            if t in NARRATIVE_HL_ALIASES:  # SPX6900 -> SPX row
+                tickers.add(_norm_sym(NARRATIVE_HL_ALIASES[t]))
             # bare form so HL kPEPE matches watchlist PEPE
             if t.startswith("K") and len(t) > 2:
                 tickers.add(t[1:])
@@ -450,8 +510,20 @@ def load_universe(max_n: int = MAX_SYMBOLS) -> Tuple[List[str], str, Dict[str, A
             names = filtered
             src = src + "+base_v0_filter"
 
+    # Force-include every narrative ticker listed on HL perps (bypasses volume/OI floors and
+    # max_n). Same GC signals / tier logic apply; non-HL tickers stay narrative-only.
+    narrative_map = resolve_narrative(meta_names)
+    forced = [h for h in narrative_map.values() if h and h not in names]
+    forced = list(dict.fromkeys(forced))
+    if forced:
+        names = names + forced
+        src = src + f"+narrative{len(forced)}"
+        print(f"[info] narrative force-include: {', '.join(forced)}", file=sys.stderr)
+
     meta = {
         "floors": floors,
+        "narrative_map": narrative_map,
+        "narrative_forced": forced,
         "n_meta_live": len(vol_rows),
         "n_nonzero_day_ntl": nonzero,
         "ctx_by_symbol": {
@@ -985,6 +1057,8 @@ def scan_tf(
         "universe_requested": symbols,
         "n_scanned": n,
         "universe_floors": floors,
+        "narrative_map": universe_meta.get("narrative_map") or {},
+        "narrative_forced": universe_meta.get("narrative_forced") or [],
         "momentum_note": (
             "rvol/vol_accel/vol_change_pct/mom_score/mom_rank are observe+rank only; "
             "dual_cross_up GC entry math unchanged"

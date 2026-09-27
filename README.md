@@ -319,6 +319,14 @@ closed-bar scan) and the forming bar is updated with the mid (close=mid, high/lo
 high/low are sampled every 10 min, so live GC is a close approximation until the closed-bar scan re-fetches the bar.
 The closed-bar scan jobs above are unchanged and also rebuild candidates after every 1H/4H scan.
 
+**Narrative → radar (automatic):** every closed-bar scan force-includes each narrative ticker listed on HL perps
+(bypassing the dayNtlVlm/OI floor and `--max`), and every 10-min live cycle adds any still-missing ones to each TF
+(`scan_symbol`, same GC/tier logic; ≤25/TF/cycle; failures e.g. short history retried after 6h) and re-tags the
+Narrative category on all rows from the current list (`out/narrative_watchlist.json`, written by `POST /api/ai/narrative`).
+Name mapping (`resolve_hl_name`): exact → case-insensitive → alias (`BONK→kBONK, PEPE→kPEPE, SHIB→kSHIB, FLOKI→kFLOKI,
+SPX6900→SPX`, …) → `k`+symbol. Radar JSON: `narrative_map` {ticker: HL name|null}, `narrative_forced`,
+`narrative_not_on_hl` (spot-only; not an error). Rows added this way carry `narrative_forced: true`.
+
 **Live execution (EXEC_DRY_RUN=0 + key):** isolated margin; set leverage (≤5x and ≤ coin maxLeverage) →
 IOC limit buy at live mid + slippage → reduce-only stop-market Hard SL for the filled size
 (Mega/Large 4H Lower, Small/Tiny 4H Filter). If the SL cannot be placed the fill is closed immediately.

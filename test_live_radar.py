@@ -230,7 +230,7 @@ class TestNarrativeEndpoint(unittest.TestCase):
 
     def test_merge_upsert_and_remove(self):
         r = self.serve.update_narrative_watchlist(
-            {"items": [{"ticker": "$new", "sector": "rwa", "venue": "HL", "narrative": "n" * 400},
+            {"items": [{"ticker": "$NEW", "sector": "rwa", "venue": "HL", "narrative": "n" * 400},
                        {"ticker": "OLD", "venue": "bitunix"}], "remove": []})
         self.assertEqual(r["count"], 2)
         wl = self._wl()
@@ -260,3 +260,70 @@ class TestNarrativeEndpoint(unittest.TestCase):
             os.makedirs(os.path.join(self.tmp, "narrative"), exist_ok=True)
             json.dump({"items": [{"ticker": "BAKED"}]}, open(os.path.join(self.tmp, "narrative", "watchlist.json"), "w"))
             self.assertEqual(sgr.load_narrative_tickers(), {"ZZTOP"})
+
+
+class TestNarrativeUniverse(unittest.TestCase):
+    HL = ["BTC", "ZEC", "NEAR", "INJ", "kBONK", "kPEPE", "kSHIB", "SPX", "kFLOKI"]
+
+    def test_resolve_hl_name(self):
+        r = lambda t: sgr.resolve_hl_name(t, self.HL)
+        self.assertEqual(r("ZEC"), "ZEC")
+        self.assertEqual(r("zec"), "ZEC")
+        self.assertEqual(r("BONK"), "kBONK")
+        self.assertEqual(r("KBONK"), "kBONK")
+        self.assertEqual(r("$PEPE"), "kPEPE")
+        self.assertEqual(r("SPX6900"), "SPX")
+        self.assertEqual(r("FLOKI"), "kFLOKI")
+        self.assertIsNone(r("WORM"))
+        self.assertIsNone(r("SPYx"))
+
+    def _with_watchlist(self, tickers):
+        tmp = tempfile.mkdtemp()
+        os.makedirs(os.path.join(tmp, "out"))
+        json.dump({"managed_by": "api", "items": [{"ticker": t} for t in tickers]},
+                  open(os.path.join(tmp, "out", "narrative_watchlist.json"), "w"))
+        return patch.object(sgr, "ROOT", tmp)
+
+    def test_universe_force_includes_narrative(self):
+        vol = [{"name": f"C{i}", "day_ntl_vlm": 1e6, "open_interest": 1.0} for i in range(100)]
+        vol += [{"name": n, "day_ntl_vlm": 10.0, "open_interest": 1.0} for n in ("ZEC", "kBONK", "SPX")]
+        meta_names = [r["name"] for r in vol]
+        with self._with_watchlist(["ZEC", "BONK", "SPX6900", "WORM"]), \
+             patch.object(sgr, "fetch_meta_universe", return_value=(vol, meta_names)), \
+             patch.object(sgr, "load_base_v0", return_value=None):
+            names, src, meta = sgr.load_universe(max_n=50)
+            self.assertEqual(names[:50], [f"C{i}" for i in range(50)])
+            self.assertEqual(set(names[50:]), {"ZEC", "kBONK", "SPX"})
+            self.assertIn("narrative3", src)
+            self.assertIsNone(meta["narrative_map"]["WORM"])
+            self.assertIn("SPX", sgr.load_narrative_tickers())  # SPX6900 alias tags SPX row
+
+    def test_live_sync_adds_missing_and_tags(self):
+        tmp_out = tempfile.mkdtemp()
+        radar = {"rows": [{"symbol": "BTC", "trend": "Green", "close": 1, "drop_from_ath_pct": 1}]}
+        fake = {"symbol": "ZEC", "trend": "Green", "close": 2.0, "dual_cross_up": False, "drop_from_ath_pct": 10}
+
+        def scan(coin, tf):
+            with sgr._BARS_LOCK:
+                sgr._BARS_CACHE[(tf, coin)] = [{"t": 1, "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1}]
+            return dict(fake, symbol=coin) if coin == "ZEC" else None
+        cbars = {}
+        with self._with_watchlist(["ZEC", "BTC", "NEWCOIN", "WORM"]), patch.object(sgr, "scan_symbol", side_effect=scan):
+            res = live_radar.sync_narrative("1d", radar, cbars, {"ZEC": "ZEC", "BTC": "BTC", "NEWCOIN": "NEWCOIN", "WORM": None})
+            self.assertEqual(res["added"], ["ZEC"])
+            self.assertTrue(res["failed"][0].startswith("NEWCOIN"))
+            self.assertIn("NEWCOIN", radar["narrative_retry_after_ms"])
+            by = {r["symbol"]: r for r in radar["rows"]}
+            self.assertEqual(by["ZEC"]["category"], "Narrative")
+            self.assertEqual(by["BTC"]["category"], "Narrative")
+            self.assertTrue(by["ZEC"]["narrative_forced"])
+            self.assertIn("ZEC", cbars)
+            self.assertEqual(radar["breadth"]["n"], 2)
+            self.assertEqual(radar["narrative_not_on_hl"], ["WORM"])
+            # second call: NEWCOIN backed off, nothing re-scanned
+            res2 = live_radar.sync_narrative("1d", radar, cbars, {"ZEC": "ZEC", "NEWCOIN": "NEWCOIN"})
+            self.assertEqual(res2["added"], [])
+            self.assertEqual(res2["failed"], [])
+
+    def test_perp_names_filter(self):
+        self.assertEqual(live_radar.hl_perp_names({"BTC": 1, "@12": 1, "PURR/USDC": 1, "kPEPE": 1}), ["BTC", "kPEPE"])

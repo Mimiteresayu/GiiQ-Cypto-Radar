@@ -26,6 +26,68 @@ from typing import Dict, List, Optional
 import scan_gc_radar as sgr
 
 LIVE_TFS = ("1d", "4h", "1h")
+NARRATIVE_ADD_MAX = 25  # max new narrative coins scanned per TF per cycle (HL rate limits)
+
+
+def hl_perp_names(mids: Dict[str, float]) -> List[str]:
+    """Perp names from allMids keys (spot pairs are '@123' or 'X/USDC')."""
+    return [k for k in mids if not k.startswith("@") and "/" not in k]
+
+
+def _recount(radar: dict) -> None:
+    """Recompute closed-bar breadth/flags after rows were added (same fields as scan_tf)."""
+    rows = radar.get("rows") or []
+    g = sum(1 for r in rows if r.get("trend") == "Green")
+    n = len(rows)
+    radar["breadth"] = {"green_count": g, "red_count": sum(1 for r in rows if r.get("trend") == "Red"),
+                        "green_pct": round(100.0 * g / n, 2) if n else 0.0, "n": n}
+    radar["flags"] = {
+        "dual_cross_up": [r["symbol"] for r in rows if r.get("dual_cross_up")],
+        "dual_cross_down_filter": [r["symbol"] for r in rows if r.get("dual_cross_down_filter")],
+        "above_upper": [r["symbol"] for r in rows if r.get("above_upper")],
+    }
+    radar["n_scanned"] = n
+
+
+def sync_narrative(tf: str, radar: dict, cbars: dict, narrative_map: Dict[str, Optional[str]]) -> dict:
+    """Add HL-listed narrative coins missing from this TF (same scan_symbol GC math, floor
+    bypassed) and re-tag Narrative category on all rows from the CURRENT narrative list."""
+    rows = radar.setdefault("rows", [])
+    have = {r.get("symbol") for r in rows}
+    want = [h for h in dict.fromkeys(narrative_map.values()) if h]
+    # coins that failed recently (e.g. new listing, < period+20 bars) are retried every 6h only
+    retry = radar.get("narrative_retry_after_ms") or {}
+    now_ms = int(time.time() * 1000)
+    missing = [h for h in want if h not in have and retry.get(h, 0) <= now_ms][:NARRATIVE_ADD_MAX]
+    added, failed = [], []
+    for coin in missing:
+        try:
+            row = sgr.scan_symbol(coin, tf)
+        except Exception as e:
+            row = None
+            failed.append(f"{coin}: {e}")
+        if not row:
+            if not failed or not failed[-1].startswith(coin):
+                failed.append(f"{coin}: insufficient history")
+            retry[coin] = now_ms + 6 * 3600_000
+            continue
+        with sgr._BARS_LOCK:
+            bars = sgr._BARS_CACHE.get((tf, coin)) or []
+        cbars[coin] = [[b["t"], b["open"], b["high"], b["low"], b["close"], b["volume"]] for b in bars]
+        row["narrative_forced"] = True
+        rows.append(row)
+        added.append(coin)
+    narr = sgr.load_narrative_tickers()
+    mcap_map = sgr.load_mcap_map() if getattr(sgr, "load_mcap_map", None) else {}
+    for r in rows:
+        sgr.enrich_row_tier_category(r, narr, mcap_map)
+    if added:
+        _recount(radar)
+    radar["narrative_retry_after_ms"] = {k: v for k, v in retry.items() if v > now_ms}
+    radar["narrative_map"] = narrative_map
+    radar["narrative_forced"] = sorted(set((radar.get("narrative_forced") or []) + added) & {r.get("symbol") for r in rows})
+    radar["narrative_not_on_hl"] = sorted(t for t, h in narrative_map.items() if not h)
+    return {"added": added, "failed": failed}
 
 
 def fetch_all_mids() -> Dict[str, float]:
@@ -73,7 +135,7 @@ def apply_mid(bars: List[list], mid: float, now_ms: int, bar_ms: int) -> List[li
 
 
 def refresh_tf(tf: str, mids: Dict[str, float], now_ms: Optional[int] = None,
-               out_dir: Optional[str] = None) -> dict:
+               out_dir: Optional[str] = None, narrative_map: Optional[Dict[str, Optional[str]]] = None) -> dict:
     out_dir = out_dir or sgr.OUT_DIR
     now_ms = now_ms or int(time.time() * 1000)
     cfg = sgr.TF_CONFIG[tf]
@@ -91,6 +153,7 @@ def refresh_tf(tf: str, mids: Dict[str, float], now_ms: Optional[int] = None,
     if not cbars:
         return {"tf": tf, "ok": False, "error": "candle cache missing (run closed-bar scan first)"}
 
+    nsync = sync_narrative(tf, radar, cbars, narrative_map) if narrative_map is not None else {}
     n_live = 0
     max_keep = int(cfg["n_bars"]) + 5
     for row in radar.get("rows") or []:
@@ -123,7 +186,8 @@ def refresh_tf(tf: str, mids: Dict[str, float], now_ms: Optional[int] = None,
     cache["bars"] = cbars
     cache["live_ts"] = ts
     _atomic_json(cache_path, cache, gz=True)
-    return {"tf": tf, "ok": True, "n_live": n_live, "n_rows": len(rows), "live_ts": ts}
+    return {"tf": tf, "ok": True, "n_live": n_live, "n_rows": len(rows), "live_ts": ts,
+            "narrative_added": nsync.get("added", []), "narrative_failed": nsync.get("failed", [])}
 
 
 def refresh_live(tfs=LIVE_TFS, mids: Optional[Dict[str, float]] = None, now_ms: Optional[int] = None,
@@ -131,10 +195,16 @@ def refresh_live(tfs=LIVE_TFS, mids: Optional[Dict[str, float]] = None, now_ms: 
     t0 = time.time()
     if mids is None:
         mids = fetch_all_mids()
-    res = {"ok": True, "n_mids": len(mids), "tfs": {}}
+    try:
+        narrative_map = sgr.resolve_narrative(hl_perp_names(mids))
+    except Exception:
+        narrative_map = None
+    res = {"ok": True, "n_mids": len(mids), "tfs": {},
+           "narrative_on_hl": sorted(h for h in (narrative_map or {}).values() if h),
+           "narrative_not_on_hl": sorted(t for t, h in (narrative_map or {}).items() if not h)}
     for tf in tfs:
         try:
-            r = refresh_tf(tf, mids, now_ms=now_ms, out_dir=out_dir)
+            r = refresh_tf(tf, mids, now_ms=now_ms, out_dir=out_dir, narrative_map=narrative_map)
         except Exception as e:  # never break the loop on one TF
             r = {"tf": tf, "ok": False, "error": str(e)}
         res["tfs"][tf] = r
