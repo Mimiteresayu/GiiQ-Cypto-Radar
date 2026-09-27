@@ -337,6 +337,14 @@ class TestReasonTagsAndCemetery(unittest.TestCase):
         r2 = {"symbol": "Y", "dual_cross_up": False, "drop_from_ath_pct": 90, "in_floor": False}
         sgr.enrich_row_tier_category(r2, set(), {})
         self.assertEqual(r2["reason_tags"], ["CEMETERY"])
+        r3 = {"symbol": "Z", "dual_cross_up": True, "drop_from_ath_pct": 40}  # GC but not cemetery -> no P/CR
+        sgr.enrich_row_tier_category(r3, set(), {})
+        self.assertEqual(r3["cat_tags"], "GC")
+        r4 = {"symbol": "W", "dual_cross_up": True, "drop_from_ath_pct": 10, "cemetery_1d": True}  # 4H row, 1D cem
+        sgr.enrich_row_tier_category(r4, set(), {})
+        self.assertEqual(r4["cat_tags"], "CEMETERY, GC, P/CR")
+        r5 = {"symbol": "V", "dual_cross_up": True, "drop_from_ath_pct": 90, "cemetery_1d": False}  # 1D not cem
+        self.assertNotIn("P/CR", sgr.reason_tags(r5, []))
 
     def test_1d_probe_keeps_only_cemetery_or_narrative(self):
         tmp = tempfile.mkdtemp()
@@ -354,7 +362,7 @@ class TestReasonTagsAndCemetery(unittest.TestCase):
         by = {r["symbol"]: r for r in p["rows"]}
         self.assertEqual(set(by), {"A", "LOWCEM"})
         self.assertEqual(by["LOWCEM"]["cat_tags"], "CEMETERY")
-        self.assertIn("P/CR", by["A"]["cat_tags"])
+        self.assertNotIn("P/CR", by["A"]["cat_tags"])  # no volume-floor tag
         self.assertEqual(p["cemetery_forced"], ["LOWCEM"])
 
     def test_live_sync_adds_cemetery_on_4h(self):
