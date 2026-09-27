@@ -45,7 +45,7 @@ def _get_hl_info(endpoint: str, params: dict) -> dict:
     """Call Hyperliquid info API."""
     import urllib.request as _url_req
     
-    payload = json.dumps(params).encode()
+    payload = json.dumps({"type": endpoint, **params}).encode()
     req = _url_req.Request(
         "https://api.hyperliquid.xyz/info",
         data=payload,
