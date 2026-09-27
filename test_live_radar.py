@@ -99,6 +99,7 @@ class TestDeskDataLiveFields(unittest.TestCase):
         for tf in ("1d", "4h", "1h"):
             rows = [{"symbol": s, "trend": "Green", "close": 1.0, "filter": 0.9, "upper": 1.1, "lower": 0.8,
                      "dual_cross_up": s == "AAA", "dual_cross_down_filter": False, "tier": "tiny", "bar_time": 1,
+                     "category": "Narrative", "categories": ["Narrative", "Cemetery"],
                      "live": {"close": 1.05, "filter": 0.91, "upper": 1.12, "lower": 0.81, "trend": "Green",
                               "above_upper": False, "cross_up": False}}
                     for s in ("AAA", "BTC", "ZZZ", "NARR")]
@@ -110,7 +111,8 @@ class TestDeskDataLiveFields(unittest.TestCase):
                                    "tier": "tiny", "close_1d": 1.0, "upper_1d": 1.1, "filter_4h": 0.9,
                                    "lower_4h": 0.8, "entry_ref": 1.1}]},
                   open(os.path.join(self.tmp, "entry_candidates_latest.json"), "w"))
-        json.dump({"updated": "2026-09-27", "items": [{"ticker": "NARR", "sector": "ai", "narrative": "x" * 200}]},
+        json.dump({"updated": "2026-09-27", "items": [{"ticker": "NARR", "sector": "ai", "narrative": "x" * 200},
+                                                     {"ticker": "OFFHL", "venue": "bitunix"}]},
                   open(os.path.join(self.tmp, "narrative_watchlist.json"), "w"))
         hl = {"hl_perp": {"marginSummary": {}, "withdrawable": "0", "assetPositions": []},
               "hl_spot": {"balances": [{"coin": "USDC", "total": "100", "hold": "0"}]},
@@ -145,6 +147,10 @@ class TestDeskDataLiveFields(unittest.TestCase):
         self.assertEqual(p["narrative"]["items"][0]["ticker"], "NARR")
         self.assertTrue(p["narrative"]["items"][0]["on_hl"])
         self.assertLessEqual(len(p["narrative"]["items"][0]["narrative"]), 80)
+        self.assertEqual(p["narrative"]["items"][0]["venue"], "HL")
+        self.assertEqual(p["narrative"]["items"][1]["venue"], "bitunix")  # non-HL ticker kept
+        self.assertFalse(p["narrative"]["items"][1]["on_hl"])
+        self.assertEqual(row["cat"], "Narrative + Cemetery")
 
     def test_live_payload_is_compact_focus(self):
         p = self.serve._build_desk_data_payload("live_radar", now=self.now, kind="live")

@@ -762,6 +762,14 @@ def _tf_timing(tf: str, radar: dict, now: datetime) -> dict:
     }
 
 
+def _cat_label(r: dict) -> str | None:
+    """ALL category labels joined (e.g. "Narrative + Cemetery"); falls back to primary."""
+    cats = r.get("categories")
+    if isinstance(cats, list) and cats:
+        return " + ".join(str(c) for c in cats)
+    return r.get("category_label") or r.get("category")
+
+
 def _trim_radar(radar: dict, focus: set | None = None) -> dict:
     """Radar for DESK_DATA. Row keys w/o prefix = LAST CLOSED bar (signal SoT);
     live_* = forming bar (display only). focus: keep only these symbols (compact log)."""
@@ -775,6 +783,7 @@ def _trim_radar(radar: dict, focus: set | None = None) -> dict:
         row["dual_cross_up"] = bool(r.get("dual_cross_up"))
         row["dual_cross_down"] = bool(r.get("dual_cross_down_filter", r.get("dual_cross_down")))
         row["tier"] = r.get("tier")
+        row["cat"] = _cat_label(r)
         mc = r.get("mcap_usd", r.get("mcap"))
         row["mcap"] = int(mc) if isinstance(mc, (int, float)) else None
         lv = r.get("live") if isinstance(r.get("live"), dict) else {}
@@ -831,7 +840,7 @@ def _load_candidates_file() -> dict:
         return {}
 
 
-_ENTRY_TAB_KEYS = ("symbol", "tier", "category", "trend_1d", "trend_4h", "close_1d", "upper_1d",
+_ENTRY_TAB_KEYS = ("symbol", "tier", "category", "category_label", "trend_1d", "trend_4h", "close_1d", "upper_1d",
                    "filter_1d", "close_4h", "upper_4h", "filter_4h", "lower_4h", "entry_ref", "hard_sl_dist_pct")
 
 
@@ -873,7 +882,7 @@ def _load_narrative(radar_1d: dict | None = None) -> dict:
         items.append({
             "ticker": t,
             "sector": it.get("sector"),
-            "venue": it.get("venue"),
+            "venue": "HL" if h else (it.get("venue") or "unknown"),  # HL or spot venue; non-HL kept
             "gc_scan": it.get("gc_scan"),
             "narrative": (it.get("narrative") or "")[:80],
             "last_seen": it.get("last_seen"),

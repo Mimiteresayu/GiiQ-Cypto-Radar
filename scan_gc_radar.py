@@ -176,6 +176,7 @@ def enrich_row_tier_category(row: dict, narrative_set: set, mcap_map: dict | Non
     primary, cats = classify_category(sym, row.get("drop_from_ath_pct"), narrative_set)
     row["category"] = primary
     row["categories"] = cats
+    row["category_label"] = " + ".join(cats) if cats else primary  # ALL labels, e.g. "Narrative + Cemetery"
 
 
 MAX_SYMBOLS = 280  # expanded liquid HL universe (~250–300; --max overrides)
