@@ -15,6 +15,20 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+_CAT_ORDER = ("N", "C", "CR")
+_CAT_LEGACY = {"NARRATIVE": "N", "Narrative": "N", "CEMETERY": "C", "Cemetery": "C", "P/CR": "CR"}
+
+
+def _cat_codes(r: dict) -> str:
+    """CAT short codes "N C CR" (blank if none); maps legacy tags/categories."""
+    raw = r.get("cat_tags")
+    if raw is None:
+        raw = r.get("categories") or []
+    if isinstance(raw, str):
+        raw = raw.replace(",", " ").split()
+    got = {_CAT_LEGACY.get(t, t) for t in raw}
+    return " ".join(c for c in _CAT_ORDER if c in got)
+
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
@@ -187,8 +201,8 @@ def build_candidates(
             "close_4h": r4h.get("close") if r4h else None,
             "category": r1d.get("category"),
             "categories": r1d.get("categories") or ([r1d["category"]] if r1d.get("category") else []),
-            "category_label": " + ".join(r1d.get("categories") or []) or r1d.get("category"),
-            "cat_tags": r1d.get("cat_tags"),
+            "category_label": _cat_codes(r1d),
+            "cat_tags": _cat_codes(r1d),
             "is_base": bool(base),
             "is_chase": bool(chase),
             # ENTRY ref: Base = 1D Upper, Chase = 4H Upper (closed bars)

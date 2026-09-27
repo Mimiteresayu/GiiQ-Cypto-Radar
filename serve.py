@@ -762,14 +762,19 @@ def _tf_timing(tf: str, radar: dict, now: datetime) -> dict:
     }
 
 
-def _cat_label(r: dict) -> str | None:
-    """Reason tags comma-separated (e.g. "NARRATIVE, CEMETERY, GC, P/CR"); older rows: categories joined."""
-    if r.get("cat_tags"):
-        return r["cat_tags"]
-    cats = r.get("categories")
-    if isinstance(cats, list) and cats:
-        return " + ".join(str(c) for c in cats)
-    return r.get("category_label") or r.get("category")
+_CAT_ORDER = ("N", "C", "CR")
+_CAT_LEGACY = {"NARRATIVE": "N", "Narrative": "N", "CEMETERY": "C", "Cemetery": "C", "P/CR": "CR"}
+
+
+def _cat_label(r: dict) -> str:
+    """CAT short codes, space-separated, fixed order N C CR (blank if none). Legacy rows mapped."""
+    raw = r.get("cat_tags")
+    if raw is None:
+        raw = r.get("categories") or []
+    if isinstance(raw, str):
+        raw = raw.replace(",", " ").split()
+    got = {_CAT_LEGACY.get(t, t) for t in raw}
+    return " ".join(c for c in _CAT_ORDER if c in got)
 
 
 def _trim_radar(radar: dict, focus: set | None = None) -> dict:

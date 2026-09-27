@@ -244,9 +244,9 @@ def enrich_row_tier_category(row: dict, narrative_set: set, mcap_map: dict | Non
     primary, cats = classify_category(sym, row.get("drop_from_ath_pct"), narrative_set)
     row["category"] = primary
     row["categories"] = cats
-    row["category_label"] = " + ".join(cats) if cats else primary  # ALL labels, e.g. "Narrative + Cemetery"
     row["reason_tags"] = reason_tags(row, cats)
-    row["cat_tags"] = ", ".join(row["reason_tags"])
+    row["cat_tags"] = " ".join(row["reason_tags"])  # CAT display: "N C CR" (blank if none)
+    row["category_label"] = row["cat_tags"]  # same short codes (no long "Narrative + Cemetery" strings)
 
 
 def _is_cemetery_1d(row: dict) -> bool:
@@ -260,21 +260,33 @@ def _is_cemetery_1d(row: dict) -> bool:
         return False
 
 
+CAT_CODE_ORDER = ("N", "C", "CR")
+_LEGACY_CAT = {"NARRATIVE": "N", "Narrative": "N", "CEMETERY": "C", "Cemetery": "C", "P/CR": "CR"}
+
+
 def reason_tags(row: dict, cats: Optional[List[str]] = None) -> List[str]:
-    """Why a row is on the radar (display only): NARRATIVE (watchlist), CEMETERY (>=70% below ATH),
-    GC (closed-bar dual_cross_up on this TF), P/CR (cemetery ignition, user lock: 1D down-from-ATH >= 70%
-    AND closed-bar dual_cross_up on this TF = Primary + Cemetery Revival)."""
+    """CAT short codes (display only), fixed order: N (narrative watchlist), C (cemetery: >=70% below the 1D ATH;
+    4H/1H use the 1D status), CR (cemetery revival = C AND closed-bar dual_cross_up on this TF). Plain coins -> []."""
     cats = cats if cats is not None else (row.get("categories") or [])
     tags = []
     if "Narrative" in cats:
-        tags.append("NARRATIVE")
-    if "Cemetery" in cats or row.get("cemetery_1d"):  # 4H/1H use the 1D (280d ATH) cemetery status
-        tags.append("CEMETERY")
-    if row.get("dual_cross_up"):
-        tags.append("GC")
-    if row.get("dual_cross_up") and _is_cemetery_1d(row):
-        tags.append("P/CR")
+        tags.append("N")
+    if _is_cemetery_1d(row):
+        tags.append("C")
+        if row.get("dual_cross_up"):
+            tags.append("CR")
     return tags
+
+
+def cat_codes(row: dict) -> str:
+    """Space-separated CAT codes for any row (new `cat_tags`, legacy comma tags, or old `categories`)."""
+    raw = row.get("cat_tags")
+    if raw is None:
+        raw = row.get("categories") or []
+    if isinstance(raw, str):
+        raw = raw.replace(",", " ").split()
+    got = {_LEGACY_CAT.get(t, t) for t in raw}
+    return " ".join(c for c in CAT_CODE_ORDER if c in got)
 
 
 def load_cemetery_set() -> List[str]:

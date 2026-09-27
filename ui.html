@@ -672,7 +672,7 @@
         <tr>
           <th data-k="symbol">Symbol <span class="arrow">↕</span></th>
           <th data-k="tier">Tier <span class="arrow">↕</span></th>
-          <th data-k="category">Cat <span class="arrow">↕</span></th>
+          <th data-k="cat_code" title="N=Narrative  C=Cemetery (≥70% below ATH)  CR=Cemetery + GC cross">Cat <span class="arrow">↕</span></th>
           <th data-k="lv_trend" title="forming bar (live)">Trend·live <span class="arrow">↕</span></th>
           <th data-k="lv_close" title="live price">Close·live <span class="arrow">↕</span></th>
           <th data-k="lv_filter">Filter·live <span class="arrow">↕</span></th>
@@ -687,6 +687,7 @@
           <th data-k="mom_score">mom_score <span class="arrow">↕</span></th>
           <th data-k="mom_rank">mom_rank <span class="arrow">↕</span></th>
         </tr>
+        <tr class="cat-legend"><th colspan="40" style="font-weight:normal;font-size:0.68rem;color:var(--muted);text-align:left;cursor:default">CAT: N=Narrative&nbsp;&nbsp;C=Cemetery (≥70% below ATH)&nbsp;&nbsp;CR=Cemetery + GC cross</th></tr>
       </thead>
       <tbody id="radarTbody"></tbody>
     </table>
@@ -845,12 +846,15 @@
     const closedClose = closedOpen ? closedOpen + bar : null;
     return `live @ ${hktHM(d.live_ts||d.ts)} · last closed bar ${hktHM(closedClose)} / next close ${hktHM(nextClose)} HKT`;
   }
-  // ALL category labels joined ("Narrative + Cemetery"); primary as fallback
+  // CAT short codes, fixed order: N=Narrative C=Cemetery CR=Cemetery+GC cross (blank if none); legacy rows mapped
+  const CAT_ORDER = ["N","C","CR"];
+  const CAT_LEGACY = {NARRATIVE:"N", Narrative:"N", CEMETERY:"C", Cemetery:"C", "P/CR":"CR"};
   function catLabel(r) {
     if (!r) return "";
-    if (r.cat_tags) return r.cat_tags;  // "NARRATIVE, CEMETERY, GC, P/CR"
-    if (Array.isArray(r.categories) && r.categories.length) return r.categories.join(" + ");
-    return r.category_label || r.category || "";
+    let raw = (r.cat_tags != null) ? r.cat_tags : (r.categories || []);
+    if (typeof raw === "string") raw = raw.replace(/,/g," ").split(/\s+/);
+    const got = new Set(raw.map(t => CAT_LEGACY[t] || t));
+    return CAT_ORDER.filter(c => got.has(c)).join(" ");
   }
   function liveOf(r) { return (r && r.live) || {}; }
 
@@ -1157,11 +1161,11 @@
       ? base.map(c => {
           const tier = (c.tier||"tiny").toLowerCase();
           const cat  = c.category||"";
-          const catL = c.cat_tags||c.category_label||cat;
+          const catL = catLabel(c);
           return `<div class="entry-row">
             <span class="er-coin">${esc(c.symbol)}</span>
             <span class="cand-tier tier-${tier}">${tier}</span>
-            <span class="cat-${cat}" style="font-size:0.68rem">${esc(catL)}</span>
+            <span class="cat-${cat}" style="font-size:0.68rem">${esc(catL)||""}</span>
             <span class="er-price">${fmtNum(c.upper_1d)}</span>
             <span class="er-note">1D cross_up + 1D Green (closed) · fill N+1 · entry=Upper ${c.upper_1d?">"+fmtNum(c.upper_1d):""}</span>
           </div>`;
@@ -1193,7 +1197,7 @@
       return `<tr class="${r.dual_cross_up?"hl-up":""}">
         <td>${esc(r.symbol)}</td>
         <td class="tier-${(r.tier||"tiny").toLowerCase()}">${r.tier||"—"}</td>
-        <td class="cat-${r.category||""}">${esc(catLabel(r))||"—"}</td>
+        <td class="cat-${r.category||""}">${esc(catLabel(r))}</td>
         <td class="trend-g">Green</td>
         <td>${fmtNum(r.close)}</td>
         <td>${fmtNum(r.upper)}</td>
@@ -1237,7 +1241,7 @@
       const lv = liveOf(r);
       return {...r, lv_close: lv.close ?? r.close, lv_filter: lv.filter ?? r.filter, lv_upper: lv.upper ?? r.upper,
               lv_lower: lv.lower ?? r.lower, lv_trend: lv.trend ?? r.trend, lv_above_upper: lv.above_upper ?? r.above_upper,
-              lv_cross_up: !!lv.cross_up};
+              lv_cross_up: !!lv.cross_up, cat_code: catLabel(r)};
     }) : [];
     switch (radarFilter) {
       case "green": rows=rows.filter(r=>r.trend==="Green"); break;
@@ -1262,7 +1266,7 @@
       return `<tr class="${cls}">
         <td>${esc(r.symbol)}</td>
         <td class="tier-${tier}">${tier}</td>
-        <td class="cat-${r.category||""}">${esc(catLabel(r))||"—"}</td>
+        <td class="cat-${r.category||""}">${esc(catLabel(r))}</td>
         <td class="${r.lv_trend==="Green"?"trend-g":"trend-r"}">${r.lv_trend}${r.lv_cross_up?" ↑":""}</td>
         <td>${fmtNum(r.lv_close)}</td>
         <td>${fmtNum(r.lv_filter)}</td>
