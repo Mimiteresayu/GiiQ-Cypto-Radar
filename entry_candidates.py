@@ -90,7 +90,9 @@ def build_candidates(
     stale = False
     if radar_1d_age_h and radar_1d_age_h > 36:
         stale = True
-    if radar_4h_age_h and radar_4h_age_h > 2:
+    # 4H radar refreshes every 4h (:10) and the 08:05 job now rescans 4H too; allow one
+    # full 4H cycle + slack before flagging stale (was 2h -> always stale at 08:05).
+    if radar_4h_age_h and radar_4h_age_h > 4.5:
         stale = True
     
     # Build position set for already_held check

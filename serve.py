@@ -58,6 +58,11 @@ SCAN_CONCURRENCY = int(os.environ.get("OTR_SCAN_CONCURRENCY") or "2")
 # Radar refresh interval for 1h+4h (minutes). Default 15 for 1H exits.
 SCAN_INTERVAL_MIN = max(5, int(os.environ.get("OTR_SCAN_INTERVAL_MIN") or "15"))
 _scan_lock = threading.Lock()
+# Scheduled jobs WAIT for the scan lock (instead of skipping) so e.g. the 08:05 1D+4H scan
+# never makes the 08:07 1H exit job skip.  Manual /api/rescan still returns 409 when busy.
+SCHED_LOCK_WAIT_S = int(os.environ.get("OTR_SCHED_LOCK_WAIT_S") or "1200")
+DESK_DATA_CHUNK_BYTES = int(os.environ.get("DESK_DATA_CHUNK_BYTES") or "60000")
+SCHEDULER_STATUS_PATH = os.path.join(OUT_DIR, "scheduler_status.json")
 _last_scan: dict[str, str] = {}  # tf -> slot key
 _last_failsafe: str = ""  # last failsafe run slot key (hour)
 
@@ -65,6 +70,16 @@ try:
     from entry_candidates import build_candidates
 except ImportError:
     build_candidates = None  # type: ignore
+
+from exec_common import (  # noqa: E402
+    clamp_leverage,
+    hard_sl_for_tier,
+    hkt_date,
+    isolated_liq_price_long,
+    liq_beyond_sl_long,
+    parse_ts,
+    sig,
+)
 
 try:
     from decisions import store_decisions, get_decisions_for_today
@@ -211,10 +226,10 @@ def _due_tfs(now: datetime) -> list[tuple[str, int]]:
     return due
 
 
-def _generate_entry_candidates() -> None:
-    """Generate entry_candidates_latest.json and dated snapshot (non-fatal)."""
+def _generate_entry_candidates() -> int | None:
+    """Generate entry_candidates_latest.json and dated snapshot (non-fatal). Returns count."""
     if not build_candidates:
-        return
+        return None
     try:
         radar_1d_path = os.path.join(OUT_DIR, "gc_radar_1d.json")
         radar_4h_path = os.path.join(OUT_DIR, "gc_radar_4h.json")
@@ -236,8 +251,10 @@ def _generate_entry_candidates() -> None:
         with open(dated_path, "w") as f:
             json.dump(result, f, indent=2)
         sys.stderr.write(f"[entry_candidates] generated count={result['count']} → {dated_name}\n")
+        return result["count"]
     except Exception as e:
         sys.stderr.write(f"[entry_candidates] error (non-fatal): {e}\n")
+        return None
 
 
 def _fetch_hl_live() -> dict:
@@ -546,219 +563,423 @@ def _compute_positions_with_stops(hl_data: dict, radar_1h: dict, radar_4h: dict)
     return result
 
 
-def _log_desk_data() -> None:
-    """One-line summary of scan completion (reduced from full JSON dump)."""
+# =====================================================================
+# [DESK_DATA] single-line JSON for log readers (Claude jobs read Railway logs via MCP)
+# =====================================================================
+
+_hl_meta_cache: dict = {}
+_hl_meta_lock = threading.Lock()
+HL_META_TTL_S = 3600
+
+
+def _get_hl_meta_cached() -> dict:
+    """coin -> {szDecimals, maxLeverage} from HL meta (1h cache; {} on failure)."""
+    now = time.time()
+    with _hl_meta_lock:
+        if _hl_meta_cache.get("data") and now - _hl_meta_cache.get("ts", 0) < HL_META_TTL_S:
+            return _hl_meta_cache["data"]
+        try:
+            req = _url_req.Request(
+                HL_API_URL,
+                data=json.dumps({"type": "meta"}).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with _url_req.urlopen(req, timeout=15) as resp:
+                m = json.loads(resp.read())
+            data = {
+                a["name"]: {"szDecimals": a.get("szDecimals", 0), "maxLeverage": a.get("maxLeverage")}
+                for a in (m.get("universe") or [])
+            }
+            _hl_meta_cache.update(ts=now, data=data)
+            return data
+        except Exception as e:
+            sys.stderr.write(f"[HL_META] fetch failed: {e}\n")
+            return _hl_meta_cache.get("data") or {}
+
+
+def _suggested_size_pct(entry_type: str) -> float:
+    if entry_type == "Continuation":
+        return 3.0
+    if entry_type == "Chase":
+        return 8.0
+    return 6.0
+
+
+def _enhance_candidates(candidates: list, account: dict, meta: dict) -> list:
+    """Add suggested size/leverage, tier Hard SL and ISOLATED liq estimate to each candidate.
+
+    size_pct = margin % of equity; notional = margin x leverage.
+    Liq = HL isolated-long formula (exec_common.isolated_liq_price_long) -> never negative.
+    """
+    equity = 0.0
     try:
-        radar_ts = {}
-        pos_count = {}
-        for tf in ("1h", "4h", "1d"):
-            fp = os.path.join(OUT_DIR, f"gc_radar_{tf}.json")
-            try:
-                with open(fp) as f:
-                    data = json.load(f)
-                    radar_ts[tf] = data.get("ts", "")[:19]
-                    rows = data.get("rows") or []
-                    pos_count[tf] = len(rows)
-            except Exception:
-                radar_ts[tf] = "error"
-                pos_count[tf] = 0
-        sys.stderr.write(
-            f"[DESK_DATA] {datetime.now(timezone.utc).isoformat()[:19]} "
-            f"radar_1h={pos_count['1h']}@{radar_ts['1h']} "
-            f"radar_4h={pos_count['4h']}@{radar_ts['4h']} "
-            f"radar_1d={pos_count['1d']}@{radar_ts['1d']}\n"
-        )
+        equity = float(account.get("equity") or 0)
+    except (TypeError, ValueError, AttributeError):
+        equity = 0.0
+    out = []
+    for c in candidates:
+        coin_max = (meta.get(c.get("symbol")) or {}).get("maxLeverage")
+        size_pct = _suggested_size_pct(c.get("type", "Base"))
+        lev = clamp_leverage(2.0, coin_max)
+        hard_sl, sl_label = hard_sl_for_tier(c.get("tier", ""), {"lower": c.get("lower_4h"), "filter": c.get("filter_4h")})
+        close_1d = c.get("close_1d") or 0
+        liq = isolated_liq_price_long(close_1d, lev, coin_max) if close_1d else None
+        margin = equity * size_pct / 100.0 if equity else None
+        out.append({
+            **c,
+            "suggested_size_pct": size_pct,
+            "suggested_leverage": lev,
+            "coin_max_leverage": coin_max,
+            "margin_mode": "isolated",
+            "suggested_margin_usd": round(margin, 2) if margin else None,
+            "suggested_notional_usd": round(margin * lev, 2) if margin else None,
+            "hard_sl": hard_sl,
+            "hard_sl_label": sl_label,
+            "estimated_liq_price": liq,
+            "liq_beyond_sl": liq_beyond_sl_long(liq, hard_sl) if liq is not None else None,
+        })
+    return out
+
+
+_DESK_ROW_KEYS = ("symbol", "trend", "close", "filter", "upper", "lower")
+
+
+def _trim_radar(radar: dict) -> dict:
+    if not isinstance(radar, dict) or "rows" not in radar:
+        return {"error": (radar or {}).get("error", "missing") if isinstance(radar, dict) else "missing"}
+    rows = []
+    for r in radar.get("rows") or []:
+        row = {k: sig(r.get(k)) for k in _DESK_ROW_KEYS}
+        row["dual_cross_up"] = bool(r.get("dual_cross_up"))
+        row["dual_cross_down"] = bool(r.get("dual_cross_down_filter", r.get("dual_cross_down")))
+        row["tier"] = r.get("tier")
+        mc = r.get("mcap_usd", r.get("mcap"))
+        row["mcap"] = int(mc) if isinstance(mc, (int, float)) else None
+        rows.append(row)
+    return {
+        "ts": radar.get("ts"),
+        "n": len(rows),
+        "breadth": radar.get("breadth"),
+        "flags": {"dual_cross_up": (radar.get("flags") or {}).get("dual_cross_up", [])},
+        "rows": rows,
+    }
+
+
+def _trim_hl_perp(perp: dict) -> dict:
+    if not isinstance(perp, dict) or "error" in perp:
+        return {"error": (perp or {}).get("error", "missing") if isinstance(perp, dict) else "missing"}
+    ms = perp.get("marginSummary") or {}
+    positions = []
+    for g in perp.get("assetPositions") or []:
+        p = g.get("position") or {}
+        try:
+            if abs(float(p.get("szi") or 0)) < 1e-12:
+                continue
+        except (TypeError, ValueError):
+            continue
+        lev = p.get("leverage") or {}
+        positions.append({
+            "coin": p.get("coin"),
+            "szi": sig(float(p.get("szi") or 0)),
+            "entryPx": sig(float(p.get("entryPx") or 0)),
+            "positionValue": sig(float(p.get("positionValue") or 0)),
+            "unrealizedPnl": sig(float(p.get("unrealizedPnl") or 0)),
+            "liquidationPx": sig(float(p.get("liquidationPx") or 0)) if p.get("liquidationPx") else None,
+            "marginUsed": sig(float(p.get("marginUsed") or 0)),
+            "leverage": {"type": lev.get("type"), "value": lev.get("value")},
+        })
+    return {
+        "marginSummary": {k: sig(float(ms.get(k) or 0)) for k in ("accountValue", "totalMarginUsed", "totalNtlPos")},
+        "withdrawable": sig(float(perp.get("withdrawable") or 0)),
+        "positions": positions,
+    }
+
+
+def _trim_hl_spot(spot: dict) -> dict:
+    if not isinstance(spot, dict) or "error" in spot:
+        return {"error": (spot or {}).get("error", "missing") if isinstance(spot, dict) else "missing"}
+    for b in spot.get("balances") or []:
+        if b.get("coin") == "USDC":
+            return {"usdc_total": sig(float(b.get("total") or 0)), "usdc_hold": sig(float(b.get("hold") or 0))}
+    return {"usdc_total": 0.0, "usdc_hold": 0.0}
+
+
+def _build_desk_data_payload(event: str = "", now: datetime | None = None) -> dict:
+    """Compact desk snapshot for the [DESK_DATA] log line."""
+    now = now or datetime.now(timezone.utc)
+    radars = {}
+    for tf in ("1d", "4h", "1h"):
+        try:
+            with open(os.path.join(OUT_DIR, f"gc_radar_{tf}.json")) as f:
+                radars[tf] = json.load(f)
+        except Exception as e:
+            radars[tf] = {"error": str(e)}
+    try:
+        hl_data = _get_hl_cached()
     except Exception as e:
-        sys.stderr.write(f"[DESK_DATA] error: {e}\n")
+        hl_data = {"hl_perp": {"error": str(e)}, "hl_spot": {"error": str(e)}}
+    account = _compute_unified_equity(hl_data) if not hl_data.get("fetch_error") else {}
+
+    cands: list = []
+    cand_meta: dict = {"generated_at": None, "stale": None, "today": False}
+    try:
+        with open(os.path.join(OUT_DIR, "entry_candidates_latest.json")) as f:
+            cd = json.load(f)
+        gen = parse_ts(cd.get("generated_at"))
+        cand_meta = {"generated_at": cd.get("generated_at"), "stale": cd.get("stale"),
+                     "today": bool(gen and hkt_date(gen) == hkt_date(now))}
+        if cand_meta["today"]:
+            for c in _enhance_candidates(cd.get("candidates") or [], account, _get_hl_meta_cached()):
+                cands.append({
+                    "symbol": c.get("symbol"), "type": c.get("type"), "tier": c.get("tier"),
+                    "trend_1d": c.get("trend_1d"), "trend_4h": c.get("trend_4h"),
+                    "close": sig(c.get("close_1d")), "hard_sl": sig(c.get("hard_sl")),
+                    "hard_sl_label": c.get("hard_sl_label"), "sl_pct": sig(c.get("hard_sl_dist_pct"), 4),
+                    "size_pct": c.get("suggested_size_pct"), "lev": c.get("suggested_leverage"),
+                    "max_lev": c.get("coin_max_leverage"), "liq": sig(c.get("estimated_liq_price")),
+                    "liq_beyond_sl": c.get("liq_beyond_sl"), "held": c.get("already_held"),
+                })
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        cand_meta["error"] = str(e)
+
+    return {
+        "ts": now.isoformat(),
+        "event": event,
+        "candidates_meta": cand_meta,
+        "candidates": cands,
+        "hl_spot": _trim_hl_spot(hl_data.get("hl_spot", {})),
+        "hl_perp": _trim_hl_perp(hl_data.get("hl_perp", {})),
+        "gc_radar_1d": _trim_radar(radars["1d"]),
+        "gc_radar_4h": _trim_radar(radars["4h"]),
+        "gc_radar_1h": _trim_radar(radars["1h"]),
+    }
+
+
+def _dumps(obj: dict) -> str:
+    return json.dumps(obj, separators=(",", ":"), default=str)
+
+
+def _desk_data_lines(payload: dict, max_bytes: int | None = None) -> list:
+    """Render payload as ONE line `[DESK_DATA] {json}` or, if larger than max_bytes,
+    as `[DESK_DATA i/n] {json}` chunks. Every chunk is self-contained JSON with the same
+    `ts` plus `part`/`parts`; radars too big for one chunk are split by rows with
+    `rows_offset` (concatenate rows in part order to rebuild)."""
+    max_bytes = max_bytes or DESK_DATA_CHUNK_BYTES
+    full = _dumps(payload)
+    if len(full.encode()) <= max_bytes:
+        return [f"[DESK_DATA] {full}"]
+
+    ts = payload.get("ts")
+    budget = max_bytes - 200  # room for ts/part/parts wrapper
+    sections: list = []  # list of dicts (each becomes part of a chunk)
+    head = {k: v for k, v in payload.items() if not k.startswith("gc_radar_") and k != "ts"}
+    sections.append(head)
+    for key in ("gc_radar_1d", "gc_radar_4h", "gc_radar_1h"):
+        r = payload.get(key)
+        if r is None:
+            continue
+        if len(_dumps({key: r}).encode()) <= budget or not isinstance(r.get("rows"), list):
+            sections.append({key: r})
+            continue
+        base = {k: v for k, v in r.items() if k != "rows"}
+        rows = r["rows"]
+        piece: list = []
+        offset = 0
+        first = True
+        for i, row in enumerate(rows):
+            trial = dict(base if first else {"ts": r.get("ts")}, rows_offset=offset, rows=piece + [row])
+            if piece and len(_dumps({key: trial}).encode()) > budget:
+                sections.append({key: dict(base if first else {"ts": r.get("ts")}, rows_offset=offset, rows=piece)})
+                first = False
+                offset = i
+                piece = [row]
+            else:
+                piece.append(row)
+        sections.append({key: dict(base if first else {"ts": r.get("ts")}, rows_offset=offset, rows=piece)})
+
+    chunks: list = []
+    cur: dict = {}
+    for sec in sections:
+        trial = {**cur, **sec}
+        if cur and (len(_dumps(trial).encode()) > budget or any(k in cur for k in sec)):
+            chunks.append(cur)
+            cur = dict(sec)
+        else:
+            cur = trial
+    if cur:
+        chunks.append(cur)
+    n = len(chunks)
+    return [f"[DESK_DATA {i}/{n}] " + _dumps({"ts": ts, "part": i, "parts": n, **c}) for i, c in enumerate(chunks, 1)]
+
+
+def _log_desk_data(event: str = "") -> None:
+    """Emit the [DESK_DATA] JSON line(s) to stdout (Railway deploy logs)."""
+    try:
+        for line in _desk_data_lines(_build_desk_data_payload(event)):
+            sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+    except Exception as e:
+        sys.stderr.write(f"[DESK_DATA_ERROR] {e}\n")
 
 
 # =====================================================================
 # APScheduler: In-process cron jobs for auto-execution
 # =====================================================================
 
-# Scheduler state tracking
 _scheduler_jobs_status: dict[str, dict] = {}
 _scheduler_lock = threading.Lock()
 
 
+def _load_job_status() -> None:
+    """Restore last job status from the volume so restarts don't wipe it."""
+    try:
+        with open(SCHEDULER_STATUS_PATH) as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            with _scheduler_lock:
+                _scheduler_jobs_status.update(data)
+    except Exception:
+        pass
+
+
 def _update_job_status(job_name: str, status: str, message: str = "", error: str = "") -> None:
-    """Update scheduler job status."""
     with _scheduler_lock:
         _scheduler_jobs_status[job_name] = {
             "last_run": datetime.now(timezone.utc).isoformat(),
             "status": status,
             "message": message,
-            "error": error,
+            "error": error[-1500:] if error else "",
         }
+        snapshot = dict(_scheduler_jobs_status)
+    try:
+        os.makedirs(OUT_DIR, exist_ok=True)
+        tmp = SCHEDULER_STATUS_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(snapshot, f, indent=2)
+        os.replace(tmp, SCHEDULER_STATUS_PATH)
+    except Exception as e:
+        sys.stderr.write(f"[SCHEDULER] status persist failed: {e}\n")
 
 
 def _get_scheduler_status() -> dict:
-    """Get current scheduler status for all jobs."""
     with _scheduler_lock:
         return dict(_scheduler_jobs_status)
 
 
-def _scheduled_1d_scan() -> None:
-    """Scheduled job: 1D scan + generate entry candidates (08:05 HKT daily)."""
-    job_name = "1d_scan_candidates"
-    
-    # Lock guard
-    if not _scan_lock.acquire(blocking=False):
-        _update_job_status(job_name, "skipped", "scan already running")
+def _run_worker(script: str, args: list, timeout: int, force_dry_run: bool = False) -> tuple[int, str, str]:
+    """Run a worker script; forward its stderr to our logs. force_dry_run strips live creds."""
+    env = dict(os.environ)
+    if force_dry_run:
+        env["EXEC_DRY_RUN"] = "1"
+        env.pop("HL_API_PRIVATE_KEY", None)
+    proc = subprocess.run(
+        [sys.executable, os.path.join(ROOT, script), *args],
+        cwd=ROOT, capture_output=True, text=True, timeout=timeout, env=env,
+    )
+    if proc.stderr:
+        for line in proc.stderr.strip().splitlines()[-60:]:
+            sys.stderr.write(f"  [{script}] {line}\n")
+    return proc.returncode, proc.stdout or "", proc.stderr or ""
+
+
+def _acquire_scan_lock(job_name: str) -> bool:
+    if _scan_lock.acquire(timeout=SCHED_LOCK_WAIT_S):
+        return True
+    _update_job_status(job_name, "skipped", f"scan lock busy > {SCHED_LOCK_WAIT_S}s")
+    sys.stderr.write(f"[SCHEDULER] {job_name} skipped: lock busy > {SCHED_LOCK_WAIT_S}s\n")
+    return False
+
+
+def _scheduled_1d_scan(manual: bool = False) -> None:
+    """08:05 HKT: 1D + 4H scan (fresh 4H bar for Chase/stale check) -> candidates -> [DESK_DATA]."""
+    job_name = "manual_1d_scan_candidates" if manual else "1d_scan_candidates"
+    if not _acquire_scan_lock(job_name):
         return
-    
     try:
         sys.stderr.write(f"[SCHEDULER] Starting {job_name}\n")
-        
-        # 1D scan
-        ok, note = _run_scan(["1d"], max_symbols=SCAN_MAX)
+        ok, note = _run_scan(["1d", "4h"], max_symbols=SCAN_MAX)
         if not ok:
             _update_job_status(job_name, "error", "", note)
             sys.stderr.write(f"[SCHEDULER] {job_name} scan failed: {note[:200]}\n")
             return
-        
-        # Generate entry candidates
-        if build_candidates:
-            _generate_entry_candidates()
-        
-        _update_job_status(job_name, "success", f"1D scan complete, {note}")
-        sys.stderr.write(f"[SCHEDULER] {job_name} completed: {note[:200]}\n")
+        count = _generate_entry_candidates()
+        _update_job_status(job_name, "success", f"{note}; candidates={count}")
+        sys.stderr.write(f"[SCHEDULER] {job_name} completed: {note}; candidates={count}\n")
     except Exception as e:
         _update_job_status(job_name, "error", "", str(e))
         sys.stderr.write(f"[SCHEDULER] {job_name} exception: {e}\n")
     finally:
         _scan_lock.release()
+    _log_desk_data(job_name)
 
 
-def _scheduled_1h_scan_exits() -> None:
-    """Scheduled job: 1H scan + Small/Tiny exits (hourly :05)."""
-    job_name = "1h_scan_exits"
-    
-    # Lock guard
-    if not _scan_lock.acquire(blocking=False):
-        _update_job_status(job_name, "skipped", "scan already running")
+def _scan_and_exits(job_name: str, tf: str, max_symbols: int, exit_arg: str, manual: bool) -> None:
+    if not _acquire_scan_lock(job_name):
         return
-    
     try:
         sys.stderr.write(f"[SCHEDULER] Starting {job_name}\n")
-        
-        # 1H scan
-        ok, note = _run_scan(["1h"], max_symbols=SCAN_MAX_1H)
+        ok, note = _run_scan([tf], max_symbols=max_symbols)
         if not ok:
             _update_job_status(job_name, "error", "", note)
             sys.stderr.write(f"[SCHEDULER] {job_name} scan failed: {note[:200]}\n")
             return
-        
-        # Small/Tiny exits
-        exit_script = os.path.join(ROOT, "exit_worker.py")
-        if os.path.isfile(exit_script):
+        try:
+            rc, out, err = _run_worker("exit_worker.py", [exit_arg], timeout=300, force_dry_run=manual)
+        except Exception as e:
+            rc, out, err = 99, "", str(e)
+        if rc == 0:
             try:
-                proc = subprocess.run(
-                    [sys.executable, exit_script, "hourly"],
-                    cwd=ROOT,
-                    capture_output=True,
-                    text=True,
-                    timeout=300,
-                )
-                exit_msg = "exits OK" if proc.returncode == 0 else f"exits failed: {proc.returncode}"
-            except Exception as e:
-                exit_msg = f"exits error: {e}"
-        else:
-            exit_msg = "exit_worker.py missing"
-        
-        _update_job_status(job_name, "success", f"1H scan + {exit_msg}")
-        sys.stderr.write(f"[SCHEDULER] {job_name} completed: {note[:200]}, {exit_msg}\n")
-        _log_desk_data()
-    except Exception as e:
-        _update_job_status(job_name, "error", "", str(e))
-        sys.stderr.write(f"[SCHEDULER] {job_name} exception: {e}\n")
-    finally:
-        _scan_lock.release()
-
-
-def _scheduled_4h_scan_exits() -> None:
-    """Scheduled job: 4H scan + Mega/Large exits (every 4h :05)."""
-    job_name = "4h_scan_exits"
-    
-    # Lock guard
-    if not _scan_lock.acquire(blocking=False):
-        _update_job_status(job_name, "skipped", "scan already running")
-        return
-    
-    try:
-        sys.stderr.write(f"[SCHEDULER] Starting {job_name}\n")
-        
-        # 4H scan
-        ok, note = _run_scan(["4h"], max_symbols=SCAN_MAX)
-        if not ok:
-            _update_job_status(job_name, "error", "", note)
-            sys.stderr.write(f"[SCHEDULER] {job_name} scan failed: {note[:200]}\n")
-            return
-        
-        # Mega/Large exits
-        exit_script = os.path.join(ROOT, "exit_worker.py")
-        if os.path.isfile(exit_script):
-            try:
-                proc = subprocess.run(
-                    [sys.executable, exit_script, "4h"],
-                    cwd=ROOT,
-                    capture_output=True,
-                    text=True,
-                    timeout=300,
-                )
-                exit_msg = "exits OK" if proc.returncode == 0 else f"exits failed: {proc.returncode}"
-            except Exception as e:
-                exit_msg = f"exits error: {e}"
-        else:
-            exit_msg = "exit_worker.py missing"
-        
-        _update_job_status(job_name, "success", f"4H scan + {exit_msg}")
-        sys.stderr.write(f"[SCHEDULER] {job_name} completed: {note[:200]}, {exit_msg}\n")
-        _log_desk_data()
-    except Exception as e:
-        _update_job_status(job_name, "error", "", str(e))
-        sys.stderr.write(f"[SCHEDULER] {job_name} exception: {e}\n")
-    finally:
-        _scan_lock.release()
-
-
-def _scheduled_executor() -> None:
-    """Scheduled job: Execute approved candidates (08:55 HKT daily)."""
-    job_name = "executor"
-    
-    try:
-        sys.stderr.write(f"[SCHEDULER] Starting {job_name}\n")
-        
-        executor_script = os.path.join(ROOT, "executor.py")
-        if not os.path.isfile(executor_script):
-            _update_job_status(job_name, "error", "", "executor.py missing")
-            return
-        
-        proc = subprocess.run(
-            [sys.executable, executor_script],
-            cwd=ROOT,
-            capture_output=True,
-            text=True,
-            timeout=600,  # 10 min timeout
-        )
-        
-        if proc.returncode == 0:
-            try:
-                result = json.loads(proc.stdout)
-                executed = len(result.get("executed", []))
-                actions = len(result.get("actions", []))
-                skipped = len(result.get("skipped", []))
-                mode = result.get("mode", "?")
-                status = result.get("status", "unknown")
-                msg = f"{mode} {status}: executed={executed} actions={actions} skipped={skipped}"
-                _update_job_status(job_name, "success", msg)
-                sys.stderr.write(f"[SCHEDULER] {job_name} completed: {msg}\n")
+                res = json.loads(out)
+                msg = (f"{note}; exits {res.get('mode')} ok: exits={len(res.get('exits', []))} "
+                       f"actions={len(res.get('actions', []))} sl_actions={len(res.get('sl_actions', []))} "
+                       f"holds={len(res.get('holds', []))}")
             except Exception:
-                _update_job_status(job_name, "success", "executor ran (status unknown)")
+                msg = f"{note}; exits ok"
+            _update_job_status(job_name, "success", msg)
         else:
-            err = (proc.stderr or proc.stdout or "executor failed")[-1000:]
-            _update_job_status(job_name, "error", "", err)
-            sys.stderr.write(f"[SCHEDULER] {job_name} failed: {err[:200]}\n")
+            msg = f"{note}; exit_worker rc={rc}"
+            _update_job_status(job_name, "error", msg, (err or out)[-1500:])
+        sys.stderr.write(f"[SCHEDULER] {job_name} completed: {msg}\n")
+    except Exception as e:
+        _update_job_status(job_name, "error", "", str(e))
+        sys.stderr.write(f"[SCHEDULER] {job_name} exception: {e}\n")
+    finally:
+        _scan_lock.release()
+    _log_desk_data(job_name)
+
+
+def _scheduled_1h_scan_exits(manual: bool = False) -> None:
+    """Hourly :07 HKT: 1H scan + Small/Tiny exits + SL align."""
+    _scan_and_exits("manual_1h_scan_exits" if manual else "1h_scan_exits", "1h", SCAN_MAX_1H, "hourly", manual)
+
+
+def _scheduled_4h_scan_exits(manual: bool = False) -> None:
+    """Every 4h :10 HKT: 4H scan + Mega/Large exits + SL align."""
+    _scan_and_exits("manual_4h_scan_exits" if manual else "4h_scan_exits", "4h", SCAN_MAX, "4h", manual)
+
+
+def _scheduled_executor(manual: bool = False) -> None:
+    """08:55 HKT: execute AI-approved candidates (manual runs are always DRY_RUN)."""
+    job_name = "manual_executor" if manual else "executor"
+    try:
+        sys.stderr.write(f"[SCHEDULER] Starting {job_name}\n")
+        rc, out, err = _run_worker("executor.py", [], timeout=600, force_dry_run=manual)
+        try:
+            res = json.loads(out)
+        except Exception:
+            res = {}
+        status = res.get("status", "unknown")
+        msg = (f"{res.get('mode', '?')} {status}: executed={len(res.get('executed', []))} "
+               f"actions={len(res.get('actions', []))} skipped={len(res.get('skipped', []))}"
+               + (f" | {res.get('message')}" if res.get("message") else ""))
+        if rc == 0 and status in ("success", "fail_closed"):
+            _update_job_status(job_name, status, msg)
+        else:
+            _update_job_status(job_name, "error", msg, (err or out)[-1500:])
+        sys.stderr.write(f"[SCHEDULER] {job_name} {status}: {msg}\n")
     except subprocess.TimeoutExpired:
         _update_job_status(job_name, "error", "", "executor timed out (>600s)")
     except Exception as e:
@@ -766,71 +987,63 @@ def _scheduled_executor() -> None:
         sys.stderr.write(f"[SCHEDULER] {job_name} exception: {e}\n")
 
 
+MANUAL_JOBS = {
+    "1d": _scheduled_1d_scan,
+    "1h": _scheduled_1h_scan_exits,
+    "4h": _scheduled_4h_scan_exits,
+    "executor": _scheduled_executor,
+}
+_manual_running: set = set()
+_manual_lock = threading.Lock()
+
+
+def _start_manual_job(job: str) -> tuple[bool, str]:
+    fn = MANUAL_JOBS.get(job)
+    if not fn:
+        return False, f"unknown job {job!r}; use one of {sorted(MANUAL_JOBS)}"
+    with _manual_lock:
+        if job in _manual_running:
+            return False, f"{job} already running"
+        _manual_running.add(job)
+
+    def _run() -> None:
+        try:
+            fn(manual=True)
+        finally:
+            with _manual_lock:
+                _manual_running.discard(job)
+
+    threading.Thread(target=_run, name=f"manual-{job}", daemon=True).start()
+    return True, "started"
+
+
 def _init_scheduler() -> BackgroundScheduler | None:
-    """Initialize APScheduler with cron jobs (Asia/Hong_Kong timezone).
-    
-    Staggered times to avoid lock collisions (PR #6 fix):
-    - 08:05 HKT: 1D scan + candidates
-    - Every hour :07: 1H scan + Small/Tiny exits
-    - Every 4h :10: 4H scan + Mega/Large exits  
-    - 08:55 HKT: Executor
-    """
+    """APScheduler cron jobs (Asia/Hong_Kong):
+    08:05 1D+4H scan + candidates · hourly :07 1H + Small/Tiny exits ·
+    every 4h :10 4H + Mega/Large exits · 08:55 executor. Jobs wait for the scan lock."""
     if not HAS_APSCHEDULER:
         sys.stderr.write("[SCHEDULER] APScheduler not available, skipping\n")
         return None
-    
     if not SCHEDULER_ENABLED:
         sys.stderr.write("[SCHEDULER] SCHEDULER_ENABLED=0, skipping\n")
         return None
-    
     try:
+        _load_job_status()
         hkt = pytz.timezone("Asia/Hong_Kong")
         scheduler = BackgroundScheduler(timezone=hkt)
-        
-        # 08:05 HKT daily: 1D scan + generate entry candidates
-        scheduler.add_job(
-            _scheduled_1d_scan,
-            CronTrigger(hour=8, minute=5, timezone=hkt),
-            id="1d_scan_candidates",
-            name="1D Scan + Entry Candidates",
-            max_instances=1,
-            coalesce=True,
-        )
-        
-        # Hourly :07 (staggered +2min from 1D): 1H scan + Small/Tiny exits
-        scheduler.add_job(
-            _scheduled_1h_scan_exits,
-            CronTrigger(minute=7, timezone=hkt),
-            id="1h_scan_exits",
-            name="1H Scan + Small/Tiny Exits",
-            max_instances=1,
-            coalesce=True,
-        )
-        
-        # Every 4h :10 (staggered +5min from 1D/1H): 4H scan + Mega/Large exits
-        scheduler.add_job(
-            _scheduled_4h_scan_exits,
-            CronTrigger(hour="0,4,8,12,16,20", minute=10, timezone=hkt),
-            id="4h_scan_exits",
-            name="4H Scan + Mega/Large Exits",
-            max_instances=1,
-            coalesce=True,
-        )
-        
-        # 08:55 HKT daily: Execute approved candidates
-        scheduler.add_job(
-            _scheduled_executor,
-            CronTrigger(hour=8, minute=55, timezone=hkt),
-            id="executor",
-            name="Auto-Executor",
-            max_instances=1,
-            coalesce=True,
-        )
-        
+        common = dict(max_instances=1, coalesce=True, misfire_grace_time=600)
+        scheduler.add_job(_scheduled_1d_scan, CronTrigger(hour=8, minute=5, timezone=hkt),
+                          id="1d_scan_candidates", name="1D+4H Scan + Entry Candidates", **common)
+        scheduler.add_job(_scheduled_1h_scan_exits, CronTrigger(minute=7, timezone=hkt),
+                          id="1h_scan_exits", name="1H Scan + Small/Tiny Exits", **common)
+        scheduler.add_job(_scheduled_4h_scan_exits, CronTrigger(hour="0,4,8,12,16,20", minute=10, timezone=hkt),
+                          id="4h_scan_exits", name="4H Scan + Mega/Large Exits", **common)
+        scheduler.add_job(_scheduled_executor, CronTrigger(hour=8, minute=55, timezone=hkt),
+                          id="executor", name="Auto-Executor", **common)
         scheduler.start()
         sys.stderr.write(
-            "[SCHEDULER] APScheduler started (Asia/Hong_Kong timezone, staggered)\n"
-            "  - 08:05 HKT: 1D scan + entry candidates\n"
+            "[SCHEDULER] APScheduler started (Asia/Hong_Kong)\n"
+            "  - 08:05 HKT: 1D+4H scan + entry candidates\n"
             "  - Hourly :07: 1H scan + Small/Tiny exits\n"
             "  - Every 4h :10: 4H scan + Mega/Large exits\n"
             "  - 08:55 HKT: Auto-executor\n"
@@ -839,32 +1052,6 @@ def _init_scheduler() -> BackgroundScheduler | None:
     except Exception as e:
         sys.stderr.write(f"[SCHEDULER] Failed to initialize: {e}\n")
         return None
-
-
-def _log_desk_data() -> None:
-    """One-line summary of scan completion (reduced from full JSON dump)."""
-    try:
-        radar_ts = {}
-        pos_count = {}
-        for tf in ("1h", "4h", "1d"):
-            fp = os.path.join(OUT_DIR, f"gc_radar_{tf}.json")
-            try:
-                with open(fp) as f:
-                    data = json.load(f)
-                    radar_ts[tf] = data.get("ts", "")[:19]
-                    rows = data.get("rows") or []
-                    pos_count[tf] = len(rows)
-            except Exception:
-                radar_ts[tf] = "error"
-                pos_count[tf] = 0
-        sys.stderr.write(
-            f"[DESK_DATA] {datetime.now(timezone.utc).isoformat()[:19]} "
-            f"radar_1h={pos_count['1h']}@{radar_ts['1h']} "
-            f"radar_4h={pos_count['4h']}@{radar_ts['4h']} "
-            f"radar_1d={pos_count['1d']}@{radar_ts['1d']}\n"
-        )
-    except Exception as e:
-        sys.stderr.write(f"[DESK_DATA] error: {e}\n")
 
 
 def _scheduler_loop() -> None:
@@ -1049,6 +1236,12 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if path == "/api/ai/decision":
             self._ai_decision()
+            return
+        if path == "/api/jobs/run":
+            # Password-gated manual trigger. executor/exit workers are FORCED DRY_RUN here.
+            if self._need_auth():
+                return
+            self._run_job()
             return
         self.send_error(404, "Not Found")
 
@@ -1247,44 +1440,9 @@ class Handler(SimpleHTTPRequestHandler):
         except Exception as e:
             account = {"error": str(e)}
         
-        # Enhance candidates with suggested size/leverage
-        candidates = candidates_data.get("candidates", [])
-        enhanced = []
-        
-        for c in candidates:
-            tier = c.get("tier", "unknown")
-            trend_1d = c.get("trend_1d", "")
-            trend_4h = c.get("trend_4h", "")
-            sl_dist_pct = c.get("hard_sl_dist_pct", 0)
-            
-            # Suggested size % (simplified: Base 6%, Chase 8%, Continuation 3%)
-            entry_type = c.get("type", "Base")
-            if entry_type == "Continuation":
-                suggested_size_pct = 3.0
-            elif entry_type == "Chase":
-                suggested_size_pct = 8.0
-            else:
-                suggested_size_pct = 6.0
-            
-            # Suggested leverage (conservative: 2-3x)
-            suggested_leverage = 2.5
-            
-            # Estimated liquidation price (rough)
-            close_1d = c.get("close_1d", 0)
-            if close_1d and account.get("equity"):
-                equity = account["equity"]
-                size_usd = equity * (suggested_size_pct / 100.0)
-                liq_estimate = close_1d * (1 - (equity - size_usd / suggested_leverage) / size_usd)
-            else:
-                liq_estimate = None
-            
-            enhanced.append({
-                **c,
-                "suggested_size_pct": suggested_size_pct,
-                "suggested_leverage": suggested_leverage,
-                "estimated_liq_price": liq_estimate,
-            })
-        
+        # Enhance: suggested size/leverage (<= coin max), tier Hard SL, isolated liq estimate
+        enhanced = _enhance_candidates(candidates_data.get("candidates", []), account, _get_hl_meta_cached())
+
         # Build response
         response = {
             "generated_at": candidates_data.get("generated_at"),
@@ -1304,8 +1462,9 @@ class Handler(SimpleHTTPRequestHandler):
         
         Auth: header X-AI-Key or query param key.
         Body: {decisions: [{symbol, decision: approve|veto, size_pct, leverage, reason}, ...]}
-        
-        Clamps size/leverage to SoT bands server-side.
+
+        size_pct/leverage are stored as submitted; the executor clamps them to SoT bands
+        (size band, 1-5x, coin maxLeverage) at execution time.
         """
         # Auth check
         auth_header = self.headers.get("X-AI-Key") or ""
@@ -1447,6 +1606,24 @@ class Handler(SimpleHTTPRequestHandler):
         except Exception as e:
             self._send_json(500, {"ok": False, "error": str(e)})
 
+    def _run_job(self) -> None:
+        """POST /api/jobs/run {"job": "1d"|"1h"|"4h"|"executor"} -> 202, runs in background.
+
+        Same code path as the scheduled job, but executor / exit worker are always DRY_RUN
+        (EXEC_DRY_RUN=1 and no key in the subprocess env). Status: /api/scheduler/status
+        under manual_<job>.
+        """
+        length = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(length) if length else b"{}"
+        try:
+            job = str((json.loads(raw.decode() or "{}") or {}).get("job") or "")
+        except Exception:
+            self._send_json(400, {"ok": False, "error": "invalid json"})
+            return
+        ok, msg = _start_manual_job(job)
+        self._send_json(202 if ok else 409 if "running" in msg else 400,
+                        {"ok": ok, "job": job, "message": msg, "dry_run_forced": job in ("executor", "1h", "4h")})
+
     def _rescan(self) -> None:
         length = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(length) if length else b""
@@ -1467,10 +1644,13 @@ class Handler(SimpleHTTPRequestHandler):
             return
         try:
             ok, note = _run_scan(tfs, max_symbols=max_symbols)
+            if ok and "1d" in tfs:
+                count = _generate_entry_candidates()
+                note = f"{note}; candidates={count}"
         finally:
             _scan_lock.release()
         if ok:
-            _log_desk_data()  # emit updated desk data after manual rescan
+            _log_desk_data("manual_rescan")  # emit updated desk data after manual rescan
         if not ok:
             self._send_json(500, {"ok": False, "error": note})
             return

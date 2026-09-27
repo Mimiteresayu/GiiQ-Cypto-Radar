@@ -9,7 +9,7 @@
 
 **Cockpit (phone / read radar + positions):**  
 https://cockpit-production-ec2c.up.railway.app  
-(password: ask MMT / `iammoneymagnet` if already shared)
+(password: `<COCKPIT_PASSWORD>` — ask MMT)
 
 **SoT mirrors (if user pastes):**  
 - `HARBOR_AUTOTRADE_PROMPT_v1.md` (LOCKED 2026-09-21, no Armed)  
