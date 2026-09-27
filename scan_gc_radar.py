@@ -262,29 +262,34 @@ def _is_cemetery_1d(row: dict) -> bool:
 
 CAT_CODE_ORDER = ("N", "C", "V")
 _LEGACY_CAT = {"NARRATIVE": "N", "Narrative": "N", "CEMETERY": "C", "Cemetery": "C"}
-# Volume ignition (Cemetery Revival card, "Ignition"): bar volume 3-7x vs quiet base while close still <= Upper.
-VOL_IGNITION_RVOL = 3.0  # rvol = last closed bar volume / median(prior RVOL_LOOKBACK closed bars)
 
 
-def is_vol_ignition(row: dict) -> bool:
-    """V: closed-bar rvol >= VOL_IGNITION_RVOL AND close <= Upper (not yet broken out) on this TF."""
+def passes_volume_rule(row: dict) -> bool:
+    """V: passes the universe volume rule = HL dayNtlVlm >= MIN_DAY_NTL_VLM ($75k) AND open interest > 0 when known
+    (same floor as load_universe). Rows added only as Narrative/Cemetery below the floor, volume-pad fillers and
+    rows without dayNtlVlm get no V."""
     try:
-        return (float(row.get("rvol")) >= VOL_IGNITION_RVOL
-                and float(row.get("close")) <= float(row.get("upper")))
+        vlm = float(row.get("day_ntl_vlm"))
     except (TypeError, ValueError):
         return False
+    oi = row.get("open_interest")
+    try:
+        oi_ok = (not REQUIRE_OI_POSITIVE) or oi is None or float(oi) > 0
+    except (TypeError, ValueError):
+        oi_ok = True
+    return vlm >= MIN_DAY_NTL_VLM and oi_ok
 
 
 def reason_tags(row: dict, cats: Optional[List[str]] = None) -> List[str]:
     """CAT short codes (display only), fixed order: N (narrative watchlist), C (cemetery: >=70% below the 1D ATH;
-    4H/1H use the 1D status), V (volume ignition on this TF's closed bar, see is_vol_ignition). Plain coins -> []."""
+    4H/1H use the 1D status), V (passes the universe volume rule, see passes_volume_rule). Plain coins -> []."""
     cats = cats if cats is not None else (row.get("categories") or [])
     tags = []
     if "Narrative" in cats:
         tags.append("N")
     if _is_cemetery_1d(row):
         tags.append("C")
-    if is_vol_ignition(row):
+    if passes_volume_rule(row):
         tags.append("V")
     return tags
 

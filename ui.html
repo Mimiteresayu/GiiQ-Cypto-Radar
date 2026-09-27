@@ -672,7 +672,7 @@
         <tr>
           <th data-k="symbol">Symbol <span class="arrow">↕</span></th>
           <th data-k="tier">Tier <span class="arrow">↕</span></th>
-          <th data-k="cat_code" title="N=Narrative  C=Cemetery (≥70% below ATH)  V=Volume ignition">Cat <span class="arrow">↕</span></th>
+          <th data-k="cat_code" title="N=Narrative  C=Cemetery (≥70% below ATH)  V=Passes volume universe rule">Cat <span class="arrow">↕</span></th>
           <th data-k="lv_trend" title="forming bar (live)">Trend·live <span class="arrow">↕</span></th>
           <th data-k="lv_close" title="live price">Close·live <span class="arrow">↕</span></th>
           <th data-k="lv_filter">Filter·live <span class="arrow">↕</span></th>
@@ -687,7 +687,7 @@
           <th data-k="mom_score">mom_score <span class="arrow">↕</span></th>
           <th data-k="mom_rank">mom_rank <span class="arrow">↕</span></th>
         </tr>
-        <tr class="cat-legend"><th colspan="40" style="font-weight:normal;font-size:0.68rem;color:var(--muted);text-align:left;cursor:default">N=Narrative&nbsp;&nbsp;C=Cemetery (≥70% below ATH)&nbsp;&nbsp;V=Volume ignition</th></tr>
+        <tr class="cat-legend"><th colspan="40" style="font-weight:normal;font-size:0.68rem;color:var(--muted);text-align:left;cursor:default">N=Narrative&nbsp;&nbsp;C=Cemetery (≥70% below ATH)&nbsp;&nbsp;V=Passes volume universe rule</th></tr>
       </thead>
       <tbody id="radarTbody"></tbody>
     </table>
@@ -846,7 +846,7 @@
     const closedClose = closedOpen ? closedOpen + bar : null;
     return `live @ ${hktHM(d.live_ts||d.ts)} · last closed bar ${hktHM(closedClose)} / next close ${hktHM(nextClose)} HKT`;
   }
-  // CAT short codes, fixed order: N=Narrative C=Cemetery V=Volume ignition (blank if none); legacy rows mapped
+  // CAT short codes, fixed order: N=Narrative C=Cemetery V=Passes volume universe rule (blank if none); legacy rows mapped
   const CAT_ORDER = ["N","C","V"];
   const CAT_LEGACY = {NARRATIVE:"N", Narrative:"N", CEMETERY:"C", Cemetery:"C"};
   function catLabel(r) {

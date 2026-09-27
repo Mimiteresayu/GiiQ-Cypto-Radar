@@ -331,8 +331,8 @@ SPX6900→SPX`, …) → `k`+symbol. Radar JSON: `narrative_map` {ticker: HL nam
 Cemetery (≥70% below ATH) or Narrative; 4H/1H scans and the live loop force-include the last 1D cemetery set
 (`cemetery_forced`, `cemetery_1d`). **CAT column** (`cat_tags` string = `category_label` = DESK_DATA `cat`; `reason_tags` list; display only): short codes,
 fixed order, space-separated, blank if none: `N` (narrative watchlist), `C` (cemetery: ≥70% below the 1D ATH; 4H/1H use the
-1D status), `V` (volume ignition, Cemetery Revival card: that TF's closed-bar `rvol` ≥ 3 — bar volume vs median of the prior
-14 closed bars — AND close ≤ Upper), e.g. `N C V`. `category`/`categories` (Narrative/Cemetery/Price) are kept unchanged as
+1D status), `V` (passes the universe volume rule: HL `day_ntl_vlm` ≥ $75k AND
+open interest > 0 when known; coins added only as N/C below the floor, and volume-pad fillers, get no V), e.g. `N C V`. `category`/`categories` (Narrative/Cemetery/Price) are kept unchanged as
 machine fields; "Price" is just the default (neither N nor C) and is not shown.
 
 **Live execution (EXEC_DRY_RUN=0 + key):** isolated margin; set leverage (≤5x and ≤ coin maxLeverage) →

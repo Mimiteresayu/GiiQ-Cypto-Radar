@@ -331,14 +331,15 @@ class TestNarrativeUniverse(unittest.TestCase):
 
 class TestReasonTagsAndCemetery(unittest.TestCase):
     def test_reason_tags(self):
-        r = {"symbol": "X", "dual_cross_up": False, "drop_from_ath_pct": 80, "rvol": 4.2, "close": 1.0, "upper": 1.1}
+        r = {"symbol": "X", "dual_cross_up": False, "drop_from_ath_pct": 80, "day_ntl_vlm": 80000, "open_interest": 5}
         sgr.enrich_row_tier_category(r, {"X"}, {})
         self.assertEqual(r["cat_tags"], "N C V")
         self.assertEqual(r["category_label"], "N C V")
-        rb = {"symbol": "B", "drop_from_ath_pct": 5, "rvol": 5.0, "close": 1.2, "upper": 1.1}  # above Upper -> no V
+        rb = {"symbol": "B", "drop_from_ath_pct": 5, "day_ntl_vlm": 74999}  # below floor -> no V
         self.assertEqual(sgr.reason_tags(rb, []), [])
-        rq = {"symbol": "Q", "drop_from_ath_pct": 5, "rvol": 2.9, "close": 1.0, "upper": 1.1}  # rvol < 3 -> no V
+        rq = {"symbol": "Q", "drop_from_ath_pct": 5, "day_ntl_vlm": 1e6, "open_interest": 0}  # OI 0 -> no V
         self.assertEqual(sgr.reason_tags(rq, []), [])
+        self.assertEqual(sgr.reason_tags({"symbol": "R", "day_ntl_vlm": 1e6}, []), ["V"])
         r2 = {"symbol": "Y", "dual_cross_up": False, "drop_from_ath_pct": 90, "in_floor": False}
         sgr.enrich_row_tier_category(r2, set(), {})
         self.assertEqual(r2["reason_tags"], ["C"])
