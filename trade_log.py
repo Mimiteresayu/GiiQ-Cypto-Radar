@@ -20,6 +20,11 @@ DEFAULT_LOG_PATH = str(ROOT / "out" / "trades" / "trades.json")
 TRADE_LOG_PATH = os.environ.get("TRADE_LOG_PATH", DEFAULT_LOG_PATH)
 
 
+def _log_path() -> str:
+    """Resolve at call time: env TRADE_LOG_PATH wins, else the module default."""
+    return os.environ.get("TRADE_LOG_PATH") or TRADE_LOG_PATH
+
+
 def _is_sqlite(path: str) -> bool:
     """Check if path is SQLite database."""
     return path.endswith(".db") or path.endswith(".sqlite")
@@ -111,7 +116,7 @@ def log_entry(
         "dry_run": dry_run,
     }
     
-    path = TRADE_LOG_PATH
+    path = _log_path()
     
     if _is_sqlite(path):
         # SQLite
@@ -181,7 +186,7 @@ def log_exit(
     """
     now = datetime.now(timezone.utc).isoformat()
     
-    path = TRADE_LOG_PATH
+    path = _log_path()
     
     if _is_sqlite(path):
         # SQLite
@@ -243,7 +248,7 @@ def get_all_trades() -> List[Dict[str, Any]]:
     Returns:
         list of trade dicts
     """
-    path = TRADE_LOG_PATH
+    path = _log_path()
     
     if _is_sqlite(path):
         # SQLite
@@ -269,14 +274,19 @@ def get_all_trades() -> List[Dict[str, Any]]:
             return []
 
 
-def get_open_trades() -> List[Dict[str, Any]]:
-    """Get all open trades (no exit timestamp).
-    
-    Returns:
-        list of trade dicts
+def get_open_trades(dry_run: Optional[bool] = None) -> List[Dict[str, Any]]:
+    """Get open trades (no exit timestamp).
+
+    Args:
+        dry_run: None = all; False = only real trades; True = only dry-run trades.
+            The exit worker passes dry_run=(not live) so dry-run records are never
+            matched to real HL positions.
     """
     all_trades = get_all_trades()
-    return [t for t in all_trades if not t.get("exit_timestamp")]
+    open_trades = [t for t in all_trades if not t.get("exit_timestamp")]
+    if dry_run is None:
+        return open_trades
+    return [t for t in open_trades if bool(t.get("dry_run")) == bool(dry_run)]
 
 
 def clear_all_trades() -> Dict[str, Any]:
@@ -285,7 +295,7 @@ def clear_all_trades() -> Dict[str, Any]:
     Returns:
         dict with ok, message
     """
-    path = Path(TRADE_LOG_PATH)
+    path = Path(_log_path())
     
     if _is_sqlite(str(path)):
         if path.is_file():

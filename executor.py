@@ -1,42 +1,63 @@
 #!/usr/bin/env python3
-"""Auto-executor for approved entry candidates.
+"""Auto-executor for AI-approved entry candidates (08:55 HKT).
 
-Enforces Source of Truth (SoT) rules:
-- Min notional $10, leverage 1-5x
-- SL distance >= 1.5%
-- Liq price must be beyond Hard SL
-- Total used margin <= 80% equity after entry
-- Re-check all open positions have liq beyond Hard SL (cross margin)
-- BTC 4H close < 4H Filter: fixed 4% per coin
+SoT enforcement (see exec_common.py):
+- Candidates must be fresh (built today HKT, <= EXEC_MAX_CANDIDATE_AGE_H old, not stale)
+- Min notional $10; leverage 1-5x AND <= coin HL maxLeverage (integer)
+- SL distance >= 1.5% from the LIVE mid; Hard SL per tier (Mega/Large 4H Lower, Small/Tiny 4H Filter)
+- Isolated liq price must lie below the Hard SL
+- Total margin (existing + all new entries, cumulative) <= 80% equity
+- All open positions must already have liq beyond their tier Hard SL
+- BTC 4H close < 4H Filter -> fixed 4% per coin
+- size_pct = margin % of equity; notional = margin x leverage; qty = notional / price
 
-Places limit entry + reduce-only Hard SL trigger order via hyperliquid-python-sdk.
-DRY_RUN by default (EXEC_DRY_RUN=1); live only if EXEC_DRY_RUN=0 AND HL_API_PRIVATE_KEY present.
+Entry: IOC limit buy at live mid + EXEC_ENTRY_SLIPPAGE_PCT (default 0.5%), isolated margin,
+then an immediate reduce-only stop-market Hard SL for the filled size. If the SL cannot be
+placed the fill is closed at once (fail-safe). See hl_exec.enter_long_with_sl.
+
+DRY_RUN by default (EXEC_DRY_RUN=1). LIVE only if EXEC_DRY_RUN=0 AND HL_API_PRIVATE_KEY present.
+Exit code: 0 = success or fail_closed (normal "nothing to do"), 1 = error.
 """
 from __future__ import annotations
 
 import json
 import os
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-# Env vars
-EXEC_DRY_RUN = os.environ.get("EXEC_DRY_RUN", "1").strip() in ("1", "true", "yes")
-HL_API_PRIVATE_KEY = os.environ.get("HL_API_PRIVATE_KEY", "").strip()
+from exec_common import (  # noqa: E402
+    MAX_LEVERAGE,
+    MAX_MARGIN_UTILIZATION_PCT,
+    MIN_LEVERAGE,
+    MIN_NOTIONAL_USD,
+    MIN_SL_DIST_PCT,
+    candidates_fresh,
+    clamp_leverage,
+    hard_sl_for_tier,
+    is_live_mode,
+    isolated_liq_price_long,
+    liq_beyond_sl_long,
+    margin_cap_ok,
+    order_qty,
+    round_price,
+)
+
+try:
+    from decisions import get_decisions_for_today
+    from trade_log import log_entry
+    from mcap_tiers import tier_for
+except ImportError as e:  # pragma: no cover
+    print(f"ERROR: {e}", file=sys.stderr)
+    sys.exit(1)
+
 HL_ADDRESS = os.environ.get("HL_ADDRESS", "0xcFCda0F8576a268BaA17935368081F4e687dB122").strip()
 
-# Execution limits
-MIN_NOTIONAL_USD = 10.0
-MIN_LEVERAGE = 1.0
-MAX_LEVERAGE = 5.0
-MIN_SL_DIST_PCT = 1.5
-MAX_MARGIN_UTILIZATION_PCT = 80.0
-
-# SoT size bands
+# SoT size bands (margin % of equity)
 SIZE_BANDS = {
     "P": (4.0, 8.0),              # Primary only
     "P+N": (8.0, 12.0),           # Primary + Narrative
@@ -44,513 +65,282 @@ SIZE_BANDS = {
     "P+N+CR": (10.0, 15.0),       # Primary + Narrative + Cemetery Revival
     "Continuation": (2.0, 4.0),   # Continuation (no daily cap)
 }
-
-# BTC regime fixed size
 BTC_BEARISH_FIXED_SIZE_PCT = 4.0
 
-try:
-    from decisions import get_decisions_for_today, get_approved_symbols
-    from trade_log import log_entry
-    from mcap_tiers import tier_for
-except ImportError as e:
-    print(f"ERROR: {e}", file=sys.stderr)
-    sys.exit(1)
+
+def _entry_slippage_pct() -> float:
+    try:
+        return max(0.0, min(2.0, float(os.environ.get("EXEC_ENTRY_SLIPPAGE_PCT") or 0.5)))
+    except ValueError:
+        return 0.5
 
 
-def _is_live_mode() -> bool:
-    """Check if executor should run in LIVE mode."""
-    return not EXEC_DRY_RUN and bool(HL_API_PRIVATE_KEY)
+def _log(msg: str) -> None:
+    sys.stderr.write(f"[EXECUTOR] {msg}\n")
+    sys.stderr.flush()
 
 
-def _get_hl_info(endpoint: str, params: dict) -> dict:
-    """Call Hyperliquid info API."""
-    import urllib.request as _url_req
-    
-    payload = json.dumps({"type": endpoint, **params}).encode()
-    req = _url_req.Request(
-        "https://api.hyperliquid.xyz/info",
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    
-    with _url_req.urlopen(req, timeout=15) as resp:
-        return json.loads(resp.read())
+def _load_json(path: Path) -> dict:
+    if not path.is_file():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
 
 
 def _load_radar(tf: str) -> dict:
-    """Load radar JSON for timeframe."""
-    path = ROOT / "out" / f"gc_radar_{tf}.json"
-    if not path.is_file():
-        return {}
-    
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
+    return _load_json(ROOT / "out" / f"gc_radar_{tf}.json")
 
 
 def _load_candidates() -> dict:
-    """Load entry_candidates_latest.json."""
-    path = ROOT / "out" / "entry_candidates_latest.json"
-    if not path.is_file():
-        return {}
-    
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
+    return _load_json(ROOT / "out" / "entry_candidates_latest.json")
 
 
-def _get_account_state() -> dict:
-    """Get Hyperliquid account state (Unified mode).
-    
-    Returns:
-        {
-            "equity": float (spot USDC),
-            "margin_used": float,
-            "free_margin": float,
-            "positions": list of position dicts
-        }
-    """
-    hl_spot = _get_hl_info("spotClearinghouseState", {"user": HL_ADDRESS})
-    hl_perp = _get_hl_info("clearinghouseState", {"user": HL_ADDRESS})
-    
-    # Spot USDC balance (equity in Unified mode)
-    balances = hl_spot.get("balances", [])
+def _parse_account(spot: dict, perp: dict) -> dict:
+    """Unified account: equity = spot USDC total; margin from perp marginSummary."""
     equity = 0.0
-    for bal in balances:
+    for bal in spot.get("balances", []) or []:
         if bal.get("coin") == "USDC":
             try:
                 equity = float(bal.get("total", 0))
             except (TypeError, ValueError):
                 pass
             break
-    
-    # Margin used
-    margin_summary = hl_perp.get("marginSummary", {})
     try:
-        margin_used = float(margin_summary.get("totalMarginUsed", 0))
+        margin_used = float((perp.get("marginSummary") or {}).get("totalMarginUsed", 0))
     except (TypeError, ValueError):
         margin_used = 0.0
-    
-    # Positions
-    positions_raw = hl_perp.get("assetPositions", [])
     positions = []
-    for pos_group in positions_raw:
-        position = pos_group.get("position", {})
-        if not position:
-            continue
-        
+    for grp in perp.get("assetPositions", []) or []:
+        p = grp.get("position") or {}
         try:
-            szi = float(position.get("szi", 0))
-            if abs(szi) < 1e-8:
-                continue
-            
-            positions.append({
-                "coin": position.get("coin", ""),
-                "side": "LONG" if szi > 0 else "SHORT",
-                "size": abs(szi),
-                "entry_px": float(position.get("entryPx", 0)),
-                "position_value": float(position.get("positionValue", 0)),
-                "unrealized_pnl": float(position.get("unrealizedPnl", 0)),
-                "liquidation_px": float(position.get("liquidationPx") or 0),
-            })
+            szi = float(p.get("szi", 0))
         except (TypeError, ValueError):
             continue
-    
-    return {
-        "equity": equity,
-        "margin_used": margin_used,
-        "free_margin": max(0, equity - margin_used),
-        "positions": positions,
-    }
+        if abs(szi) < 1e-12:
+            continue
+        positions.append({
+            "coin": p.get("coin", ""),
+            "side": "LONG" if szi > 0 else "SHORT",
+            "size": abs(szi),
+            "entry_px": float(p.get("entryPx") or 0),
+            "liquidation_px": float(p.get("liquidationPx") or 0),
+        })
+    return {"equity": equity, "margin_used": margin_used, "free_margin": max(0.0, equity - margin_used), "positions": positions}
 
 
-def _clamp_size_leverage(
-    candidate: dict,
-    decision: dict,
-    btc_bearish: bool,
-) -> Tuple[float, float]:
-    """Clamp size and leverage to SoT bands.
-    
-    Args:
-        candidate: entry candidate dict with type, tier, trend_1d, trend_4h
-        decision: AI decision dict with size_pct, leverage
-        btc_bearish: True if BTC 4H close < 4H Filter
-        
-    Returns:
-        (size_pct, leverage) clamped to SoT rules
-    """
-    size_pct = decision.get("size_pct", 4.0)
-    leverage = decision.get("leverage", 2.0)
-    
-    # BTC bearish: fixed 4% per coin
+def _clamp_size_leverage(candidate: dict, decision: dict, btc_bearish: bool,
+                         coin_max_leverage: Optional[float] = None) -> Tuple[float, int]:
+    """Clamp size to SoT band and leverage to 1-5x and the coin's HL maxLeverage."""
+    try:
+        size_pct = float(decision.get("size_pct") if decision.get("size_pct") is not None else 4.0)
+    except (TypeError, ValueError):
+        size_pct = 4.0
     if btc_bearish:
         size_pct = BTC_BEARISH_FIXED_SIZE_PCT
-    
-    # Clamp to SoT size bands (simplified: use type as proxy)
-    entry_type = candidate.get("type", "Base")
-    if entry_type == "Continuation":
-        min_size, max_size = SIZE_BANDS["Continuation"]
-    else:
-        # Base/Add-on: use Primary band as default
-        min_size, max_size = SIZE_BANDS["P"]
-    
-    size_pct = max(min_size, min(max_size, size_pct))
-    
-    # Clamp leverage 1-5x
-    leverage = max(MIN_LEVERAGE, min(MAX_LEVERAGE, leverage))
-    
+    band = SIZE_BANDS["Continuation"] if candidate.get("type") == "Continuation" else SIZE_BANDS["P"]
+    size_pct = max(band[0], min(band[1], size_pct))
+    leverage = clamp_leverage(decision.get("leverage", 2.0), coin_max_leverage)
     return size_pct, leverage
 
 
-def _compute_liq_price_estimate(
-    entry_price: float,
-    size_usd: float,
-    leverage: float,
-    equity: float,
-) -> float:
-    """Rough estimate of liquidation price for a LONG position in cross margin.
-    
-    This is a simplified estimate; actual liq price depends on all positions.
-    For safety checks, we use a conservative approximation.
-    
-    liq_price ≈ entry_price * (1 - (equity - initial_margin) / position_value)
-    """
-    initial_margin = size_usd / leverage
-    position_value = size_usd
-    
-    # Conservative: assume we lose all free equity first
-    buffer = equity - initial_margin
-    if buffer <= 0:
-        # Instant liquidation if no buffer
-        return entry_price
-    
-    liq_pct = buffer / position_value
-    liq_price = entry_price * (1 - liq_pct)
-    
-    return liq_price
+def _check_liq_beyond_sl(entry_price: float, hard_sl: float, estimated_liq_price: Optional[float]) -> bool:
+    """LONG: liquidation strictly below Hard SL is safe."""
+    return liq_beyond_sl_long(estimated_liq_price, hard_sl)
 
 
-def _check_liq_beyond_sl(
-    entry_price: float,
-    hard_sl: float,
-    estimated_liq_price: float,
-) -> bool:
-    """Check if liquidation price is beyond (safer than) Hard SL for LONG.
-    
-    For LONG: liq_price < hard_sl is safe (we exit at SL before liquidation)
-    """
-    return estimated_liq_price < hard_sl
-
-
-def _check_all_positions_liq_safe(
-    positions: List[dict],
-    radar_1h: dict,
-    radar_4h: dict,
-) -> Tuple[bool, List[str]]:
-    """Check all open positions have liq beyond Hard SL.
-    
-    Returns:
-        (all_safe: bool, unsafe_symbols: list)
-    """
-    # Build radar maps
-    r1h_map = {r["symbol"]: r for r in radar_1h.get("rows", [])}
-    r4h_map = {r["symbol"]: r for r in radar_4h.get("rows", [])}
-    
+def _check_all_positions_liq_safe(positions: List[dict], radar_1h: dict, radar_4h: dict) -> Tuple[bool, List[str]]:
+    """Every open LONG must have its liquidation below its TIER Hard SL
+    (Mega/Large: 4H Lower; Small/Tiny: 4H Filter)."""
+    r4h_map = {r["symbol"]: r for r in radar_4h.get("rows", []) if r.get("symbol")}
     unsafe = []
-    
     for pos in positions:
         coin = pos["coin"]
-        side = pos["side"]
-        liq_px = pos.get("liquidation_px", 0)
-        
-        if not liq_px or liq_px <= 0:
-            # No liq price available (shouldn't happen in cross margin)
+        liq_px = pos.get("liquidation_px") or 0
+        if liq_px <= 0:
             continue
-        
-        # Determine Hard SL by tier
-        tier = tier_for(coin) if tier_for else "tiny"
-        
-        # All tiers: Hard SL = 4H Filter
         r4h = r4h_map.get(coin) or r4h_map.get(f"{coin}-PERP")
-        if not r4h:
-            # No radar data, can't check
-            continue
-        
-        hard_sl = r4h.get("filter")
+        hard_sl, _ = hard_sl_for_tier(tier_for(coin), r4h)
         if not hard_sl:
             continue
-        
-        # Check if liq is beyond Hard SL
-        if side == "LONG":
-            if liq_px >= hard_sl:
-                # Liq price is above Hard SL = unsafe (we'd liquidate before SL)
-                unsafe.append(coin)
-        else:
-            # SHORT: liq above Hard SL is safe
-            if liq_px <= hard_sl:
-                unsafe.append(coin)
-    
+        if pos["side"] == "LONG" and liq_px >= hard_sl:
+            unsafe.append(coin)
+        elif pos["side"] == "SHORT" and liq_px <= hard_sl:
+            unsafe.append(coin)
     return len(unsafe) == 0, unsafe
 
 
-def execute_approved_candidates() -> Dict[str, Any]:
-    """Execute approved candidates with SoT enforcement.
-    
-    Returns:
-        dict with:
-            mode: LIVE | DRY_RUN
-            status: success | fail_closed | error
-            executed: list of executed trades
-            skipped: list of skipped trades with reasons
-            actions: list of intended orders (DRY_RUN)
-    """
-    mode = "LIVE" if _is_live_mode() else "DRY_RUN"
-    
-    result = {
-        "mode": mode,
-        "status": "success",
-        "executed": [],
-        "skipped": [],
-        "actions": [],
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+def execute_approved_candidates(
+    hl: Any = None,
+    candidates_data: Optional[dict] = None,
+    decisions: Optional[Dict[str, dict]] = None,
+    radar_1h: Optional[dict] = None,
+    radar_4h: Optional[dict] = None,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """Run one execution pass. All inputs injectable for tests; defaults read disk/HL."""
+    live = is_live_mode()
+    mode = "LIVE" if live else "DRY_RUN"
+    now = now or datetime.now(timezone.utc)
+    result: Dict[str, Any] = {
+        "mode": mode, "status": "success", "executed": [], "skipped": [], "actions": [], "alerts": [],
+        "timestamp": now.isoformat(),
     }
-    
-    # Load data
-    candidates_data = _load_candidates()
-    candidates = candidates_data.get("candidates", [])
-    decisions = get_decisions_for_today()
-    approved = get_approved_symbols()
-    
-    # Fail closed if no decisions
+
+    candidates_data = _load_candidates() if candidates_data is None else candidates_data
+    decisions = get_decisions_for_today() if decisions is None else decisions
+    approved = [s for s, rec in decisions.items() if rec.get("decision") == "approve"]
     if not approved:
-        result["status"] = "fail_closed"
-        result["message"] = "No approved candidates"
+        result.update(status="fail_closed", message="No approved candidates")
+        _log(f"{mode} fail_closed: no approved candidates")
         return result
-    
-    # Load radars
-    radar_1h = _load_radar("1h")
-    radar_4h = _load_radar("4h")
-    
-    # Get account state
+
+    fresh, why = candidates_fresh(candidates_data, now=now)
+    if not fresh:
+        result.update(status="fail_closed", message=f"Candidates not fresh: {why}")
+        _log(f"{mode} fail_closed: {why}")
+        return result
+    candidates = candidates_data.get("candidates", []) or []
+
+    radar_1h = _load_radar("1h") if radar_1h is None else radar_1h
+    radar_4h = _load_radar("4h") if radar_4h is None else radar_4h
+
+    if hl is None:
+        from hl_exec import HLClient
+        hl = HLClient(HL_ADDRESS)
     try:
-        account = _get_account_state()
-    except Exception as e:
-        result["status"] = "error"
-        result["message"] = f"Failed to get account state: {e}"
+        account = _parse_account(hl.spot_state(), hl.perp_state())
+        meta = hl.meta()
+        mids = hl.all_mids()
+    except Exception as e:  # noqa: BLE001
+        result.update(status="error", message=f"Failed to get HL state: {e}")
+        _log(f"error: HL state: {e}")
         return result
-    
+
     equity = account["equity"]
-    margin_used = account["margin_used"]
-    positions = account["positions"]
-    
-    # Check BTC regime
-    btc_bearish = False
-    btc_4h_row = next((r for r in radar_4h.get("rows", []) if r.get("symbol") == "BTC"), None)
-    if btc_4h_row:
-        close_4h = btc_4h_row.get("close")
-        filter_4h = btc_4h_row.get("filter")
-        if close_4h and filter_4h and close_4h < filter_4h:
-            btc_bearish = True
-    
-    # Check all positions have liq beyond Hard SL
-    liq_safe, unsafe_symbols = _check_all_positions_liq_safe(positions, radar_1h, radar_4h)
-    if not liq_safe:
-        result["status"] = "fail_closed"
-        result["message"] = f"Unsafe liquidation prices for: {', '.join(unsafe_symbols)}"
+    cum_margin = account["margin_used"]
+    held = {p["coin"] for p in account["positions"]}
+    if equity <= 0:
+        result.update(status="error", message="Equity is 0 / unavailable")
         return result
-    
-    # Process approved candidates
-    for candidate in candidates:
-        symbol = candidate.get("symbol", "")
+
+    btc_bearish = False
+    btc_4h = next((r for r in radar_4h.get("rows", []) if r.get("symbol") == "BTC"), None)
+    if btc_4h and btc_4h.get("close") and btc_4h.get("filter") and btc_4h["close"] < btc_4h["filter"]:
+        btc_bearish = True
+
+    liq_safe, unsafe = _check_all_positions_liq_safe(account["positions"], radar_1h, radar_4h)
+    if not liq_safe:
+        result.update(status="fail_closed", message=f"Unsafe liquidation prices for: {', '.join(unsafe)}")
+        _log(f"{mode} fail_closed: unsafe liq {unsafe}")
+        return result
+
+    slip = _entry_slippage_pct()
+    for cand in candidates:
+        symbol = cand.get("symbol", "")
         if symbol not in approved:
             continue
-        
         decision = decisions.get(symbol, {})
-        
-        # Get fields
-        entry_type = candidate.get("type", "Base")
-        tier = candidate.get("tier", "unknown")
-        trend_1d = candidate.get("trend_1d", "")
-        trend_4h = candidate.get("trend_4h", "")
-        close_1d = candidate.get("close_1d", 0)
-        hard_sl_dist_pct = candidate.get("hard_sl_dist_pct", 0)
-        
-        # Determine Hard SL level
-        if tier in ("mega", "large"):
-            hard_sl = candidate.get("lower_4h", 0)
-        else:
-            hard_sl = candidate.get("filter_4h", 0)
-        
-        # Clamp size/leverage
-        size_pct, leverage = _clamp_size_leverage(candidate, decision, btc_bearish)
-        
-        # Checks
-        skip_reason = None
-        
-        # 1. SL distance >= 1.5%
-        if hard_sl_dist_pct < MIN_SL_DIST_PCT:
-            skip_reason = f"SL distance {hard_sl_dist_pct:.2f}% < {MIN_SL_DIST_PCT}%"
-        
-        # 2. Calculate sizes
-        size_usd = equity * (size_pct / 100.0)
-        notional_usd = size_usd * leverage
-        
-        if notional_usd < MIN_NOTIONAL_USD:
-            skip_reason = f"Notional ${notional_usd:.2f} < ${MIN_NOTIONAL_USD}"
-        
-        # 3. Margin utilization check
-        initial_margin = size_usd
-        new_margin_used = margin_used + initial_margin
-        margin_utilization_pct = (new_margin_used / equity) * 100.0 if equity > 0 else 100.0
-        
-        if margin_utilization_pct > MAX_MARGIN_UTILIZATION_PCT:
-            skip_reason = f"Margin utilization {margin_utilization_pct:.1f}% > {MAX_MARGIN_UTILIZATION_PCT}%"
-        
-        # 4. Liq price check
-        estimated_liq = _compute_liq_price_estimate(close_1d, size_usd, leverage, equity)
-        liq_safe = _check_liq_beyond_sl(close_1d, hard_sl, estimated_liq)
-        
-        if not liq_safe:
-            skip_reason = f"Liq price ${estimated_liq:.2f} not beyond Hard SL ${hard_sl:.2f}"
-        
-        # Skip if any check failed
-        if skip_reason:
-            result["skipped"].append({
-                "symbol": symbol,
-                "reason": skip_reason,
-                "size_pct": size_pct,
-                "leverage": leverage,
-            })
+        entry_type = cand.get("type", "Base")
+        tier = cand.get("tier") or tier_for(symbol)
+
+        def skip(reason: str, **extra: Any) -> None:
+            result["skipped"].append({"symbol": symbol, "reason": reason, **extra})
+            _log(f"{mode} SKIP {symbol}: {reason}")
+
+        if symbol in held:
+            skip("already holding a position")
             continue
-        
-        # Determine entry price based on entry type
-        # Base/Continuation: limit at current mid price + 0.2% (for fill), capped above Hard SL with >=1.5% SL distance
-        # Add-on: limit at 4H Filter if price is above it, else skip
-        entry_price = None
-        
-        if entry_type == "Add-on":
-            # Add-on: entry at 4H Filter if price is above it
-            filter_4h = candidate.get("filter_4h", 0)
-            if not filter_4h or close_1d <= filter_4h:
-                skip_reason = f"Add-on: price ${close_1d:.2f} not above 4H Filter ${filter_4h:.2f}"
-                result["skipped"].append({
-                    "symbol": symbol,
-                    "reason": skip_reason,
-                    "size_pct": size_pct,
-                    "leverage": leverage,
-                })
-                continue
-            entry_price = filter_4h
-        else:
-            # Base/Continuation: entry at mid price + 0.2% (small offset for fill)
-            mid_price = close_1d  # Use current close as mid price
-            entry_price = mid_price * 1.002  # +0.2% offset
-        
-        # Cap entry price to ensure it stays above Hard SL with >= 1.5% SL distance
-        min_entry_for_sl_dist = hard_sl * (1 + MIN_SL_DIST_PCT / 100.0)
-        if entry_price < min_entry_for_sl_dist:
-            entry_price = min_entry_for_sl_dist
-        
-        # Verify final SL distance
-        final_sl_dist_pct = ((entry_price - hard_sl) / entry_price) * 100.0
-        if final_sl_dist_pct < MIN_SL_DIST_PCT:
-            skip_reason = f"Entry ${entry_price:.2f} too close to Hard SL ${hard_sl:.2f} (distance {final_sl_dist_pct:.2f}%)"
-            result["skipped"].append({
-                "symbol": symbol,
-                "reason": skip_reason,
-                "size_pct": size_pct,
-                "leverage": leverage,
-            })
+        cm = meta.get(symbol)
+        if not cm:
+            skip("coin not in HL meta (delisted/unknown)")
             continue
-        
-        # SL: reduce-only trigger at Hard SL
-        sl_price = hard_sl
-        
-        # Order expiry: next 08:40 HKT (00:40 UTC next day)
-        now_utc = datetime.now(timezone.utc)
-        hkt = now_utc + timedelta(hours=8)
-        next_0840_hkt = hkt.replace(hour=8, minute=40, second=0, microsecond=0)
-        if hkt >= next_0840_hkt:
-            # Already past 08:40, use tomorrow
-            next_0840_hkt += timedelta(days=1)
-        # Convert back to UTC
-        expiry_utc = next_0840_hkt - timedelta(hours=8)
-        
-        trade_id = f"{symbol}_{now_utc.strftime('%Y%m%d_%H%M%S')}"
-        
-        order_intent = {
-            "symbol": symbol,
-            "trade_id": trade_id,
-            "entry_type": entry_type,
-            "tier": tier,
-            "entry_price": entry_price,
-            "size_usd": size_usd,
-            "leverage": leverage,
-            "notional_usd": notional_usd,
-            "hard_sl": sl_price,
-            "sl_dist_pct": final_sl_dist_pct,
-            "expiry_utc": expiry_utc.isoformat(),
-            "btc_bearish": btc_bearish,
-            "estimated_liq": estimated_liq,
+        sz_dec = int(cm.get("szDecimals", 0))
+        coin_max = cm.get("maxLeverage")
+        r4h = next((r for r in radar_4h.get("rows", []) if r.get("symbol") == symbol), None)
+        hard_sl, sl_label = hard_sl_for_tier(tier, r4h or {"lower": cand.get("lower_4h"), "filter": cand.get("filter_4h")})
+        if not hard_sl or hard_sl <= 0:
+            skip(f"no Hard SL level ({sl_label})")
+            continue
+
+        size_pct, leverage = _clamp_size_leverage(cand, decision, btc_bearish, coin_max)
+        mid = mids.get(symbol)
+        if not mid or mid <= 0:
+            skip("no live mid price")
+            continue
+        sl_dist_pct = (mid - hard_sl) / mid * 100.0
+        if sl_dist_pct < MIN_SL_DIST_PCT:
+            skip(f"SL distance {sl_dist_pct:.2f}% from live mid < {MIN_SL_DIST_PCT}%", size_pct=size_pct, leverage=leverage)
+            continue
+
+        limit_px = round_price(mid * (1 + slip / 100.0), sz_dec)
+        margin_usd = equity * size_pct / 100.0
+        notional_target = margin_usd * leverage
+        qty = order_qty(notional_target, limit_px, sz_dec)
+        notional = qty * mid
+        if notional < MIN_NOTIONAL_USD:
+            skip(f"Notional ${notional:.2f} < ${MIN_NOTIONAL_USD}", size_pct=size_pct, leverage=leverage)
+            continue
+        margin_usd = notional / leverage  # actual margin after lot rounding
+        ok_cap, util = margin_cap_ok(cum_margin, margin_usd, equity)
+        if not ok_cap:
+            skip(f"Margin utilization {util:.1f}% > {MAX_MARGIN_UTILIZATION_PCT}% (cumulative)", size_pct=size_pct, leverage=leverage)
+            continue
+        est_liq = isolated_liq_price_long(limit_px, leverage, coin_max)  # worst-case (highest) entry
+        if not liq_beyond_sl_long(est_liq, hard_sl):
+            skip(f"Isolated liq ${est_liq:.6g} not below Hard SL ${hard_sl:.6g}", size_pct=size_pct, leverage=leverage)
+            continue
+
+        trade_id = f"{symbol}_{now.strftime('%Y%m%d_%H%M%S')}"
+        intent = {
+            "symbol": symbol, "trade_id": trade_id, "entry_type": entry_type, "tier": tier,
+            "mid": mid, "limit_px": limit_px, "qty": qty, "size_pct": size_pct,
+            "margin_usd": round(margin_usd, 2), "leverage": leverage, "margin_mode": "isolated",
+            "notional_usd": round(notional, 2), "hard_sl": hard_sl, "hard_sl_label": sl_label,
+            "sl_dist_pct": round(sl_dist_pct, 3), "estimated_liq": est_liq, "coin_max_leverage": coin_max,
+            "margin_util_after_pct": round(util, 2), "btc_bearish": btc_bearish,
         }
-        
-        # DRY_RUN: log intent
-        if mode == "DRY_RUN":
-            result["actions"].append(order_intent)
-            
-            # Log entry to trade log (dry_run=True)
-            log_entry(
-                trade_id=trade_id,
-                symbol=symbol,
-                entry_type=entry_type,
-                tier=tier,
-                trend_1d=trend_1d,
-                trend_4h=trend_4h,
-                sl_dist_pct=final_sl_dist_pct,
-                entry_price=entry_price,
-                entry_size=size_usd / entry_price,
-                entry_leverage=leverage,
-                ai_decision_reason=decision.get("reason", ""),
-                dry_run=True,
+
+        if not live:
+            cum_margin += margin_usd
+            result["actions"].append(intent)
+            _log(
+                f"DRY_RUN would place: BUY {symbol} qty={qty} IOC limit={limit_px} (mid {mid}) {leverage}x isolated "
+                f"notional=${notional:.2f} margin=${margin_usd:.2f} | Hard SL {sl_label} {hard_sl} ({sl_dist_pct:.2f}%) "
+                f"| liq~{est_liq:.6g} | util {util:.1f}%"
             )
+            log_entry(trade_id=trade_id, symbol=symbol, entry_type=entry_type, tier=tier,
+                      trend_1d=cand.get("trend_1d", ""), trend_4h=cand.get("trend_4h", ""),
+                      sl_dist_pct=sl_dist_pct, entry_price=limit_px, entry_size=qty, entry_leverage=leverage,
+                      ai_decision_reason=decision.get("reason", ""), dry_run=True)
+            continue
+
+        # ---------------- LIVE
+        from hl_exec import enter_long_with_sl
+        _log(f"LIVE placing: BUY {symbol} qty={qty} IOC limit={limit_px} {leverage}x isolated, Hard SL {hard_sl}")
+        r = enter_long_with_sl(hl, symbol, qty, limit_px, leverage, hard_sl, sz_dec)
+        intent["live_result"] = r
+        st = r.get("status")
+        if st == "executed":
+            cum_margin += (r.get("filled_sz") or qty) * (r.get("avg_px") or limit_px) / leverage
+            result["executed"].append(intent)
+            log_entry(trade_id=trade_id, symbol=symbol, entry_type=entry_type, tier=tier,
+                      trend_1d=cand.get("trend_1d", ""), trend_4h=cand.get("trend_4h", ""),
+                      sl_dist_pct=sl_dist_pct, entry_price=r.get("avg_px") or limit_px,
+                      entry_size=r.get("filled_sz") or qty, entry_leverage=leverage,
+                      ai_decision_reason=decision.get("reason", ""), dry_run=False)
         else:
-            # LIVE: place orders via hyperliquid-python-sdk
-            try:
-                # TODO: Integrate hyperliquid-python-sdk
-                # For now, log the intent
-                result["executed"].append(order_intent)
-                
-                # Log entry to trade log (dry_run=False)
-                log_entry(
-                    trade_id=trade_id,
-                    symbol=symbol,
-                    entry_type=entry_type,
-                    tier=tier,
-                    trend_1d=trend_1d,
-                    trend_4h=trend_4h,
-                    sl_dist_pct=final_sl_dist_pct,
-                    entry_price=entry_price,
-                    entry_size=size_usd / entry_price,
-                    entry_leverage=leverage,
-                    ai_decision_reason=decision.get("reason", ""),
-                    dry_run=False,
-                )
-            except Exception as e:
-                result["skipped"].append({
-                    "symbol": symbol,
-                    "reason": f"Order placement failed: {e}",
-                })
-    
+            skip(f"live entry {st}", live_result=r)
+            if st and st.startswith("sl_failed"):
+                result["alerts"].append(f"{symbol}: {st}")
+                if st == "sl_failed_CLOSE_FAILED":
+                    result["status"] = "error"
+                    result["message"] = f"{symbol}: SL failed AND fail-safe close failed - MANUAL ACTION"
     return result
 
 
 if __name__ == "__main__":
-    # CLI execution
-    result = execute_approved_candidates()
-    
-    print(json.dumps(result, indent=2))
-    
-    sys.exit(0 if result["status"] == "success" else 1)
+    res = execute_approved_candidates()
+    print(json.dumps(res, indent=2, default=str))
+    sys.exit(0 if res["status"] in ("success", "fail_closed") else 1)

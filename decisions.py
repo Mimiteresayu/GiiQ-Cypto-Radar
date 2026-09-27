@@ -13,12 +13,17 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 ROOT = Path(__file__).resolve().parent
-DECISIONS_DIR = Path(os.environ.get("DECISIONS_DIR") or str(ROOT / "out" / "decisions"))
+DEFAULT_DECISIONS_DIR = ROOT / "out" / "decisions"
+
+
+def _decisions_dir() -> Path:
+    """Resolve at call time so DECISIONS_DIR overrides (tests, subprocess env) always apply."""
+    return Path(os.environ.get("DECISIONS_DIR") or str(DEFAULT_DECISIONS_DIR))
 
 
 def _ensure_dir() -> None:
     """Ensure decisions directory exists."""
-    DECISIONS_DIR.mkdir(parents=True, exist_ok=True)
+    _decisions_dir().mkdir(parents=True, exist_ok=True)
 
 
 def _decision_file() -> Path:
@@ -27,7 +32,7 @@ def _decision_file() -> Path:
     now_utc = datetime.now(timezone.utc)
     hkt = now_utc + timedelta(hours=8)
     date_str = hkt.strftime("%Y%m%d")
-    return DECISIONS_DIR / f"decisions_{date_str}.json"
+    return _decisions_dir() / f"decisions_{date_str}.json"
 
 
 def store_decisions(decisions: List[Dict[str, Any]]) -> Dict[str, Any]:

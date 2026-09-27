@@ -277,6 +277,11 @@ Trimmed radar feed for public consumption (e.g., giiqquant site):
 | `SCHEDULER_ENABLED` | No | `1` (Railway) | Enable APScheduler in-process cron jobs (Asia/Hong_Kong timezone) |
 | `DECISIONS_DIR` | No | `out/decisions` | Directory for AI decision storage |
 | `TRADE_LOG_PATH` | No | `out/trades/trades.json` | Path for trade log (`.json` or `.db`/`.sqlite` for SQLite) |
+| `HL_API_WALLET_ADDRESS` | No | `0xb74a9E2E…4D0` | Expected address of `HL_API_PRIVATE_KEY`; LIVE refuses to start on mismatch |
+| `EXEC_ENTRY_SLIPPAGE_PCT` | No | `0.5` | IOC entry limit = live mid × (1 + x%) (max 2) |
+| `EXEC_MAX_CANDIDATE_AGE_H` | No | `3` | Executor fails closed if candidates are older / not from today (HKT) / `stale` |
+| `OTR_SCHED_LOCK_WAIT_S` | No | `1200` | Scheduled jobs wait this long for the scan lock instead of skipping |
+| `DESK_DATA_CHUNK_BYTES` | No | `60000` | Max bytes per `[DESK_DATA]` log line before splitting into `[DESK_DATA i/n]` |
 
 **Existing variables:**
 - `COCKPIT_PASSWORD`: Password gate for UI and `/api/desk-data`
@@ -287,13 +292,29 @@ Trimmed radar feed for public consumption (e.g., giiqquant site):
 
 **In-process scheduler (APScheduler):** When `SCHEDULER_ENABLED=1` (default on Railway), all cron jobs run automatically in the cockpit service process (Asia/Hong_Kong timezone):
 
-- **08:05 HKT daily**: 1D scan + generate entry candidates
-- **Hourly :05**: 1H scan + Small/Tiny exits
-- **Every 4h :05** (00, 04, 08, 12, 16, 20 HKT): 4H scan + Mega/Large exits
-- **08:55 HKT daily**: Auto-executor (executes approved candidates)
+- **08:05 HKT daily**: 1D + 4H scan + generate entry candidates → `[DESK_DATA]`
+- **Hourly :07**: 1H scan + Small/Tiny exits + Hard SL align → `[DESK_DATA]`
+- **Every 4h :10** (00, 04, 08, 12, 16, 20 HKT): 4H scan + Mega/Large exits + Hard SL align → `[DESK_DATA]`
+- **08:55 HKT daily**: Auto-executor (executes approved candidates; fails closed without fresh candidates + approvals)
+
+**Live execution (EXEC_DRY_RUN=0 + key):** isolated margin; set leverage (≤5x and ≤ coin maxLeverage) →
+IOC limit buy at live mid + slippage → reduce-only stop-market Hard SL for the filled size
+(Mega/Large 4H Lower, Small/Tiny 4H Filter). If the SL cannot be placed the fill is closed immediately.
+Exits: reduce-only IOC close on primary exit, then SL triggers cancelled; held positions get their SL
+re-aligned (new SL placed before the old one is cancelled; never at/below liquidation).
+
+**`[DESK_DATA]` log line:** single-line `[DESK_DATA] {json}` on stdout with `ts`, `candidates` (today's, with
+tier/type/SL/size/lev/liq), `gc_radar_1d/4h/1h` (trimmed rows + breadth + flags.dual_cross_up), `hl_perp`, `hl_spot`.
+If larger than `DESK_DATA_CHUNK_BYTES` it is split into self-contained `[DESK_DATA i/n] {json}` chunks sharing `ts`
+(big radars are split by rows with `rows_offset`; concatenate rows in part order).
+
+**Manual trigger:** `POST /api/jobs/run {"job": "1d"|"1h"|"4h"|"executor"}` (password-gated, 202, background).
+Executor / exit workers are always forced to DRY_RUN on manual runs. `POST /api/rescan` with `tf` containing `1d`
+now also rebuilds candidates.
 
 **Scheduler status:**
-- Password-gated: `GET /api/scheduler/status`
+- Password-gated: `GET /api/scheduler/status` (persisted to `out/scheduler_status.json`, survives restarts;
+  executor `fail_closed` is reported as `fail_closed`, not `error`; exit-worker failures are `error`)
 - Included in `GET /api/desk-data` under `scheduler` key
 - Shows last run time, status, message/error for each job
 
@@ -333,8 +354,7 @@ If you prefer external cron (or `SCHEDULER_ENABLED=0`), use:
 
 Run all tests:
 ```bash
-python3 test_entry_candidates.py   # Existing: 12 tests
-python3 test_auto_execution.py     # New: 16 tests
+python3 -m pytest -q test_*.py      # all suites (HL mocked; no network, no orders)
 ```
 
 Keep secrets out of commits. Set `HL_API_PRIVATE_KEY` in Railway environment variables only.

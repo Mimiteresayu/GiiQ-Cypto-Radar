@@ -242,10 +242,10 @@ class TestEntryCandidatesLogic(unittest.TestCase):
         self.assertTrue(result["stale"])
 
     def test_stale_flag_4h_old(self):
-        """Stale = True if 4H > 2h."""
+        """Stale = True if 4H > 4.5h (one full 4H cycle + slack)."""
         from datetime import timedelta
         recent_ts = datetime.now(timezone.utc).isoformat()
-        old_4h_ts = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
+        old_4h_ts = (datetime.now(timezone.utc) - timedelta(hours=5)).isoformat()
         
         radar_1d = {
             "ts": recent_ts,
@@ -275,6 +275,10 @@ class TestEntryCandidatesLogic(unittest.TestCase):
         
         result = build_candidates(radar_1d, radar_4h)
         self.assertTrue(result["stale"])
+
+        # 3h-old 4H radar (normal at 08:05 before the fix) is NOT stale anymore
+        radar_4h["ts"] = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
+        self.assertFalse(build_candidates(radar_1d, radar_4h)["stale"])
 
     def test_hard_sl_dist_pct(self):
         """Hard SL distance % calculated from close_1d and tier-correct hard SL.
