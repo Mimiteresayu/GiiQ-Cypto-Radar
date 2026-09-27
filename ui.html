@@ -1303,7 +1303,13 @@
       let cross=0; const crossNames=[];
       const html = items.map(it => {
         const t = String(it.ticker||"").toUpperCase();
-        const g = byT[t]||{};
+        // HL radar row (1D, closed bar) via narrative_map (ZEC, kBONK, SPX…); Bitunix GC as fallback
+        const d1 = radar["1d"]||{};
+        const nm = d1.narrative_map||{};
+        const hlSym = nm[it.ticker] || nm[t] || t;
+        const hlRow = Array.isArray(d1.rows) ? d1.rows.find(r => r.symbol===hlSym) : null;
+        const g = hlRow || byT[t] || {};
+        if (hlRow) it = {...it, venue: "HL"+(hlSym!==t?" ("+hlSym+")":"")};
         const trend = g.trend||(it.gc_scan?"…":"n/a");
         const tCls = trend==="Green"?"trend-g":trend==="Red"?"trend-r":"";
         if (g.dual_cross_up){cross++;crossNames.push(t);}

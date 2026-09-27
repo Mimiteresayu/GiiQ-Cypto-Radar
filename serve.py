@@ -874,11 +874,13 @@ def _load_narrative(radar_1d: dict | None = None) -> dict:
     except Exception:
         pass
     hl_by = {r.get("symbol"): r for r in (radar_1d or {}).get("rows") or []} if isinstance(radar_1d, dict) else {}
+    nmap = {str(k).upper(): v for k, v in ((radar_1d or {}).get("narrative_map") or {}).items()} if isinstance(radar_1d, dict) else {}
     items = []
     for it in wl.get("items") or []:
         t = str(it.get("ticker") or "").upper()
         g = gc_by.get(t) or {}
-        h = hl_by.get(t) or {}
+        hl_sym = nmap.get(t) or (t if t in hl_by else None)
+        h = hl_by.get(hl_sym) or {}
         items.append({
             "ticker": t,
             "sector": it.get("sector"),
@@ -887,6 +889,7 @@ def _load_narrative(radar_1d: dict | None = None) -> dict:
             "narrative": (it.get("narrative") or "")[:80],
             "last_seen": it.get("last_seen"),
             "on_hl": bool(h),
+            "hl_symbol": hl_sym if h else None,
             "trend_1d": h.get("trend") or g.get("trend"),
             "close_1d": sig(h.get("close") if h else g.get("close")),
             "upper_1d": sig(h.get("upper") if h else g.get("upper")),
@@ -931,7 +934,7 @@ def update_narrative_watchlist(body: dict, now: datetime | None = None) -> dict:
     for it in items:
         if not isinstance(it, dict):
             raise ValueError("each item must be an object")
-        t = _clean_str(it.get("ticker") or it.get("symbol"), 20).upper().lstrip("$")
+        t = _clean_str(it.get("ticker") or it.get("symbol"), 20).lstrip("$")  # keep case (HL kPEPE)
         if not t:
             raise ValueError("item missing ticker")
         row = {"ticker": t}
@@ -944,8 +947,8 @@ def update_narrative_watchlist(body: dict, now: datetime | None = None) -> dict:
         old = {str(i.get("ticker") or "").upper(): i for i in wl.get("items") or [] if isinstance(i, dict)}
         merged = {} if mode == "replace" else dict(old)
         for row in clean:
-            prev = old.get(row["ticker"], {})
-            merged[row["ticker"]] = {**prev, **row, "first_seen": prev.get("first_seen") or today, "last_seen": today}
+            prev = old.get(row["ticker"].upper(), {})
+            merged[row["ticker"].upper()] = {**prev, **row, "first_seen": prev.get("first_seen") or today, "last_seen": today}
         for t in remove:
             merged.pop(_clean_str(t, 20).upper().lstrip("$"), None)
         if len(merged) > NARRATIVE_MAX_ITEMS:
