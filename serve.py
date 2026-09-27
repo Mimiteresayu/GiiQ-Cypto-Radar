@@ -244,13 +244,18 @@ def _fetch_hl_live() -> dict:
     """Fetch fresh HL clearinghouse + spot state for HL_ADDRESS (no cache).
     
     Returns: {
-        "hl_perp": clearinghouseState,
-        "hl_spot": spotClearinghouseState,
+        "hl_perp": clearinghouseState (or {"error": "..."}),
+        "hl_spot": spotClearinghouseState (or {"error": "..."}),
         "ts": ISO timestamp,
-        "address": HL_ADDRESS
+        "address": HL_ADDRESS,
+        "fetch_error": bool (True if any fetch failed, PR #6 fix)
     }
     """
-    result: dict = {"address": HL_ADDRESS, "ts": datetime.now(timezone.utc).isoformat()}
+    result: dict = {
+        "address": HL_ADDRESS,
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "fetch_error": False,
+    }
     
     for req_type, key in [
         ("clearinghouseState", "hl_perp"),
@@ -268,12 +273,18 @@ def _fetch_hl_live() -> dict:
                 result[key] = json.loads(resp.read())
         except Exception as e:
             result[key] = {"error": str(e)}
+            result["fetch_error"] = True
+            sys.stderr.write(f"[HL_FETCH] {req_type} failed: {e}\n")
     
     return result
 
 
 def _get_hl_cached() -> dict:
-    """Get cached HL data or fetch fresh if cache expired."""
+    """Get cached HL data or fetch fresh if cache expired.
+    
+    Returns cached data if valid and fresh, or fetches new data.
+    Does NOT cache data with fetch errors (PR #6 fix).
+    """
     global _hl_cache
     now = time.time()
     
@@ -281,12 +292,20 @@ def _get_hl_cached() -> dict:
         cached = _hl_cache.get("data")
         ts = _hl_cache.get("ts", 0)
         
-        if cached and (now - ts) < HL_CACHE_TTL_S:
+        # Return cached if valid and fresh
+        if cached and (now - ts) < HL_CACHE_TTL_S and not cached.get("fetch_error"):
             return cached
         
         # Fetch fresh
         fresh = _fetch_hl_live()
-        _hl_cache = {"ts": now, "data": fresh}
+        
+        # Only cache if fetch succeeded (no errors)
+        if not fresh.get("fetch_error"):
+            _hl_cache = {"ts": now, "data": fresh}
+        else:
+            # Don't cache errors, but return the fresh attempt
+            sys.stderr.write("[HL_CACHE] Not caching data with fetch errors\n")
+        
         return fresh
 
 
@@ -302,9 +321,29 @@ def _compute_unified_equity(hl_data: dict) -> dict:
         "margin_used": float,
         "spot_usdc_free": float,
         "uPnL_sum": float,
-        "ts": ISO string
+        "ts": ISO string,
+        "error": str (if HL fetch failed, PR #6 fix)
     }
     """
+    # Check for fetch errors (PR #6 fix)
+    if hl_data.get("fetch_error"):
+        hl_spot = hl_data.get("hl_spot", {})
+        hl_perp = hl_data.get("hl_perp", {})
+        errors = []
+        if "error" in hl_spot:
+            errors.append(f"spot: {hl_spot['error']}")
+        if "error" in hl_perp:
+            errors.append(f"perp: {hl_perp['error']}")
+        return {
+            "equity": 0.0,
+            "spot_usdc": 0.0,
+            "margin_used": 0.0,
+            "spot_usdc_free": 0.0,
+            "uPnL_sum": 0.0,
+            "ts": hl_data.get("ts", ""),
+            "error": "HL fetch failed: " + "; ".join(errors),
+        }
+    
     hl_spot = hl_data.get("hl_spot", {})
     hl_perp = hl_data.get("hl_perp", {})
     
@@ -728,7 +767,14 @@ def _scheduled_executor() -> None:
 
 
 def _init_scheduler() -> BackgroundScheduler | None:
-    """Initialize APScheduler with cron jobs (Asia/Hong_Kong timezone)."""
+    """Initialize APScheduler with cron jobs (Asia/Hong_Kong timezone).
+    
+    Staggered times to avoid lock collisions (PR #6 fix):
+    - 08:05 HKT: 1D scan + candidates
+    - Every hour :07: 1H scan + Small/Tiny exits
+    - Every 4h :10: 4H scan + Mega/Large exits  
+    - 08:55 HKT: Executor
+    """
     if not HAS_APSCHEDULER:
         sys.stderr.write("[SCHEDULER] APScheduler not available, skipping\n")
         return None
@@ -751,20 +797,20 @@ def _init_scheduler() -> BackgroundScheduler | None:
             coalesce=True,
         )
         
-        # Hourly :05: 1H scan + Small/Tiny exits
+        # Hourly :07 (staggered +2min from 1D): 1H scan + Small/Tiny exits
         scheduler.add_job(
             _scheduled_1h_scan_exits,
-            CronTrigger(minute=5, timezone=hkt),
+            CronTrigger(minute=7, timezone=hkt),
             id="1h_scan_exits",
             name="1H Scan + Small/Tiny Exits",
             max_instances=1,
             coalesce=True,
         )
         
-        # Every 4h :05: 4H scan + Mega/Large exits
+        # Every 4h :10 (staggered +5min from 1D/1H): 4H scan + Mega/Large exits
         scheduler.add_job(
             _scheduled_4h_scan_exits,
-            CronTrigger(hour="0,4,8,12,16,20", minute=5, timezone=hkt),
+            CronTrigger(hour="0,4,8,12,16,20", minute=10, timezone=hkt),
             id="4h_scan_exits",
             name="4H Scan + Mega/Large Exits",
             max_instances=1,
@@ -783,10 +829,10 @@ def _init_scheduler() -> BackgroundScheduler | None:
         
         scheduler.start()
         sys.stderr.write(
-            "[SCHEDULER] APScheduler started (Asia/Hong_Kong timezone)\n"
+            "[SCHEDULER] APScheduler started (Asia/Hong_Kong timezone, staggered)\n"
             "  - 08:05 HKT: 1D scan + entry candidates\n"
-            "  - Hourly :05: 1H scan + Small/Tiny exits\n"
-            "  - Every 4h :05: 4H scan + Mega/Large exits\n"
+            "  - Hourly :07: 1H scan + Small/Tiny exits\n"
+            "  - Every 4h :10: 4H scan + Mega/Large exits\n"
             "  - 08:55 HKT: Auto-executor\n"
         )
         return scheduler

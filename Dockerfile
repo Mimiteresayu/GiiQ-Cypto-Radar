@@ -5,6 +5,8 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 # Scanner is stdlib-only (urllib fallback); bake it so Railway self-refreshes without Harbor.
 COPY serve.py ui.html scan_gc_radar.py mcap_tiers.py failsafe_exit_worker.py entry_candidates.py ./
+# Auto-execution system modules (added 2026-09-27 for PR #6)
+COPY executor.py exit_worker.py trade_log.py decisions.py ./
 COPY data/ ./data/
 # Bake narrative watchlist fallback (Harbor may overwrite via /api/sync)
 RUN mkdir -p out narrative
