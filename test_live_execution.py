@@ -216,6 +216,30 @@ class TestHardSLTier(unittest.TestCase):
         self.assertTrue(executor._check_all_positions_liq_safe(pos, {}, _radar4h(("BTC", 100.0, 90.0, 101.0)))[0])
 
 
+class TestHardSLConsistency(unittest.TestCase):
+    """mcap_tiers.HARD_SL_BY_TIER and failsafe must match exec_common.hard_sl_for_tier."""
+
+    def test_constants_match_exec_common(self):
+        from mcap_tiers import HARD_SL_BY_TIER
+        row = {"filter": 100.0, "lower": 90.0}
+        for tier, rule in HARD_SL_BY_TIER.items():
+            lvl, _ = ec.hard_sl_for_tier(tier, row)
+            self.assertEqual(lvl, row["lower"] if rule == "4h_lower" else row["filter"], tier)
+        self.assertEqual(HARD_SL_BY_TIER["mega"], "4h_lower")
+        self.assertEqual(HARD_SL_BY_TIER["small"], "4h_filter")
+
+    def test_failsafe_uses_tier_hard_sl(self):
+        import failsafe_exit_worker as fs
+        g4 = {"ok": True, "close": 101.0, "prev_close": 101.0, "filter": 100.0, "prev_filter": 99.0,
+              "lower": 90.0, "prev_lower": 89.0, "upper": 110.0}
+        g1 = dict(g4, lower=95.0, prev_lower=94.0)
+        with patch.object(fs, "_gc_closed", side_effect=lambda c, tf: g4 if tf == "4h" else g1):
+            self.assertEqual(fs._compute_long_signal("BTC", "mega", 100, 1)["hard_sl_px"], 90.0)
+            self.assertEqual(fs._compute_long_signal("ETH", "large", 100, 1)["hard_sl_px"], 90.0)
+            self.assertEqual(fs._compute_long_signal("X", "small", 100, 1)["hard_sl_px"], 100.0)
+            self.assertEqual(fs._compute_long_signal("Y", "tiny", 100, 1)["hard_sl_px"], 100.0)
+
+
 # ------------------------------------------------------------------ executor flow (DRY_RUN)
 class TestExecutorDryRun(EnvMixin, unittest.TestCase):
     META = {"AAA": {"szDecimals": 0, "maxLeverage": 3.0}, "BBB": {"szDecimals": 1, "maxLeverage": 3.0},
