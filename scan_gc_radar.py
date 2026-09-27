@@ -245,6 +245,34 @@ def enrich_row_tier_category(row: dict, narrative_set: set, mcap_map: dict | Non
     row["category"] = primary
     row["categories"] = cats
     row["category_label"] = " + ".join(cats) if cats else primary  # ALL labels, e.g. "Narrative + Cemetery"
+    row["reason_tags"] = reason_tags(row, cats)
+    row["cat_tags"] = ", ".join(row["reason_tags"])
+
+
+def reason_tags(row: dict, cats: Optional[List[str]] = None) -> List[str]:
+    """Why a row is on the radar (display only): NARRATIVE (watchlist), CEMETERY (>=70% below ATH),
+    GC (closed-bar dual_cross_up on this TF), P/CR (price/liquidity universe: dayNtlVlm floor or
+    volume pad). Force-included narrative/cemetery rows below the floor have no P/CR."""
+    cats = cats if cats is not None else (row.get("categories") or [])
+    tags = []
+    if "Narrative" in cats:
+        tags.append("NARRATIVE")
+    if "Cemetery" in cats or row.get("cemetery_1d"):  # 4H/1H use the 1D (280d ATH) cemetery status
+        tags.append("CEMETERY")
+    if row.get("dual_cross_up"):
+        tags.append("GC")
+    if row.get("in_floor", True):
+        tags.append("P/CR")
+    return tags
+
+
+def load_cemetery_set() -> List[str]:
+    """Cemetery symbols from the last 1D radar (ATH drop needs ~280 daily bars)."""
+    try:
+        d = json.loads(Path(os.path.join(ROOT, "out", "gc_radar_1d.json")).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    return [r["symbol"] for r in d.get("rows") or [] if "Cemetery" in (r.get("categories") or []) and r.get("symbol")]
 
 
 MAX_SYMBOLS = 280  # expanded liquid HL universe (~250–300; --max overrides)
@@ -520,10 +548,21 @@ def load_universe(max_n: int = MAX_SYMBOLS) -> Tuple[List[str], str, Dict[str, A
         src = src + f"+narrative{len(forced)}"
         print(f"[info] narrative force-include: {', '.join(forced)}", file=sys.stderr)
 
+    # Cemetery-only coins below the floor/max: force-include last 1D cemetery set; the 1D scan also
+    # probes every other live HL perp and keeps only cemetery/narrative rows (scan_tf probe filter).
+    meta_set = set(meta_names)
+    cem_forced = [c for c in dict.fromkeys(load_cemetery_set()) if c in meta_set and c not in names]
+    if cem_forced:
+        names = names + cem_forced
+        src = src + f"+cemetery{len(cem_forced)}"
+    probe = [n for n in meta_names if n not in set(names)]
+
     meta = {
         "floors": floors,
         "narrative_map": narrative_map,
         "narrative_forced": forced,
+        "cemetery_forced": cem_forced,
+        "probe": probe,
         "n_meta_live": len(vol_rows),
         "n_nonzero_day_ntl": nonzero,
         "ctx_by_symbol": {
@@ -980,6 +1019,11 @@ def scan_tf(
 
     rows: List[dict] = []
     errors: List[str] = []
+    forced_set = set(universe_meta.get("narrative_forced") or []) | set(universe_meta.get("cemetery_forced") or [])
+    probe_set = set(universe_meta.get("probe") or []) if tf == "1d" else set()
+    if probe_set:
+        symbols = list(symbols) + [p for p in universe_meta.get("probe") or [] if p not in set(symbols)]
+        print(f"[tf=1d] probing {len(probe_set)} below-floor HL perps for cemetery/narrative")
 
     def _job(sym: str) -> Tuple[str, Optional[dict], Optional[str]]:
         try:
@@ -1014,8 +1058,15 @@ def scan_tf(
     # Size tier (mcap) + category sleeve (Narrative / Cemetery / Price)
     narr = load_narrative_tickers()
     mcap_map = load_mcap_map() if load_mcap_map else {}
+    cem_1d = set(load_cemetery_set()) if tf != "1d" else set()
     for r in rows:
+        r["in_floor"] = r["symbol"] not in forced_set and r["symbol"] not in probe_set
+        if tf != "1d":
+            r["cemetery_1d"] = r["symbol"] in cem_1d
         enrich_row_tier_category(r, narr, mcap_map)
+    if probe_set:  # keep probed below-floor rows only if cemetery or narrative
+        rows = [r for r in rows if r["symbol"] not in probe_set
+                or {"Cemetery", "Narrative"} & set(r.get("categories") or [])]
 
     # Display/candidate priority: dual_cross_up first, then mom_score, then symbol.
     # Does NOT change which rows get dual_cross_up=true (GC only).
@@ -1059,6 +1110,8 @@ def scan_tf(
         "universe_floors": floors,
         "narrative_map": universe_meta.get("narrative_map") or {},
         "narrative_forced": universe_meta.get("narrative_forced") or [],
+        "cemetery_forced": sorted(set(universe_meta.get("cemetery_forced") or [])
+                                  | {r["symbol"] for r in rows if r["symbol"] in probe_set}),
         "momentum_note": (
             "rvol/vol_accel/vol_change_pct/mom_score/mom_rank are observe+rank only; "
             "dual_cross_up GC entry math unchanged"
