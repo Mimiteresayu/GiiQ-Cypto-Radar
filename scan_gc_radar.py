@@ -245,7 +245,7 @@ def enrich_row_tier_category(row: dict, narrative_set: set, mcap_map: dict | Non
     row["category"] = primary
     row["categories"] = cats
     row["reason_tags"] = reason_tags(row, cats)
-    row["cat_tags"] = " ".join(row["reason_tags"])  # CAT display: "N C CR" (blank if none)
+    row["cat_tags"] = " ".join(row["reason_tags"])  # CAT display: "N C V" (blank if none)
     row["category_label"] = row["cat_tags"]  # same short codes (no long "Narrative + Cemetery" strings)
 
 
@@ -260,21 +260,32 @@ def _is_cemetery_1d(row: dict) -> bool:
         return False
 
 
-CAT_CODE_ORDER = ("N", "C", "CR")
-_LEGACY_CAT = {"NARRATIVE": "N", "Narrative": "N", "CEMETERY": "C", "Cemetery": "C", "P/CR": "CR"}
+CAT_CODE_ORDER = ("N", "C", "V")
+_LEGACY_CAT = {"NARRATIVE": "N", "Narrative": "N", "CEMETERY": "C", "Cemetery": "C"}
+# Volume ignition (Cemetery Revival card, "Ignition"): bar volume 3-7x vs quiet base while close still <= Upper.
+VOL_IGNITION_RVOL = 3.0  # rvol = last closed bar volume / median(prior RVOL_LOOKBACK closed bars)
+
+
+def is_vol_ignition(row: dict) -> bool:
+    """V: closed-bar rvol >= VOL_IGNITION_RVOL AND close <= Upper (not yet broken out) on this TF."""
+    try:
+        return (float(row.get("rvol")) >= VOL_IGNITION_RVOL
+                and float(row.get("close")) <= float(row.get("upper")))
+    except (TypeError, ValueError):
+        return False
 
 
 def reason_tags(row: dict, cats: Optional[List[str]] = None) -> List[str]:
     """CAT short codes (display only), fixed order: N (narrative watchlist), C (cemetery: >=70% below the 1D ATH;
-    4H/1H use the 1D status), CR (cemetery revival = C AND closed-bar dual_cross_up on this TF). Plain coins -> []."""
+    4H/1H use the 1D status), V (volume ignition on this TF's closed bar, see is_vol_ignition). Plain coins -> []."""
     cats = cats if cats is not None else (row.get("categories") or [])
     tags = []
     if "Narrative" in cats:
         tags.append("N")
     if _is_cemetery_1d(row):
         tags.append("C")
-        if row.get("dual_cross_up"):
-            tags.append("CR")
+    if is_vol_ignition(row):
+        tags.append("V")
     return tags
 
 

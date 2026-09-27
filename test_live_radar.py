@@ -331,10 +331,14 @@ class TestNarrativeUniverse(unittest.TestCase):
 
 class TestReasonTagsAndCemetery(unittest.TestCase):
     def test_reason_tags(self):
-        r = {"symbol": "X", "dual_cross_up": True, "drop_from_ath_pct": 80, "in_floor": True}
+        r = {"symbol": "X", "dual_cross_up": False, "drop_from_ath_pct": 80, "rvol": 4.2, "close": 1.0, "upper": 1.1}
         sgr.enrich_row_tier_category(r, {"X"}, {})
-        self.assertEqual(r["cat_tags"], "N C CR")
-        self.assertEqual(r["category_label"], "N C CR")
+        self.assertEqual(r["cat_tags"], "N C V")
+        self.assertEqual(r["category_label"], "N C V")
+        rb = {"symbol": "B", "drop_from_ath_pct": 5, "rvol": 5.0, "close": 1.2, "upper": 1.1}  # above Upper -> no V
+        self.assertEqual(sgr.reason_tags(rb, []), [])
+        rq = {"symbol": "Q", "drop_from_ath_pct": 5, "rvol": 2.9, "close": 1.0, "upper": 1.1}  # rvol < 3 -> no V
+        self.assertEqual(sgr.reason_tags(rq, []), [])
         r2 = {"symbol": "Y", "dual_cross_up": False, "drop_from_ath_pct": 90, "in_floor": False}
         sgr.enrich_row_tier_category(r2, set(), {})
         self.assertEqual(r2["reason_tags"], ["C"])
@@ -343,10 +347,11 @@ class TestReasonTagsAndCemetery(unittest.TestCase):
         self.assertEqual(r3["cat_tags"], "")
         r4 = {"symbol": "W", "dual_cross_up": True, "drop_from_ath_pct": 10, "cemetery_1d": True}  # 4H row, 1D cem
         sgr.enrich_row_tier_category(r4, set(), {})
-        self.assertEqual(r4["cat_tags"], "C CR")
+        self.assertEqual(r4["cat_tags"], "C")
         r5 = {"symbol": "V", "dual_cross_up": True, "drop_from_ath_pct": 90, "cemetery_1d": False}  # 1D not cem
         self.assertEqual(sgr.reason_tags(r5, []), [])
-        self.assertEqual(sgr.cat_codes({"cat_tags": "NARRATIVE, CEMETERY, GC, P/CR"}), "N C CR")
+        self.assertEqual(sgr.cat_codes({"cat_tags": "NARRATIVE, CEMETERY, GC, P/CR"}), "N C")
+        self.assertEqual(sgr.cat_codes({"cat_tags": "N C CR"}), "N C")
         self.assertEqual(sgr.cat_codes({"categories": ["Narrative", "Cemetery"]}), "N C")
         self.assertEqual(sgr.cat_codes({"categories": ["Price"]}), "")
 

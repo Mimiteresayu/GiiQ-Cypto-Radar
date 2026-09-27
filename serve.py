@@ -762,12 +762,12 @@ def _tf_timing(tf: str, radar: dict, now: datetime) -> dict:
     }
 
 
-_CAT_ORDER = ("N", "C", "CR")
-_CAT_LEGACY = {"NARRATIVE": "N", "Narrative": "N", "CEMETERY": "C", "Cemetery": "C", "P/CR": "CR"}
+_CAT_ORDER = ("N", "C", "V")
+_CAT_LEGACY = {"NARRATIVE": "N", "Narrative": "N", "CEMETERY": "C", "Cemetery": "C"}
 
 
 def _cat_label(r: dict) -> str:
-    """CAT short codes, space-separated, fixed order N C CR (blank if none). Legacy rows mapped."""
+    """CAT short codes, space-separated, fixed order N C V (blank if none). Legacy rows mapped."""
     raw = r.get("cat_tags")
     if raw is None:
         raw = r.get("categories") or []
