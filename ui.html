@@ -848,6 +848,7 @@
   // ALL category labels joined ("Narrative + Cemetery"); primary as fallback
   function catLabel(r) {
     if (!r) return "";
+    if (r.cat_tags) return r.cat_tags;  // "NARRATIVE, CEMETERY, GC, P/CR"
     if (Array.isArray(r.categories) && r.categories.length) return r.categories.join(" + ");
     return r.category_label || r.category || "";
   }
@@ -1156,7 +1157,7 @@
       ? base.map(c => {
           const tier = (c.tier||"tiny").toLowerCase();
           const cat  = c.category||"";
-          const catL = c.category_label||cat;
+          const catL = c.cat_tags||c.category_label||cat;
           return `<div class="entry-row">
             <span class="er-coin">${esc(c.symbol)}</span>
             <span class="cand-tier tier-${tier}">${tier}</span>
@@ -1310,7 +1311,7 @@
         const hlRow = Array.isArray(d1.rows) ? d1.rows.find(r => r.symbol===hlSym) : null;
         const g = hlRow || byT[t] || {};
         if (hlRow) it = {...it, venue: "HL"+(hlSym!==t?" ("+hlSym+")":"")};
-        const trend = g.trend||(it.gc_scan?"…":"n/a");
+        const trend = g.trend||(hlRow||byT[t] ? "…" : "not on HL");
         const tCls = trend==="Green"?"trend-g":trend==="Red"?"trend-r":"";
         if (g.dual_cross_up){cross++;crossNames.push(t);}
         const cls = g.dual_cross_up?"hl-up":g.dual_cross_down_filter?"hl-down":"";

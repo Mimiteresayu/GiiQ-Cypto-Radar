@@ -188,6 +188,7 @@ def build_candidates(
             "category": r1d.get("category"),
             "categories": r1d.get("categories") or ([r1d["category"]] if r1d.get("category") else []),
             "category_label": " + ".join(r1d.get("categories") or []) or r1d.get("category"),
+            "cat_tags": r1d.get("cat_tags"),
             "is_base": bool(base),
             "is_chase": bool(chase),
             # ENTRY ref: Base = 1D Upper, Chase = 4H Upper (closed bars)

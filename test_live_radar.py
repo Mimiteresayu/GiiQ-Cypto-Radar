@@ -327,3 +327,50 @@ class TestNarrativeUniverse(unittest.TestCase):
 
     def test_perp_names_filter(self):
         self.assertEqual(live_radar.hl_perp_names({"BTC": 1, "@12": 1, "PURR/USDC": 1, "kPEPE": 1}), ["BTC", "kPEPE"])
+
+
+class TestReasonTagsAndCemetery(unittest.TestCase):
+    def test_reason_tags(self):
+        r = {"symbol": "X", "dual_cross_up": True, "drop_from_ath_pct": 80, "in_floor": True}
+        sgr.enrich_row_tier_category(r, {"X"}, {})
+        self.assertEqual(r["cat_tags"], "NARRATIVE, CEMETERY, GC, P/CR")
+        r2 = {"symbol": "Y", "dual_cross_up": False, "drop_from_ath_pct": 90, "in_floor": False}
+        sgr.enrich_row_tier_category(r2, set(), {})
+        self.assertEqual(r2["reason_tags"], ["CEMETERY"])
+
+    def test_1d_probe_keeps_only_cemetery_or_narrative(self):
+        tmp = tempfile.mkdtemp()
+        rows = {"A": 10, "LOWCEM": 85, "LOWNOTHING": 5}
+
+        def scan(coin, tf, ctx=None):
+            return {"symbol": coin, "close": 1.0, "filter": 1.0, "upper": 1.1, "lower": 0.9, "trend": "Green",
+                    "above_upper": False, "dual_cross_up": False, "dual_cross_down_filter": False,
+                    "drop_from_ath_pct": rows[coin], "bar_time": 1, "mom_score": 0}
+        meta = {"probe": ["LOWCEM", "LOWNOTHING"], "narrative_forced": [], "cemetery_forced": []}
+        with patch.object(sgr, "OUT_DIR", tmp), patch.object(sgr, "scan_symbol", side_effect=scan), \
+             patch.object(sgr, "load_narrative_tickers", return_value=set()), \
+             patch.object(sgr, "write_candles_cache", return_value=None):
+            p = sgr.scan_tf("1d", ["A"], "test", concurrency=1, universe_meta=meta)
+        by = {r["symbol"]: r for r in p["rows"]}
+        self.assertEqual(set(by), {"A", "LOWCEM"})
+        self.assertEqual(by["LOWCEM"]["cat_tags"], "CEMETERY")
+        self.assertIn("P/CR", by["A"]["cat_tags"])
+        self.assertEqual(p["cemetery_forced"], ["LOWCEM"])
+
+    def test_live_sync_adds_cemetery_on_4h(self):
+        radar = {"rows": [{"symbol": "BTC", "trend": "Green", "drop_from_ath_pct": 1}]}
+
+        def scan(coin, tf):
+            with sgr._BARS_LOCK:
+                sgr._BARS_CACHE[(tf, coin)] = [{"t": 1, "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1}]
+            return {"symbol": coin, "trend": "Red", "drop_from_ath_pct": 5, "dual_cross_up": False}
+        with patch.object(sgr, "load_cemetery_set", return_value=["DEAD"]), \
+             patch.object(sgr, "load_narrative_tickers", return_value=set()), \
+             patch.object(sgr, "scan_symbol", side_effect=scan):
+            res = live_radar.sync_narrative("4h", radar, {}, {})
+            self.assertEqual(res["added"], ["DEAD"])
+            row = [r for r in radar["rows"] if r["symbol"] == "DEAD"][0]
+            self.assertTrue(row["cemetery_forced"])
+            self.assertEqual(row["reason_tags"], ["CEMETERY"])
+            res1d = live_radar.sync_narrative("1d", {"rows": []}, {}, {})
+            self.assertEqual(res1d["added"], [])  # 1D cemetery comes from the probe scan

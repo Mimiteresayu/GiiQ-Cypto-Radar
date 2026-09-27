@@ -763,7 +763,9 @@ def _tf_timing(tf: str, radar: dict, now: datetime) -> dict:
 
 
 def _cat_label(r: dict) -> str | None:
-    """ALL category labels joined (e.g. "Narrative + Cemetery"); falls back to primary."""
+    """Reason tags comma-separated (e.g. "NARRATIVE, CEMETERY, GC, P/CR"); older rows: categories joined."""
+    if r.get("cat_tags"):
+        return r["cat_tags"]
     cats = r.get("categories")
     if isinstance(cats, list) and cats:
         return " + ".join(str(c) for c in cats)
@@ -840,7 +842,7 @@ def _load_candidates_file() -> dict:
         return {}
 
 
-_ENTRY_TAB_KEYS = ("symbol", "tier", "category", "category_label", "trend_1d", "trend_4h", "close_1d", "upper_1d",
+_ENTRY_TAB_KEYS = ("symbol", "tier", "category", "category_label", "cat_tags", "trend_1d", "trend_4h", "close_1d", "upper_1d",
                    "filter_1d", "close_4h", "upper_4h", "filter_4h", "lower_4h", "entry_ref", "hard_sl_dist_pct")
 
 

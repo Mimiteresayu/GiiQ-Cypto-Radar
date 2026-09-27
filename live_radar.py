@@ -55,6 +55,8 @@ def sync_narrative(tf: str, radar: dict, cbars: dict, narrative_map: Dict[str, O
     rows = radar.setdefault("rows", [])
     have = {r.get("symbol") for r in rows}
     want = [h for h in dict.fromkeys(narrative_map.values()) if h]
+    cem = [c for c in sgr.load_cemetery_set() if c not in want] if tf != "1d" else []
+    want += cem  # cemetery-only coins (from 1D) must be on 4H/1H too, same GC math
     # coins that failed recently (e.g. new listing, < period+20 bars) are retried every 6h only
     retry = radar.get("narrative_retry_after_ms") or {}
     now_ms = int(time.time() * 1000)
@@ -74,12 +76,17 @@ def sync_narrative(tf: str, radar: dict, cbars: dict, narrative_map: Dict[str, O
         with sgr._BARS_LOCK:
             bars = sgr._BARS_CACHE.get((tf, coin)) or []
         cbars[coin] = [[b["t"], b["open"], b["high"], b["low"], b["close"], b["volume"]] for b in bars]
-        row["narrative_forced"] = True
+        row["narrative_forced"] = coin not in cem
+        row["cemetery_forced"] = coin in cem
+        row["in_floor"] = False
         rows.append(row)
         added.append(coin)
     narr = sgr.load_narrative_tickers()
     mcap_map = sgr.load_mcap_map() if getattr(sgr, "load_mcap_map", None) else {}
+    cem_1d = set(sgr.load_cemetery_set()) if tf != "1d" else set()
     for r in rows:
+        if tf != "1d":
+            r["cemetery_1d"] = r.get("symbol") in cem_1d
         sgr.enrich_row_tier_category(r, narr, mcap_map)
     if added:
         _recount(radar)
