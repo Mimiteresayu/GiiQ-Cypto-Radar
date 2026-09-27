@@ -249,10 +249,21 @@ def enrich_row_tier_category(row: dict, narrative_set: set, mcap_map: dict | Non
     row["cat_tags"] = ", ".join(row["reason_tags"])
 
 
+def _is_cemetery_1d(row: dict) -> bool:
+    """1D cemetery status: price >= CEMETERY_DROP_ATH_PCT below the daily ATH. 4H/1H rows carry `cemetery_1d`
+    (from the last 1D radar); 1D rows use their own drop_from_ath_pct."""
+    if "cemetery_1d" in row:
+        return bool(row.get("cemetery_1d"))
+    try:
+        return float(row.get("drop_from_ath_pct")) >= CEMETERY_DROP_ATH_PCT
+    except (TypeError, ValueError):
+        return False
+
+
 def reason_tags(row: dict, cats: Optional[List[str]] = None) -> List[str]:
     """Why a row is on the radar (display only): NARRATIVE (watchlist), CEMETERY (>=70% below ATH),
-    GC (closed-bar dual_cross_up on this TF), P/CR (price/liquidity universe: dayNtlVlm floor or
-    volume pad). Force-included narrative/cemetery rows below the floor have no P/CR."""
+    GC (closed-bar dual_cross_up on this TF), P/CR (cemetery ignition, user lock: 1D down-from-ATH >= 70%
+    AND closed-bar dual_cross_up on this TF = Primary + Cemetery Revival)."""
     cats = cats if cats is not None else (row.get("categories") or [])
     tags = []
     if "Narrative" in cats:
@@ -261,7 +272,7 @@ def reason_tags(row: dict, cats: Optional[List[str]] = None) -> List[str]:
         tags.append("CEMETERY")
     if row.get("dual_cross_up"):
         tags.append("GC")
-    if row.get("in_floor", True):
+    if row.get("dual_cross_up") and _is_cemetery_1d(row):
         tags.append("P/CR")
     return tags
 

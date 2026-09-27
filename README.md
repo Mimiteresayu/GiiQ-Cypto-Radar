@@ -330,8 +330,8 @@ SPX6900→SPX`, …) → `k`+symbol. Radar JSON: `narrative_map` {ticker: HL nam
 **Cemetery-only coins:** the 1D scan also probes every other live HL perp below the floor/max and keeps rows that are
 Cemetery (≥70% below ATH) or Narrative; 4H/1H scans and the live loop force-include the last 1D cemetery set
 (`cemetery_forced`, `cemetery_1d`). **CAT column / `cat_tags`** (`reason_tags` list, display only): `NARRATIVE`
-(watchlist), `CEMETERY` (1D cemetery status), `GC` (closed-bar dual_cross_up on that TF), `P/CR` (in the price/liquidity
-universe: dayNtlVlm floor or volume pad; absent on force-included rows), e.g. `NARRATIVE, CEMETERY, GC, P/CR`.
+(watchlist), `CEMETERY` (1D cemetery status), `GC` (closed-bar dual_cross_up on that TF), `P/CR` (cemetery ignition =
+Primary + Cemetery Revival: 1D ↓ATH% ≥ 70 AND closed-bar dual_cross_up on that TF; 4H/1H use the 1D cemetery status), e.g. `NARRATIVE, CEMETERY, GC, P/CR`.
 
 **Live execution (EXEC_DRY_RUN=0 + key):** isolated margin; set leverage (≤5x and ≤ coin maxLeverage) →
 IOC limit buy at live mid + slippage → reduce-only stop-market Hard SL for the filled size
