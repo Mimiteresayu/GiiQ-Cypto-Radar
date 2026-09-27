@@ -4,7 +4,8 @@
 LOCKED rules from SIZE_TIER_EXIT_LOCKED.md / HARBOR_AUTOTRADE_PROMPT_v1.md:
 - GC periods: 1D=144, 4H=72, 1H=48, Lag/Fast off, closed bars only
 - Tiers by mcap: Mega/Large → 4H Filter cross-down; Small/Tiny → 1H Lower cross-down
-- Hard SL: **4H Filter (mid) for ALL tiers** (unified 2026-09-21); re-aligned each run
+- Hard SL: Mega/Large → 4H Lower (period 72); Small/Tiny → 4H Filter (mid); re-aligned each run
+  (same as exec_common.hard_sl_for_tier / mcap_tiers.HARD_SL_BY_TIER)
 - Shorts: report-only (no exit logic locked yet)
 - Never opens positions
 
@@ -189,7 +190,7 @@ def _compute_long_signal(coin: str, tier: str, entry: float, size: float) -> Dic
     primary_rule = PRIMARY_RULE[tier]
     hard_sl_rule = HARD_SL_BY_TIER.get(tier, "4h_filter")
 
-    # Always need 4H for hard SL (unified 2026-09-21: 4H Filter for ALL tiers)
+    # Always need 4H for hard SL (Mega/Large: 4H Lower; Small/Tiny: 4H Filter)
     g4 = _gc_closed(coin, "4h")
     if not g4.get("ok"):
         return {
@@ -200,8 +201,8 @@ def _compute_long_signal(coin: str, tier: str, entry: float, size: float) -> Dic
             "hard_sl_px": None,
         }
 
-    # Hard SL = 4H Filter (mid) for ALL tiers
-    hard_sl_px = _round_trigger(g4["filter"])
+    # Hard SL per tier (mcap_tiers.HARD_SL_BY_TIER)
+    hard_sl_px = _round_trigger(g4["lower"] if hard_sl_rule == "4h_lower" else g4["filter"])
 
     exit_signal = None
     primary_tf = "4h"

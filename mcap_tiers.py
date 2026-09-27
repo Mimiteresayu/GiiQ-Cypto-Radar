@@ -47,12 +47,12 @@ PRIMARY_RULE = {
 }
 
 HARD_SL_BY_TIER = {
-    "mega": "4h_filter",
-    "large": "4h_filter",
-    "small": "4h_filter",
+    "mega": "4h_lower",   # 4H Lower (period 72)
+    "large": "4h_lower",  # same as Mega
+    "small": "4h_filter",  # 4H Filter (mid, period 72)
     "tiny": "4h_filter",
 }
-HARD_SL_RULE = "4h_filter"  # unified 2026-09-21: 4H Filter (mid, period 72) for ALL tiers
+HARD_SL_RULE = "4h_filter"  # default for unknown tiers; per-tier SoT above (= exec_common.hard_sl_for_tier)
 
 
 
