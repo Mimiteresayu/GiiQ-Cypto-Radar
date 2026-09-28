@@ -421,6 +421,7 @@
 <body>
 
 <div id="execPreflightBanner" style="display:none;margin:0;padding:8px 14px;background:#7f1d1d;color:#fff;font-weight:700;font-size:0.82rem;border-bottom:2px solid #ef4444"></div>
+<div id="pendingBox" style="display:none;margin:0;padding:6px 14px;background:rgba(59,130,246,0.10);border-bottom:1px solid #1e3a8a;color:var(--text,#e6edf3);font-size:0.78rem"></div>
 <header class="app-header">
   <div class="header-row1">
     <!-- Brand -->
@@ -922,6 +923,29 @@
       if (r.ok) deskData = await r.json();
     } catch {}
     updateExecPreflightBanner();
+    updateModePill();
+  }
+
+  // Header badge = REAL executor mode from the service env (EXEC_DRY_RUN + key)
+  function updateModePill() {
+    const p = el("modePill");
+    if (!p || !deskData || !deskData.exec_mode) return;
+    const m = deskData.exec_mode.mode;
+    p.textContent = m === "LIVE" ? "LIVE" : "DRY_RUN";
+    p.className = "pill " + (m === "LIVE" ? "pill-err" : "pill-warn");
+    p.title = m === "LIVE" ? "Executor places REAL orders on Hyperliquid (EXEC_DRY_RUN=0, API key set)"
+                           : "Executor is in DRY_RUN (no orders)";
+  }
+
+  // AI decision badge for ENTRY rows
+  function aiDecisionHtml(c, isChase) {
+    const d = c && c.ai_decision;
+    if (!d || !d.decision) return `<span class="pill" style="font-size:0.62rem;opacity:.7" title="no AI decision stored today">NO DECISION</span>`;
+    const ok = d.decision === "APPROVE";
+    const label = ok ? (isChase ? "APPROVED → pending pullback" : "APPROVED") : "VETO";
+    const sz = ok && (d.size_pct != null || d.leverage != null) ? ` ${d.size_pct ?? "?"}% ${d.leverage ?? "?"}x` : "";
+    return `<span class="pill ${ok ? "pill-live" : "pill-err"}" style="font-size:0.62rem" title="${esc(d.reason||"")}">${label}${sz}</span>`
+      + (d.reason ? `<span class="er-note" style="display:block">AI: ${esc(String(d.reason).slice(0,160))}</span>` : "");
   }
 
   // LIVE executor preflight (Railway boot + 08:45 HKT) and last executor result: red banner on failure
@@ -937,7 +961,7 @@
     } else if (pf.ok && (pf.warnings || []).length) {
       msgs.push("Preflight warning: " + pf.warnings.join(" · "));
     }
-    ["executor", "api_exec_run"].forEach(k => {
+    ["executor", "api_exec_run", "pending_entries"].forEach(k => {
       const j = jobs[k];
       if (j && j.status === "error") msgs.push("EXECUTOR " + k + " ERROR (" + ageStr(j.last_run) + "): " + (j.message || j.error || "").slice(0, 400));
       else if (j && (j.message || "").includes("ALERTS:") && j.last_run && (Date.now() - Date.parse(j.last_run)) < 24*3600*1000)
@@ -945,6 +969,18 @@
     });
     b.style.display = msgs.length ? "block" : "none";
     b.textContent = msgs.join("  |  ");
+    // Pending pullback entries (ADD_ON / CONTINUATION) with trigger zones
+    const pb = el("pendingBox");
+    const pend = (deskData.pending_entries || []).filter(p => p && p.symbol);
+    if (pb) {
+      pb.style.display = pend.length ? "block" : "none";
+      const f = v => (v == null ? "—" : fmtNum(v));
+      pb.innerHTML = pend.length ? "<b>Pending pullback entries</b> (Railway 4H :10 job · bar N: low ≤ Filter &amp; close &gt; Lower · enter after N+1 closes &gt; Lower and &gt; N close · ADD_ON=4H bars, CONTINUATION=1D bars): " + pend.map(p =>
+        `<span style="margin-right:14px"><b>${p.symbol}</b> ${p.kind} · zone ${String(p.band_tf||"").toUpperCase()} ` +
+        `[${f(p.zone_lower)} – ${f(p.zone_filter)}] · ${p.setup ? "<b style='color:#f59e0b'>bar N set</b> (close " + f(p.setup.c) + ") · " : ""}mid ${f(p.mid)}${p.in_zone ? " <b style='color:#22c55e'>IN ZONE</b>" : ""}` +
+        ` · ${p.size_pct ?? "?"}% ${p.leverage ?? "?"}x · exp ${p.expires_at ? new Date(p.expires_at).toLocaleDateString("en-GB",{timeZone:"Asia/Hong_Kong"}) : "—"}` +
+        `${p.last_check && p.last_check.reason ? " · " + p.last_check.reason : ""}</span>`).join("") : "";
+    }
   }
 
   // ── Header breadth ─────────────────────────────────────────────────────
@@ -1192,7 +1228,8 @@
             <span class="cand-tier tier-${tier}">${tier}</span>
             <span class="cat-${cat}" style="font-size:0.68rem">${esc(catL)||""}</span>
             <span class="er-price">${fmtNum(c.upper_1d)}</span>
-            <span class="er-note">1D cross_up + 1D Green (closed) · fill N+1 · entry=Upper ${c.upper_1d?">"+fmtNum(c.upper_1d):""}</span>
+            <span class="er-note">1D cross_up + 1D Green (closed) · entry at 08:55 if live mid &gt; 1D Upper ${c.upper_1d?fmtNum(c.upper_1d):""}</span>
+            ${aiDecisionHtml(c, false)}
           </div>`;
         }).join("")
       : '<div class="empty">No Base candidates (1D dual_cross_up + 1D Green)</div>';
@@ -1207,7 +1244,8 @@
             <span class="cand-tier tier-${tier}">${tier}</span>
             <span class="cand-type" style="font-size:0.65rem">CHASE</span>
             <span class="er-price">4H:${fmtNum(c.upper_4h)}</span>
-            <span class="er-note">1D green · 4H green + cross_up (closed) · entry=4H Upper ${c.upper_4h?">"+fmtNum(c.upper_4h):""}</span>
+            <span class="er-note">1D green · 4H green + cross_up (closed) · no 08:55 entry: pending pullback (ADD_ON if held → 4H zone, else CONTINUATION → 1D zone; N+1 confirm)</span>
+            ${aiDecisionHtml(c, true)}
           </div>`;
         }).join("")
       : '<div class="empty">No chase candidates</div>';

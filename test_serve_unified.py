@@ -393,3 +393,27 @@ class TestPositionsWithStops(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestEntryTabDecisionsAndMode(unittest.TestCase):
+    def test_entry_tab_includes_ai_decision(self):
+        import os
+        from unittest.mock import patch
+        import serve
+        cd = {"generated_at": "x", "candidates": [
+            {"symbol": "YGG", "type": "Chase", "is_chase": True, "is_base": False},
+            {"symbol": "MON", "type": "Base", "is_chase": False, "is_base": True},
+            {"symbol": "ZZZ", "type": "Chase", "is_chase": True, "is_base": False}]}
+        decs = {"YGG": {"decision": "veto", "reason": "too extended"},
+                "MON": {"decision": "approve", "reason": "clean cross", "size_pct": 6, "leverage": 2}}
+        with patch.object(serve, "get_decisions_for_today", return_value=decs):
+            et = serve._entry_tab(cd)
+        chase = {r["symbol"]: r for r in et["chase"]}
+        self.assertEqual(chase["YGG"]["ai_decision"]["decision"], "VETO")
+        self.assertEqual(chase["YGG"]["ai_decision"]["reason"], "too extended")
+        self.assertIsNone(chase["ZZZ"]["ai_decision"])
+        self.assertEqual(et["base"][0]["ai_decision"]["decision"], "APPROVE")
+        with patch.dict(os.environ, {"EXEC_DRY_RUN": "0", "HL_API_PRIVATE_KEY": "0xabc"}):
+            self.assertEqual(serve._exec_mode()["mode"], "LIVE")
+        with patch.dict(os.environ, {"EXEC_DRY_RUN": "1"}):
+            self.assertEqual(serve._exec_mode()["mode"], "DRY_RUN")

@@ -101,9 +101,12 @@ def _radar4h(*rows):
 
 class EnvMixin:
     def setUp(self):
-        self._env = {k: os.environ.get(k) for k in ("EXEC_DRY_RUN", "HL_API_PRIVATE_KEY", "EXEC_MAX_CANDIDATE_AGE_H")}
+        self._env = {k: os.environ.get(k) for k in ("EXEC_DRY_RUN", "HL_API_PRIVATE_KEY", "EXEC_MAX_CANDIDATE_AGE_H",
+                                                    "PENDING_PATH")}
         os.environ["EXEC_DRY_RUN"] = "1"
         os.environ.pop("HL_API_PRIVATE_KEY", None)
+        self._pend_dir = tempfile.mkdtemp()
+        os.environ["PENDING_PATH"] = os.path.join(self._pend_dir, "pending_entries.json")
         self.log_entry = patch.object(executor, "log_entry").start()
 
     def tearDown(self):
@@ -252,30 +255,13 @@ class TestExecutorDryRun(EnvMixin, unittest.TestCase):
                                                     radar_1h={}, radar_4h=r4h or {"rows": []}, now=NOW,
                                                     radar_1d=r1d or {"rows": []})
 
-    # ---- at-entry Upper guard
-    def test_guard_chase_below_4h_upper_skips(self):
+    # ---- Base at-entry 1D Upper guard
+    def test_guard_base_above_1d_upper_passes(self):
         hl = FakeHL(equity=1000, meta=self.META, mids={"AAA": 1.0})
-        res = self.run_exec(hl, _cands(_cand("AAA", typ="Chase", upper_4h=1.02)),
-                            {"AAA": {"decision": "approve", "size_pct": 6, "leverage": 2}})
-        self.assertEqual(res["actions"], [])
-        self.assertIn("below 4H Upper at entry", res["skipped"][0]["reason"])
-        self.assertTrue(any("below 4H Upper at entry" in a for a in res["alerts"]))
-        self.assertEqual(hl.calls, [])
-
-    def test_guard_chase_uses_latest_radar_4h_upper(self):
-        # candidate snapshot says 0.97 (passes) but the newer closed-bar radar row says 1.01 -> skip
-        hl = FakeHL(equity=1000, meta=self.META, mids={"AAA": 1.0})
-        r4h = {"rows": [{"symbol": "AAA", "filter": 0.9, "lower": 0.8, "close": 1.0, "upper": 1.01}]}
-        res = self.run_exec(hl, _cands(_cand("AAA", typ="Chase")), {"AAA": {"decision": "approve"}}, r4h=r4h)
-        self.assertEqual(res["actions"], [])
-        self.assertIn("below 4H Upper at entry", res["skipped"][0]["reason"])
-
-    def test_guard_chase_above_4h_upper_passes(self):
-        hl = FakeHL(equity=1000, meta=self.META, mids={"AAA": 1.0})
-        res = self.run_exec(hl, _cands(_cand("AAA", typ="Chase", upper_4h=0.99, upper_1d=1.5)),
+        res = self.run_exec(hl, _cands(_cand("AAA", typ="Base", upper_1d=0.99, upper_4h=1.5)),
                             {"AAA": {"decision": "approve"}})
-        self.assertEqual(len(res["actions"]), 1)          # Chase ignores the 1D Upper
-        self.assertEqual(res["actions"][0]["entry_upper_label"], "4H Upper")
+        self.assertEqual(len(res["actions"]), 1)          # Base ignores the 4H Upper
+        self.assertEqual(res["actions"][0]["entry_upper_label"], "1D Upper")
 
     def test_guard_base_uses_1d_upper(self):
         hl = FakeHL(equity=1000, meta=self.META, mids={"AAA": 1.0})
@@ -283,25 +269,50 @@ class TestExecutorDryRun(EnvMixin, unittest.TestCase):
         res = self.run_exec(hl, _cands(_cand("AAA", typ="Base", upper_4h=2.0)), {"AAA": {"decision": "approve"}}, r1d=r1d)
         self.assertEqual(res["actions"], [])
         self.assertIn("below 1D Upper at entry", res["skipped"][0]["reason"])
+        self.assertTrue(any("below 1D Upper at entry" in a for a in res["alerts"]))
+
+    def test_guard_base_prefers_latest_radar_1d_upper(self):
+        hl = FakeHL(equity=1000, meta=self.META, mids={"AAA": 1.0})
+        r1d = {"rows": [{"symbol": "AAA", "upper": 1.01}]}  # snapshot 0.95 would pass; newer radar -> skip
+        res = self.run_exec(hl, _cands(_cand("AAA", typ="Base")), {"AAA": {"decision": "approve"}}, r1d=r1d)
+        self.assertEqual(res["actions"], [])
 
     def test_guard_missing_upper_fails_closed(self):
         hl = FakeHL(equity=1000, meta=self.META, mids={"AAA": 1.0})
-        c = _cand("AAA", typ="Chase")
-        c["upper_4h"] = None
+        c = _cand("AAA", typ="Base")
+        c["upper_1d"] = None
         res = self.run_exec(hl, _cands(c), {"AAA": {"decision": "approve"}})
         self.assertEqual(res["actions"], [])
-        self.assertIn("no 4H Upper", res["skipped"][0]["reason"])
+        self.assertIn("no 1D Upper", res["skipped"][0]["reason"])
 
     def test_guard_uses_fresh_mid_at_order_time(self):
         class MovingHL(FakeHL):
             n = 0
             def all_mids(self):
                 self.n += 1
-                return {"AAA": 1.0} if self.n == 1 else {"AAA": 0.96}  # drops below 4H Upper 0.97
+                return {"AAA": 1.0} if self.n == 1 else {"AAA": 0.94}  # drops below 1D Upper 0.95
         hl = MovingHL(equity=1000, meta=self.META)
-        res = self.run_exec(hl, _cands(_cand("AAA", typ="Chase")), {"AAA": {"decision": "approve"}})
+        res = self.run_exec(hl, _cands(_cand("AAA", typ="Base")), {"AAA": {"decision": "approve"}})
         self.assertEqual(res["actions"], [])
-        self.assertIn("below 4H Upper at entry", res["skipped"][0]["reason"])
+        self.assertIn("below 1D Upper at entry", res["skipped"][0]["reason"])
+
+    def test_base_and_chase_row_is_treated_as_base(self):
+        hl = FakeHL(equity=1000, meta=self.META, mids={"AAA": 1.0})
+        c = _cand("AAA", typ="Chase", upper_4h=1.5)
+        c["is_base"] = True
+        res = self.run_exec(hl, _cands(c), {"AAA": {"decision": "approve"}})
+        self.assertEqual(len(res["actions"]), 1)
+        self.assertEqual(res["pending"], [])
+
+    # ---- Chase -> pending (never an 08:55 order)
+    def test_chase_dry_run_reports_pending_but_stores_nothing(self):
+        hl = FakeHL(equity=1000, meta=self.META, mids={"AAA": 1.0})
+        res = self.run_exec(hl, _cands(_cand("AAA", typ="Chase")), {"AAA": {"decision": "approve", "size_pct": 3}})
+        self.assertEqual(res["actions"], [])
+        self.assertEqual(res["pending"][0]["kind"], "CONTINUATION")
+        self.assertTrue(res["pending"][0]["would_create"])
+        self.assertFalse(os.path.exists(os.environ["PENDING_PATH"]))
+        self.assertEqual(hl.calls, [])
 
     def test_qty_notional_liq_and_no_orders(self):
         hl = FakeHL(equity=1000, meta=self.META, mids={"AAA": 1.0})
@@ -388,13 +399,47 @@ class TestExecutorLive(EnvMixin, unittest.TestCase):
 
     def test_live_guard_skip_places_nothing(self):
         hl = FakeHL(equity=1000, meta=self.META, mids={"AAA": 1.0})
-        res = executor.execute_approved_candidates(hl=hl, candidates_data=_cands(_cand("AAA", typ="Chase", upper_4h=1.05)),
+        res = executor.execute_approved_candidates(hl=hl, candidates_data=_cands(_cand("AAA", typ="Base", upper_1d=1.05)),
                                                    decisions={"AAA": {"decision": "approve"}},
                                                    radar_1h={}, radar_4h={"rows": []}, radar_1d={"rows": []}, now=NOW)
         self.assertEqual(hl.calls, [])
         self.assertEqual(res["executed"], [])
-        self.assertIn("below 4H Upper at entry", res["skipped"][0]["reason"])
+        self.assertIn("below 1D Upper at entry", res["skipped"][0]["reason"])
         self.log_entry.assert_not_called()
+
+    def _live_chase(self, hl, decisions=None):
+        r1d = {"rows": [{"symbol": "AAA", "lower": 0.7, "filter": 0.8, "upper": 0.9, "close": 1.0, "trend": "Green"}]}
+        r4h = {"rows": [{"symbol": "AAA", "lower": 0.85, "filter": 0.92, "upper": 0.97, "close": 1.0, "trend": "Green"}]}
+        return executor.execute_approved_candidates(
+            hl=hl, candidates_data=_cands(_cand("AAA", typ="Chase")),
+            decisions=decisions or {"AAA": {"decision": "approve", "size_pct": 3, "leverage": 2}},
+            radar_1h={}, radar_4h=r4h, radar_1d=r1d, now=NOW)
+
+    def test_live_chase_no_position_creates_continuation_pending(self):
+        hl = FakeHL(equity=1000, meta=self.META, mids={"AAA": 1.0})
+        res = self._live_chase(hl)
+        self.assertEqual(hl.calls, [])                       # no order at 08:55
+        p = res["pending"][0]
+        self.assertEqual((p["kind"], p["band_tf"], p["zone_lower"], p["zone_filter"]), ("CONTINUATION", "1d", 0.7, 0.8))
+        self.assertTrue(p["created"])
+        import pending_entries as pe
+        stored = pe.load_pending()
+        self.assertEqual(len(stored), 1)
+        self.assertEqual((stored[0]["size_pct"], stored[0]["leverage"]), (3, 2))
+        # idempotent re-run (/api/exec/run): no duplicate
+        res2 = self._live_chase(FakeHL(equity=1000, meta=self.META, mids={"AAA": 1.0}))
+        self.assertFalse(res2["pending"][0]["created"])
+        self.assertEqual(len(pe.load_pending()), 1)
+        self.assertEqual(res2["pending_active"][0]["symbol"], "AAA")
+
+    def test_live_chase_on_held_long_creates_add_on_pending(self):
+        pos = {"coin": "AAA", "szi": "50", "entryPx": "0.9", "liquidationPx": "0.3"}
+        hl = FakeHL(equity=1000, meta=self.META, mids={"AAA": 1.0}, positions=[pos])
+        res = self._live_chase(hl)
+        self.assertEqual(hl.calls, [])
+        p = res["pending"][0]
+        self.assertEqual((p["kind"], p["band_tf"], p["zone_lower"], p["zone_filter"]), ("ADD_ON", "4h", 0.85, 0.92))
+        self.assertEqual(res["skipped"], [])                 # not "already holding"
 
     def test_live_sl_failure_closes_position(self):
         hl = FakeHL(equity=1000, meta=self.META, mids={"AAA": 1.0}, sl_ok=False)
