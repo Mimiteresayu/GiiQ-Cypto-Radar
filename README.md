@@ -223,6 +223,21 @@ python3 executor.py
 - **DRY_RUN mode:** logs intended orders only
 - **LIVE mode:** executes via hyperliquid-python-sdk (when `EXEC_DRY_RUN=0` and `HL_API_PRIVATE_KEY` set)
 
+### Entry kinds & pending pullback entries (2026-09-28)
+
+- **Base** (fresh 1D dual-cross-up): executor enters at 08:55 HKT only if the live mid is above the 1D Upper.
+- **Chase** approvals never enter at 08:55. They become pending records in `out/pending_entries.json`:
+  - **ADD_ON** (coin already held LONG): zone = [4H Lower, 4H Filter], 4H trend Green.
+  - **CONTINUATION** (no position): zone = [1D Lower, 1D Filter], 1D trend Green.
+- `pending_worker.py` runs after every 4H closed-bar scan (4H job, :10 HKT). Trigger: the just-closed 4H
+  bar's low <= zone Filter AND its close > zone Lower; then enter at the live mid only if it's within
+  [Lower, Filter x 1.01]. Fill time re-checks: radar freshness, Hard SL per tier, SL distance >= 1.5%,
+  size band (Continuation/Add-on 2-4%), leverage 1-5x / coin max, 80% cumulative margin, isolated liq
+  beyond Hard SL. Cancelled when the band TF closes below Lower, after 7 days, or when idempotency
+  rules apply (CONTINUATION already held / ADD_ON base closed). Records are written only in LIVE mode.
+- Visible in the cockpit (blue pending bar), `GET /api/exec/pending` (X-AI-Key), executor results
+  (`pending`, `pending_active`) and the 08:45 preflight (`pending:<SYM>` lines).
+
 ### Exit Worker Cron
 
 **In-process scheduler (Railway):** Exit workers run automatically via APScheduler when `SCHEDULER_ENABLED=1` (default on Railway):

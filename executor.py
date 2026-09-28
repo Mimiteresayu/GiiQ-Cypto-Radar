@@ -6,8 +6,12 @@ SoT enforcement (see exec_common.py):
 - Min notional $10; leverage 1-5x AND <= coin HL maxLeverage (integer)
 - SL distance >= 1.5% from the LIVE mid; Hard SL per tier (Mega/Large 4H Lower, Small/Tiny 4H Filter)
 - Isolated liq price must lie below the Hard SL
-- At-entry Upper guard: a live HL mid fetched right before the order must be ABOVE the signal
-  TF Upper from the latest closed-bar scan (Chase: 4H Upper, Base: 1D Upper), else skip
+- Base (fresh 1D dual-cross-up) enters now, guarded: a live HL mid fetched right before the
+  order must be ABOVE the 1D Upper from the latest closed-bar scan, else skip
+- Chase signals never enter at 08:55: they become pending pullback entries (pending_entries.py)
+  ADD_ON (coin already held LONG, zone [4H Lower, 4H Filter]) or CONTINUATION (no position,
+  zone [1D Lower, 1D Filter]); pending_worker.py checks them hourly with the same SoT checks.
+  Pending records are only written in LIVE mode (DRY_RUN reports "would_create").
 - Total margin (existing + all new entries, cumulative) <= 80% equity
 - All open positions must already have liq beyond their tier Hard SL
 - BTC 4H close < 4H Filter -> fixed 4% per coin
@@ -50,6 +54,10 @@ from exec_common import (  # noqa: E402
     order_qty,
     round_price,
 )
+
+from pending_entries import band as pending_band  # noqa: E402
+from pending_entries import classify_chase, create_pending, load_pending, save_pending  # noqa: E402
+from pending_entries import summary as pending_summary  # noqa: E402
 
 try:
     from decisions import get_decisions_for_today
@@ -190,7 +198,7 @@ def execute_approved_candidates(
     now = now or datetime.now(timezone.utc)
     result: Dict[str, Any] = {
         "mode": mode, "status": "success", "executed": [], "skipped": [], "actions": [], "alerts": [],
-        "timestamp": now.isoformat(),
+        "pending": [], "timestamp": now.isoformat(),
     }
 
     candidates_data = _load_candidates() if candidates_data is None else candidates_data
@@ -227,6 +235,9 @@ def execute_approved_candidates(
     equity = account["equity"]
     cum_margin = account["margin_used"]
     held = {p["coin"] for p in account["positions"]}
+    held_long = {p["coin"] for p in account["positions"] if p["side"] == "LONG"}
+    pend_entries = load_pending()
+    pend_dirty = False
     if equity <= 0:
         result.update(status="error", message="Equity is 0 / unavailable")
         return result
@@ -267,6 +278,36 @@ def execute_approved_candidates(
         def skip(reason: str, **extra: Any) -> None:
             result["skipped"].append({"symbol": symbol, "reason": reason, **extra})
             _log(f"{mode} SKIP {symbol}: {reason}")
+
+        is_base = bool(cand.get("is_base")) or entry_type == "Base"
+        if not is_base and entry_type == "Chase":
+            # Chase -> pending pullback entry (ADD_ON / CONTINUATION), never an 08:55 order
+            if symbol in held and symbol not in held_long:
+                skip("Chase signal on a SHORT position: no pending add-on")
+                continue
+            kind = classify_chase(symbol, held_long)
+            r1d_p = next((r for r in radar_1d.get("rows", []) if r.get("symbol") == symbol), None)
+            r4h_p = next((r for r in radar_4h.get("rows", []) if r.get("symbol") == symbol), None)
+            bnd = pending_band(kind, r1d_p, r4h_p)
+            info = {"symbol": symbol, "kind": kind, "band_tf": bnd["tf"], "zone_lower": bnd["lower"],
+                    "zone_filter": bnd["filter"], "size_pct": decision.get("size_pct"),
+                    "leverage": decision.get("leverage")}
+            if live:
+                rec, created = create_pending(pend_entries, symbol, kind, decision, cand, bnd, now)
+                pend_dirty = pend_dirty or created
+                info.update(id=rec["id"], created=created, status=rec.get("status"),
+                            expires_at=rec.get("expires_at"))
+            else:
+                info["would_create"] = True
+            result["pending"].append(info)
+            _log(f"{mode} PENDING {kind} {symbol}: zone {bnd['tf'].upper()} [{bnd['lower']}, {bnd['filter']}]"
+                 f"{'' if live else ' (DRY_RUN: not stored)'}")
+            continue
+        if not is_base:
+            skip(f"unknown entry type {entry_type!r} (fail-closed)")
+            continue
+        entry_type = "Base"
+        cand = dict(cand, type="Base")  # Base guard = 1D Upper even if the row is also a 4H Chase
 
         if symbol in held:
             skip("already holding a position")
@@ -378,6 +419,19 @@ def execute_approved_candidates(
                 if st == "sl_failed_CLOSE_FAILED":
                     result["status"] = "error"
                     result["message"] = f"{symbol}: SL failed AND fail-safe close failed - MANUAL ACTION"
+    if pend_dirty:
+        try:
+            save_pending(pend_entries)
+        except Exception as e:  # noqa: BLE001
+            result["alerts"].append(f"pending store write failed: {e}")
+            result["status"] = "error"
+            result["message"] = f"pending store write failed: {e}"
+    try:
+        rows_1d = {r.get("symbol"): r for r in radar_1d.get("rows", []) or []}
+        rows_4h = {r.get("symbol"): r for r in radar_4h.get("rows", []) or []}
+        result["pending_active"] = pending_summary(pend_entries, rows_1d, rows_4h, mids)
+    except Exception:  # noqa: BLE001
+        result["pending_active"] = []
     return result
 
 

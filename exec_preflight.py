@@ -9,7 +9,8 @@ Surfaces, BEFORE the 08:55 executor, every reason LIVE entries would fail:
   4. signing: side-effect-free signed probe (cancel of a non-existent oid) is accepted by HL
   5. decisions/candidates (informational before 08:55): today's approvals, candidate freshness,
      approved coins listed on HL with maxLeverage >= requested (clamped) leverage, and the
-     at-entry Upper guard (live mid vs Chase 4H Upper / Base 1D Upper from the closed-bar scan)
+     at-entry Upper guard (Base only: live mid vs 1D Upper; Chase approvals become pending)
+  6. pending pullback entries (ADD_ON / CONTINUATION) with trigger zones
 
 Prints one JSON object. Exit 0 = ok (or DRY_RUN), 1 = a check that would block LIVE entries failed.
 Never places, modifies or cancels a real order.
@@ -169,6 +170,25 @@ def run_preflight(hl: Any = None, signed_probe: bool = True, now: Optional[datet
             add("guard", False, f"at-entry Upper guard preview failed: {e}", blocking=False)
     else:
         add("decisions", True, "no approvals stored yet for today (AI desk posts before 08:55)", blocking=False)
+    # Pending pullback entries (ADD_ON / CONTINUATION): list + trigger zones (informational)
+    try:
+        from pending_entries import load_pending, summary as pending_summary
+        rows_1d = {r.get("symbol"): r for r in (_load("gc_radar_1d.json").get("rows") or [])}
+        rows_4h = {r.get("symbol"): r for r in (_load("gc_radar_4h.json").get("rows") or [])}
+        try:
+            pmids = hl.all_mids()
+        except Exception:  # noqa: BLE001
+            pmids = {}
+        pend = pending_summary(load_pending(), rows_1d, rows_4h, pmids)
+        res["pending"] = pend
+        for p in pend:
+            add(f"pending:{p['symbol']}", True,
+                f"{p['kind']} zone {p['band_tf'].upper()} [{p['zone_lower']}, {p['zone_filter']}] mid {p['mid']}"
+                f"{' IN ZONE' if p['in_zone'] else ''} exp {p['expires_at']}", blocking=False)
+        if not pend:
+            add("pending", True, "no active pending pullback entries", blocking=False)
+    except Exception as e:  # noqa: BLE001
+        add("pending", False, f"pending list failed: {e}", blocking=False)
     return res
 
 

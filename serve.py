@@ -1262,8 +1262,14 @@ def _scheduled_1h_scan_exits(manual: bool = False) -> None:
 
 
 def _scheduled_4h_scan_exits(manual: bool = False) -> None:
-    """Every 4h :10 HKT: 4H scan + Mega/Large exits + SL align."""
+    """Every 4h :10 HKT: 4H scan + Mega/Large exits + SL align, then pending pullback entries
+    on the just-closed 4H bar (manual runs: pending forced DRY_RUN)."""
     _scan_and_exits("manual_4h_scan_exits" if manual else "4h_scan_exits", "4h", SCAN_MAX, "4h", manual)
+    try:
+        _scheduled_pending(manual=manual)
+    except Exception as e:
+        _update_job_status("pending_entries", "error", "", f"pending exception: {e}")
+        sys.stderr.write(f"[PENDING] !!!!!!!! exception: {e}\n")
 
 
 def _candles_cache_missing() -> list:
@@ -1404,12 +1410,75 @@ def _scheduled_executor(manual: bool = False, live_api: bool = False) -> dict:
     return res
 
 
+def _scheduled_pending(manual: bool = False) -> dict:
+    """Every 4h at :10 HKT, right after the 4H closed-bar scan (called from the 4H job):
+    pending pullback entries (ADD_ON / CONTINUATION) -> pending_worker.py.
+    Same env as the executor (LIVE iff EXEC_DRY_RUN=0); manual (password) runs are forced DRY_RUN."""
+    job_name = "manual_pending_entries" if manual else "pending_entries"
+    res: dict = {}
+    if not _exec_lock.acquire(timeout=120):
+        _update_job_status(job_name, "skipped", "executor/pending pass already running")
+        return {"status": "busy"}
+    try:
+        rc, out, err = _run_worker("pending_worker.py", [], timeout=300, force_dry_run=manual)
+        try:
+            res = json.loads(out)
+        except Exception:
+            res = {}
+        status = res.get("status", "unknown")
+        checks = "; ".join(f"{c.get('symbol')} {c.get('kind')}: {c.get('result') or c.get('action')} ({c.get('reason')})"
+                           for c in res.get("checked", []))
+        msg = (f"{res.get('mode', '?')} {status}: active={len(res.get('pending_active', []))} "
+               f"filled={len(res.get('filled', []))} cancelled={len(res.get('cancelled', []))}"
+               + (f" | {res.get('message')}" if res.get("message") else "")
+               + (f" | {checks[:900]}" if checks else "")
+               + (f" | ALERTS: {'; '.join(map(str, res['alerts']))[:500]}" if res.get("alerts") else ""))
+        if rc == 0 and status == "success":
+            _update_job_status(job_name, status, msg)
+        else:
+            _update_job_status(job_name, "error", msg, (err or out)[-1500:])
+        sys.stderr.write(f"[PENDING] {'!!!!!!!! ' if status != 'success' else ''}{job_name} {status}: {msg}\n")
+    except subprocess.TimeoutExpired:
+        _update_job_status(job_name, "error", "", "pending worker timed out (>300s)")
+        res = {"status": "error"}
+    except Exception as e:
+        _update_job_status(job_name, "error", "", str(e))
+        res = {"status": "error", "message": str(e)}
+    finally:
+        _exec_lock.release()
+    return res
+
+
+def _pending_view() -> list:
+    """Active pending pullback entries + live trigger zones (cockpit / API)."""
+    try:
+        from pending_entries import load_pending, summary as _psum
+        def _rows(tf: str) -> dict:
+            try:
+                with open(os.path.join(OUT_DIR, f"gc_radar_{tf}.json")) as f:
+                    return {r.get("symbol"): r for r in (json.load(f).get("rows") or [])}
+            except Exception:
+                return {}
+        entries = load_pending()
+        mids = {}
+        live = {}
+        for tf in ("1d", "4h"):
+            for sym, r in _rows(tf).items():
+                if isinstance(r.get("live"), dict) and r["live"].get("close"):
+                    live.setdefault(sym, r["live"]["close"])
+        mids = live
+        return _psum(entries, _rows("1d"), _rows("4h"), mids)
+    except Exception as e:
+        return [{"error": str(e)}]
+
+
 MANUAL_JOBS = {
     "1d": _scheduled_1d_scan,
     "1h": _scheduled_1h_scan_exits,
     "4h": _scheduled_4h_scan_exits,
     "executor": _scheduled_executor,
     "live": _scheduled_live_radar,
+    "pending": _scheduled_pending,
 }
 _manual_running: set = set()
 _manual_lock = threading.Lock()
@@ -1493,7 +1562,8 @@ def _init_scheduler() -> BackgroundScheduler | None:
             "  - Hourly :07: 1H scan + Small/Tiny exits\n"
             "  - Every 4h :10: 4H scan + Mega/Large exits\n"
             "  - boot + 08:45 HKT: LIVE executor preflight\n"
-            "  - 08:55 HKT: Auto-executor\n"
+            "  - 08:55 HKT: Auto-executor (Base now; Chase -> pending pullback)\n"
+            "  - Every 4h :10 (after 4H scan): pending pullback entries\n"
             f"  - cron minute {LIVE_RADAR_MINUTES}: LIVE radar 1D/4H/1H + candidates sync + DESK_DATA\n"
         )
         return scheduler
@@ -1657,6 +1727,15 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if path == "/api/exec/preflight":
             self._exec_preflight()
+            return
+        if path == "/api/exec/pending":
+            if self._ai_key_ok():
+                try:
+                    from pending_entries import load_pending
+                    allrec = load_pending()
+                except Exception:
+                    allrec = []
+                self._send_json(200, {"ok": True, "active": _pending_view(), "all": allrec[-50:]})
             return
         if self._need_auth():
             return
@@ -1852,6 +1931,7 @@ class Handler(SimpleHTTPRequestHandler):
         if SCHEDULER_ENABLED:
             result["scheduler"] = _get_scheduler_status()
         result["exec_preflight"] = _read_exec_preflight()
+        result["pending_entries"] = _pending_view()
         
         result["ts"] = datetime.now(timezone.utc).isoformat()
         result["address"] = HL_ADDRESS
