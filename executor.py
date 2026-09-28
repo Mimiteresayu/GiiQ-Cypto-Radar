@@ -17,6 +17,14 @@ SoT enforcement (see exec_common.py):
 - BTC 4H close < 4H Filter -> fixed 4% per coin
 - size_pct = margin % of equity; notional = margin x leverage; qty = notional / price
 
+Guardrails (GIIQ-SoT-1, see docs/SOT_CHANGELOG.md; no strategy change):
+- Radar row-count: 1D and 4H closed-bar radars must have >= RADAR_MIN_ROWS (120) rows and
+  >= 85% of the requested universe, else the whole run fails closed
+- NAV snapshot ONCE per run (exec_common.nav_snapshot) = "equity" for all sizing / margin cap
+- Price sanity: skip a coin if the HL live mid differs from the radar price by > 50%
+- Minimum order: skip if notional < max(HL $10 minimum, 1% of NAV)
+- run_report: executed / skipped / downsized / failed with reasons (cockpit + DESK_DATA)
+
 Entry: IOC limit buy at live mid + EXEC_ENTRY_SLIPPAGE_PCT (default 0.5%), isolated margin,
 then an immediate reduce-only stop-market Hard SL for the filled size. If the SL cannot be
 placed the fill is closed at once (fail-safe). See hl_exec.enter_long_with_sl.
@@ -37,6 +45,13 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 from exec_common import (  # noqa: E402
+    SOT_ID,
+    build_run_report,
+    min_order_usd,
+    nav_snapshot,
+    price_sane,
+    radar_ref_price,
+    radar_rowcount_ok,
     MAX_LEVERAGE,
     MAX_MARGIN_UTILIZATION_PCT,
     MIN_LEVERAGE,
@@ -109,16 +124,11 @@ def _load_candidates() -> dict:
     return _load_json(ROOT / "out" / "entry_candidates_latest.json")
 
 
-def _parse_account(spot: dict, perp: dict) -> dict:
-    """Unified account: equity = spot USDC total; margin from perp marginSummary."""
-    equity = 0.0
-    for bal in spot.get("balances", []) or []:
-        if bal.get("coin") == "USDC":
-            try:
-                equity = float(bal.get("total", 0))
-            except (TypeError, ValueError):
-                pass
-            break
+def _parse_account(spot: dict, perp: dict, abstraction: Optional[str] = None) -> dict:
+    """equity = NAV snapshot (exec_common.nav_snapshot: unified -> spot USDC total);
+    margin from perp marginSummary."""
+    nav = nav_snapshot(spot, perp, abstraction)
+    equity = nav["nav"]
     try:
         margin_used = float((perp.get("marginSummary") or {}).get("totalMarginUsed", 0))
     except (TypeError, ValueError):
@@ -139,7 +149,18 @@ def _parse_account(spot: dict, perp: dict) -> dict:
             "entry_px": float(p.get("entryPx") or 0),
             "liquidation_px": float(p.get("liquidationPx") or 0),
         })
-    return {"equity": equity, "margin_used": margin_used, "free_margin": max(0.0, equity - margin_used), "positions": positions}
+    return {"equity": equity, "margin_used": margin_used, "free_margin": max(0.0, equity - margin_used),
+            "positions": positions, "nav": nav}
+
+
+def _user_abstraction(hl: Any) -> Optional[str]:
+    fn = getattr(hl, "user_abstraction", None)
+    if not callable(fn):
+        return None
+    try:
+        return fn()
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _clamp_size_leverage(candidate: dict, decision: dict, btc_bearish: bool,
@@ -192,7 +213,27 @@ def execute_approved_candidates(
     now: Optional[datetime] = None,
     radar_1d: Optional[dict] = None,
 ) -> Dict[str, Any]:
-    """Run one execution pass. All inputs injectable for tests; defaults read disk/HL."""
+    """Run one execution pass. All inputs injectable for tests; defaults read disk/HL.
+    The result always carries `sot` and a `run_report` (executed/skipped/downsized/failed)."""
+    result = _execute(hl, candidates_data, decisions, radar_1h, radar_4h, now, radar_1d)
+    result["sot"] = SOT_ID
+    try:
+        result["run_report"] = build_run_report("executor", result, result.get("nav_snapshot"),
+                                                result.get("approved_decisions"))
+    except Exception as e:  # noqa: BLE001  (report must never break the run)
+        result["run_report"] = {"sot": SOT_ID, "run": "executor", "error": str(e)}
+    return result
+
+
+def _execute(
+    hl: Any = None,
+    candidates_data: Optional[dict] = None,
+    decisions: Optional[Dict[str, dict]] = None,
+    radar_1h: Optional[dict] = None,
+    radar_4h: Optional[dict] = None,
+    now: Optional[datetime] = None,
+    radar_1d: Optional[dict] = None,
+) -> Dict[str, Any]:
     live = is_live_mode()
     mode = "LIVE" if live else "DRY_RUN"
     now = now or datetime.now(timezone.utc)
@@ -204,6 +245,8 @@ def execute_approved_candidates(
     candidates_data = _load_candidates() if candidates_data is None else candidates_data
     decisions = get_decisions_for_today() if decisions is None else decisions
     approved = [s for s, rec in decisions.items() if rec.get("decision") == "approve"]
+    result["approved_decisions"] = {s: {"size_pct": decisions[s].get("size_pct"),
+                                        "leverage": decisions[s].get("leverage")} for s in approved}
     if not approved:
         result.update(status="fail_closed", message="No approved candidates")
         _log(f"{mode} fail_closed: no approved candidates")
@@ -219,12 +262,22 @@ def execute_approved_candidates(
     radar_1h = _load_radar("1h") if radar_1h is None else radar_1h
     radar_4h = _load_radar("4h") if radar_4h is None else radar_4h
     radar_1d = _load_radar("1d") if radar_1d is None else radar_1d
+    rc_notes = []
+    for tf, rd in (("1d", radar_1d), ("4h", radar_4h)):
+        ok_rc, why_rc = radar_rowcount_ok(rd, tf)
+        rc_notes.append(why_rc)
+        if not ok_rc:
+            result.update(status="fail_closed", message=f"Radar row-count check failed: {why_rc}")
+            result["alerts"].append(why_rc)
+            _log(f"{mode} fail_closed: {why_rc}")
+            return result
+    result["radar_rowcount"] = rc_notes
 
     if hl is None:
         from hl_exec import HLClient
         hl = HLClient(HL_ADDRESS)
     try:
-        account = _parse_account(hl.spot_state(), hl.perp_state())
+        account = _parse_account(hl.spot_state(), hl.perp_state(), _user_abstraction(hl))
         meta = hl.meta()
         mids = hl.all_mids()
     except Exception as e:  # noqa: BLE001
@@ -232,7 +285,10 @@ def execute_approved_candidates(
         _log(f"error: HL state: {e}")
         return result
 
+    # NAV snapshot: taken ONCE here and used for every size / margin-cap / min-order check below
+    result["nav_snapshot"] = account["nav"]
     equity = account["equity"]
+    _log(f"{mode} NAV snapshot ${equity:,.2f} ({account['nav']['source']})")
     cum_margin = account["margin_used"]
     held = {p["coin"] for p in account["positions"]}
     held_long = {p["coin"] for p in account["positions"] if p["side"] == "LONG"}
@@ -334,6 +390,13 @@ def execute_approved_candidates(
         if not mid or mid <= 0:
             skip("no live mid price")
             continue
+        r1d_px = next((r for r in radar_1d.get("rows", []) if r.get("symbol") == symbol), None)
+        # radar price: latest closed 4H / 1D radar close, else the 1D close frozen in the candidate
+        ok_px, _diff, why_px = price_sane(mid, radar_ref_price(r4h, r1d_px) or radar_ref_price(
+            {"close": cand.get("close_1d") or cand.get("close")}))
+        if not ok_px:
+            skip(why_px, mid=mid)
+            continue
         sl_dist_pct = (mid - hard_sl) / mid * 100.0
         if sl_dist_pct < MIN_SL_DIST_PCT:
             skip(f"SL distance {sl_dist_pct:.2f}% from live mid < {MIN_SL_DIST_PCT}%", size_pct=size_pct, leverage=leverage)
@@ -344,8 +407,10 @@ def execute_approved_candidates(
         notional_target = margin_usd * leverage
         qty = order_qty(notional_target, limit_px, sz_dec)
         notional = qty * mid
-        if notional < MIN_NOTIONAL_USD:
-            skip(f"Notional ${notional:.2f} < ${MIN_NOTIONAL_USD}", size_pct=size_pct, leverage=leverage)
+        min_usd = min_order_usd(equity)
+        if notional < min_usd:
+            skip(f"Notional ${notional:.2f} < minimum ${min_usd:.2f} (max of HL ${MIN_NOTIONAL_USD:g}, 1% NAV)",
+                 size_pct=size_pct, leverage=leverage)
             continue
         margin_usd = notional / leverage  # actual margin after lot rounding
         ok_cap, util = margin_cap_ok(cum_margin, margin_usd, equity)

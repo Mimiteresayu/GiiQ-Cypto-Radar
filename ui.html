@@ -422,12 +422,14 @@
 
 <div id="execPreflightBanner" style="display:none;margin:0;padding:8px 14px;background:#7f1d1d;color:#fff;font-weight:700;font-size:0.82rem;border-bottom:2px solid #ef4444"></div>
 <div id="pendingBox" style="display:none;margin:0;padding:6px 14px;background:rgba(59,130,246,0.10);border-bottom:1px solid #1e3a8a;color:var(--text,#e6edf3);font-size:0.78rem"></div>
+<div id="runReportBox" style="display:none;margin:0;padding:6px 14px;background:rgba(148,163,184,0.08);border-bottom:1px solid var(--border,#1f2937);color:var(--text,#e6edf3);font-size:0.76rem"></div>
 <header class="app-header">
   <div class="header-row1">
     <!-- Brand -->
     <div class="brand">
       <h1>Harbor<span class="dot">·</span>HL Autotrade</h1>
       <span class="pill pill-live" id="modePill">DRY_RUN</span>
+      <span class="pill" id="sotPill" style="font-size:0.62rem;opacity:.85" title="Executor rule-set version (docs/SOT_CHANGELOG.md)">SoT —</span>
     </div>
 
     <!-- Multi-TF breadth strip -->
@@ -935,6 +937,32 @@
     p.className = "pill " + (m === "LIVE" ? "pill-err" : "pill-warn");
     p.title = m === "LIVE" ? "Executor places REAL orders on Hyperliquid (EXEC_DRY_RUN=0, API key set)"
                            : "Executor is in DRY_RUN (no orders)";
+    const sp = el("sotPill");
+    const sot = deskData.sot || deskData.exec_mode.sot;
+    if (sp && sot) sp.textContent = sot;
+    updateRunReport();
+  }
+
+  // Daily run report (executor 08:55 + pending 4H runs): executed / skipped / downsized / failed
+  function updateRunReport() {
+    const box = el("runReportBox");
+    const rr = deskData && deskData.run_report;
+    if (!box) return;
+    if (!rr || !(rr.runs || []).length) { box.style.display = "none"; return; }
+    const hk = t => t ? new Date(t).toLocaleTimeString("en-GB", {timeZone: "Asia/Hong_Kong", hour: "2-digit", minute: "2-digit"}) : "—";
+    const list = (k, color) => (rr[k] || []).length
+      ? `<div><b style="color:${color}">${k.toUpperCase()} (${rr[k].length})</b>: ` + rr[k].slice(-12).map(x =>
+          `<span style="margin-right:10px"><b>${esc(x.symbol || "?")}</b>${x.kind ? " " + esc(x.kind) : ""}` +
+          `${x.reason ? " — " + esc(String(x.reason).slice(0, 140)) : ""}` +
+          `${x.qty != null && k === "executed" ? " · " + x.qty + " @ " + fmtNum(x.px) + (x.dry_run ? " (dry-run)" : "") : ""}` +
+          ` <span style="opacity:.6">[${esc(x.run_job || "")} ${hk(x.run_ts)} HKT]</span></span>`).join("") + "</div>"
+      : "";
+    const runs = rr.runs.slice(-6).map(r => `${esc(r.job || "?")} ${hk(r.ts)} ${esc(r.mode || "")} ${esc(r.status || "")}` +
+      `${r.nav != null ? " NAV $" + Number(r.nav).toFixed(0) : ""}`).join(" · ");
+    box.style.display = "block";
+    box.innerHTML = `<b>Run report ${esc(rr.date || "")}</b> <span class="pill" style="font-size:0.6rem">${esc(rr.sot || "")}</span> ` +
+      `<span style="opacity:.75">runs: ${runs}</span>` +
+      list("executed", "#22c55e") + list("downsized", "#f59e0b") + list("failed", "#ef4444") + list("skipped", "#94a3b8");
   }
 
   // AI decision badge for ENTRY rows

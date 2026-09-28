@@ -11,6 +11,11 @@ On trigger the SAME fail-closed SoT checks as the executor run again at fill tim
   SL distance >= 1.5% from live mid, SoT size band + 1-5x/coin maxLeverage, min notional,
   cumulative 80% margin cap, isolated liq beyond Hard SL. LIVE entry = hl_exec.enter_long_with_sl
   (IOC + reduce-only Hard SL, fill closed if the SL fails).
+Guardrails (GIIQ-SoT-1): radar row-count check on 1D + 4H (fail-closed, no state change),
+NAV snapshot once per run, price sanity (HL mid vs radar price <= 50%), minimum order
+max($10, 1% NAV), run_report (executed/skipped/downsized/failed). In the 4H job this runs only
+after the exit worker finished OK (exits -> re-fetch positions here -> entries); serve.py passes
+--after-exits <ts>.
 DRY_RUN unless EXEC_DRY_RUN=0 AND HL_API_PRIVATE_KEY (exec_common.is_live_mode). In DRY_RUN the
 store is not modified. Prints one JSON object; exit 0 ok, 1 error.
 """
@@ -27,6 +32,12 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 from exec_common import (  # noqa: E402
+    SOT_ID,
+    build_run_report,
+    min_order_usd,
+    price_sane,
+    radar_ref_price,
+    radar_rowcount_ok,
     MAX_MARGIN_UTILIZATION_PCT,
     MIN_NOTIONAL_USD,
     MIN_SL_DIST_PCT,
@@ -87,12 +98,29 @@ def closed_bar(hl: Any, coin: str, tf: str, now: datetime) -> Optional[dict]:
 
 def run_pending(hl: Any = None, radar_1d: Optional[dict] = None, radar_4h: Optional[dict] = None,
                 now: Optional[datetime] = None, entries: Optional[List[dict]] = None,
-                log_entry_fn: Any = None, bar_fn: Any = None) -> Dict[str, Any]:
+                log_entry_fn: Any = None, bar_fn: Any = None, after_exits: Optional[str] = None) -> Dict[str, Any]:
+    """One pending pass. Result carries `sot` and `run_report`."""
+    res = _run_pending(hl, radar_1d, radar_4h, now, entries, log_entry_fn, bar_fn, after_exits)
+    res["sot"] = SOT_ID
+    try:
+        approved = {c.get("symbol"): {"size_pct": c.get("approved_size_pct"), "leverage": c.get("approved_leverage")}
+                    for c in res.get("filled", []) or []}
+        res["run_report"] = build_run_report("pending", res, res.get("nav_snapshot"), approved)
+    except Exception as e:  # noqa: BLE001
+        res["run_report"] = {"sot": SOT_ID, "run": "pending", "error": str(e)}
+    return res
+
+
+def _run_pending(hl: Any = None, radar_1d: Optional[dict] = None, radar_4h: Optional[dict] = None,
+                 now: Optional[datetime] = None, entries: Optional[List[dict]] = None,
+                 log_entry_fn: Any = None, bar_fn: Any = None, after_exits: Optional[str] = None) -> Dict[str, Any]:
     live = is_live_mode()
     mode = "LIVE" if live else "DRY_RUN"
     now = now or datetime.now(timezone.utc)
     res: Dict[str, Any] = {"mode": mode, "status": "success", "timestamp": now.isoformat(),
                            "checked": [], "filled": [], "cancelled": [], "alerts": [], "pending_active": []}
+    if after_exits:
+        res["sequence"] = f"exits (done {after_exits}) -> positions re-fetched -> pending entries"
     persist = entries is None
     entries = load_pending() if entries is None else entries
     act = [e for e in entries if e.get("status") == ACTIVE]
@@ -104,20 +132,28 @@ def run_pending(hl: Any = None, radar_1d: Optional[dict] = None, radar_4h: Optio
     radar_4h = _load_json("gc_radar_4h.json") if radar_4h is None else radar_4h
     rows_1d = {r.get("symbol"): r for r in radar_1d.get("rows", []) or []}
     rows_4h = {r.get("symbol"): r for r in radar_4h.get("rows", []) or []}
+    for tf, rd in (("1d", radar_1d), ("4h", radar_4h)):
+        ok_rc, why_rc = radar_rowcount_ok(rd, tf)
+        if not ok_rc:  # fail-closed: no bar consumption, no cancels, no fills this pass
+            res.update(status="fail_closed", message=f"Radar row-count check failed: {why_rc}")
+            res["alerts"].append(why_rc)
+            _log(f"{mode} fail_closed: {why_rc}")
+            return res
 
     if hl is None:
         from hl_exec import HLClient
         hl = HLClient(os.environ.get("HL_ADDRESS") or None)
     try:
-        from executor import _check_all_positions_liq_safe, _parse_account
-        perp_raw = hl.perp_state()
-        account = _parse_account(hl.spot_state(), perp_raw)
+        from executor import _check_all_positions_liq_safe, _parse_account, _user_abstraction
+        perp_raw = hl.perp_state()  # fresh positions (after the exit worker in the 4H job)
+        account = _parse_account(hl.spot_state(), perp_raw, _user_abstraction(hl))
         meta = hl.meta()
         mids = hl.all_mids()
     except Exception as e:  # noqa: BLE001
         res.update(status="error", message=f"HL state failed: {e}")
         return res
-    equity, cum_margin = account["equity"], account["margin_used"]
+    equity, cum_margin = account["equity"], account["margin_used"]  # NAV snapshot, fixed for the run
+    res["nav_snapshot"] = account["nav"]
     held_long = {p["coin"] for p in account["positions"] if p["side"] == "LONG"}
     pos_by_coin = {p["coin"]: p for p in account["positions"]}
     lev_by_coin: Dict[str, int] = {}
@@ -211,6 +247,10 @@ def run_pending(hl: Any = None, radar_1d: Optional[dict] = None, radar_4h: Optio
         if kind == ADD_ON and lev_by_coin.get(sym) and lev_by_coin[sym] != leverage:
             lev_note = f" (approved {leverage}x -> existing isolated {lev_by_coin[sym]}x)"
             leverage = clamp_leverage(lev_by_coin[sym], coin_max)
+        ok_px, _diff, why_px = price_sane(mid, radar_ref_price(rows_4h.get(sym), rows_1d.get(sym)))
+        if not ok_px:
+            note(f"in zone but {why_px}")
+            continue
         sl_dist = (mid - hard_sl) / mid * 100.0
         if sl_dist < MIN_SL_DIST_PCT:
             note(f"in zone but SL distance {sl_dist:.2f}% to {sl_label} {hard_sl:.6g} < {MIN_SL_DIST_PCT}%")
@@ -218,8 +258,9 @@ def run_pending(hl: Any = None, radar_1d: Optional[dict] = None, radar_4h: Optio
         limit_px = round_price(mid * (1 + slip / 100.0), sz_dec)
         qty = order_qty(equity * size_pct / 100.0 * leverage, limit_px, sz_dec)
         notional = qty * mid
-        if notional < MIN_NOTIONAL_USD:
-            note(f"notional ${notional:.2f} < ${MIN_NOTIONAL_USD}")
+        min_usd = min_order_usd(equity)
+        if notional < min_usd:
+            note(f"notional ${notional:.2f} < minimum ${min_usd:.2f} (max of HL ${MIN_NOTIONAL_USD:g}, 1% NAV)")
             continue
         margin_usd = notional / leverage
         ok_cap, util = margin_cap_ok(cum_margin, margin_usd, equity)
@@ -235,7 +276,8 @@ def run_pending(hl: Any = None, radar_1d: Optional[dict] = None, radar_4h: Optio
                   "size_pct": size_pct, "leverage": leverage, "notional_usd": round(notional, 2),
                   "margin_usd": round(margin_usd, 2), "hard_sl": hard_sl, "hard_sl_label": sl_label,
                   "sl_dist_pct": round(sl_dist, 3), "estimated_liq": est_liq, "margin_util_after_pct": round(util, 2),
-                  "zone": [bnd["lower"], bnd["filter"]], "note": lev_note.strip()}
+                  "zone": [bnd["lower"], bnd["filter"]], "note": lev_note.strip(),
+                  "approved_size_pct": rec.get("size_pct"), "approved_leverage": rec.get("leverage")}
         trade_id = f"{sym}_{kind}_{now.strftime('%Y%m%d_%H%M%S')}"
         if not live:
             cum_margin += margin_usd
@@ -283,6 +325,10 @@ def run_pending(hl: Any = None, radar_1d: Optional[dict] = None, radar_4h: Optio
 
 
 if __name__ == "__main__":
-    out = run_pending()
+    _after = None
+    if "--after-exits" in sys.argv:
+        i = sys.argv.index("--after-exits")
+        _after = sys.argv[i + 1] if i + 1 < len(sys.argv) else "ok"
+    out = run_pending(after_exits=_after)
     print(json.dumps(out, indent=2, default=str))
-    sys.exit(0 if out["status"] == "success" else 1)
+    sys.exit(0 if out["status"] in ("success", "fail_closed") else 1)

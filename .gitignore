@@ -9,3 +9,5 @@ out/*.log
 .railway_password
 .railway_ids.json
 railway_function.ts
+out/pending_entries.json
+out/run_reports/
