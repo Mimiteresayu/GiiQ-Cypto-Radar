@@ -862,7 +862,29 @@ def _entry_tab(cd: dict) -> dict:
             base.append(row)
         if is_chase:
             chase.append(row)
+    # AI decision per candidate (today's HKT decisions file): APPROVED / VETO + reason
+    try:
+        decs = get_decisions_for_today() if get_decisions_for_today else {}
+    except Exception:
+        decs = {}
+    for row in base + chase:
+        d = (decs or {}).get(row.get("symbol")) or {}
+        row["ai_decision"] = ({"decision": str(d.get("decision") or "").upper(), "reason": d.get("reason") or "",
+                               "size_pct": d.get("size_pct"), "leverage": d.get("leverage"),
+                               "timestamp": d.get("timestamp")} if d else None)
     return {"generated_at": cd.get("generated_at"), "base": base, "chase": chase}
+
+
+def _exec_mode() -> dict:
+    """Real executor mode from the service env (same rule as exec_common.is_live_mode)."""
+    try:
+        from exec_common import is_live_mode
+        live = is_live_mode()
+    except Exception:
+        live = False
+    return {"mode": "LIVE" if live else "DRY_RUN",
+            "exec_dry_run": (os.environ.get("EXEC_DRY_RUN") or "1").strip(),
+            "key_present": bool((os.environ.get("HL_API_PRIVATE_KEY") or "").strip())}
 
 
 def _load_narrative(radar_1d: dict | None = None) -> dict:
@@ -1932,6 +1954,7 @@ class Handler(SimpleHTTPRequestHandler):
             result["scheduler"] = _get_scheduler_status()
         result["exec_preflight"] = _read_exec_preflight()
         result["pending_entries"] = _pending_view()
+        result["exec_mode"] = _exec_mode()
         
         result["ts"] = datetime.now(timezone.utc).isoformat()
         result["address"] = HL_ADDRESS
