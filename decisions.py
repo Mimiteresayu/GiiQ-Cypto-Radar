@@ -35,6 +35,30 @@ def _decision_file() -> Path:
     return _decisions_dir() / f"decisions_{date_str}.json"
 
 
+_ACTION_MAP = {"approve": "approve", "approved": "approve", "veto": "veto", "vetoed": "veto", "reject": "veto"}
+
+
+def normalize(dec: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Accept both POST shapes: {symbol, decision: approve|veto} (original) and the ENTRY_DESK
+    SoT-2 prompt shape {coin, action: APPROVE|VETO, type}. Returns None if unusable."""
+    if not isinstance(dec, dict):
+        return None
+    symbol = str(dec.get("symbol") or dec.get("coin") or "").upper().strip()
+    action = _ACTION_MAP.get(str(dec.get("decision") or dec.get("action") or "").lower().strip())
+    if not symbol or not action:
+        return None
+    dims = dec.get("dims") if isinstance(dec.get("dims"), dict) else None
+    return {
+        "symbol": symbol,
+        "decision": action,
+        "type": (str(dec.get("type")).upper() if dec.get("type") else None),
+        "size_pct": dec.get("size_pct"),
+        "leverage": dec.get("leverage"),
+        "reason": dec.get("reason", ""),
+        "dims": dims,
+    }
+
+
 def store_decisions(decisions: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Store AI decisions for today.
     
@@ -63,24 +87,18 @@ def store_decisions(decisions: List[Dict[str, Any]]) -> Dict[str, Any]:
     
     # Store each decision
     stored_count = 0
+    rejected: List[Any] = []
+    stored: List[Dict[str, Any]] = []
     for dec in decisions:
-        symbol = str(dec.get("symbol", "")).upper().strip()
-        if not symbol:
+        norm = normalize(dec)
+        if not norm:
+            rejected.append(dec)
             continue
-        
-        decision_type = str(dec.get("decision", "")).lower()
-        if decision_type not in ("approve", "veto"):
-            continue
-        
+        symbol = norm["symbol"]
+
         # Build decision record
-        record = {
-            "symbol": symbol,
-            "decision": decision_type,
-            "size_pct": dec.get("size_pct"),
-            "leverage": dec.get("leverage"),
-            "reason": dec.get("reason", ""),
-            "timestamp": now,
-        }
+        record = {**norm, "timestamp": now}
+        stored.append(record)
         
         # Store in decisions map (latest decision per symbol)
         existing["decisions"][symbol] = record
@@ -93,12 +111,20 @@ def store_decisions(decisions: List[Dict[str, Any]]) -> Dict[str, Any]:
     # Write back
     file_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
     
-    return {
-        "ok": True,
+    out = {
+        "ok": stored_count > 0 or not decisions,
         "stored_count": stored_count,
+        "rejected_count": len(rejected),
         "file_path": str(file_path),
         "timestamp": now,
+        "stored": stored,
     }
+    if rejected:
+        out["rejected"] = rejected[:20]
+        out["expected_shape"] = "{coin|symbol, action|decision: APPROVE|VETO, type, size_pct, leverage, reason, dims}"
+    if not out["ok"]:
+        out["error"] = "no valid decisions (check coin/action keys)"
+    return out
 
 
 def get_decisions_for_today() -> Dict[str, Dict[str, Any]]:

@@ -99,6 +99,13 @@ try:
 except ImportError:
     live_radar = None  # type: ignore
 
+try:  # GIIQ dimensions + measurement ledger (shadow only, never trades)
+    import dim_ledger
+    import dimensions as giiq_dims
+except ImportError:
+    dim_ledger = None  # type: ignore
+    giiq_dims = None  # type: ignore
+
 try:
     from decisions import store_decisions, get_decisions_for_today
     from trade_log import get_all_trades
@@ -1076,6 +1083,7 @@ def _build_desk_data_payload(event: str = "", now: datetime | None = None, kind:
         "exec_mode": _exec_mode(),
         "run_report": _today_run_report(now),
         "pending_entries": _pending_view(),
+        "dimensions": _dims_compact(now),
     }
     if kind == "full":
         payload["narrative"] = narrative
@@ -1085,6 +1093,27 @@ def _build_desk_data_payload(event: str = "", now: datetime | None = None, kind:
     for tf in ("1d", "4h", "1h"):
         payload[f"gc_radar_{tf}"] = _trim_radar(radars[tf], focus)
     return payload
+
+
+def _read_out_json(name: str) -> dict:
+    try:
+        with open(os.path.join(OUT_DIR, name)) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _dims_compact(now: datetime | None = None) -> dict:
+    """Today's dimension scores (shadow) for Claude's ENTRY_DESK. {} if not computed today."""
+    if not giiq_dims:
+        return {}
+    d = _read_out_json("dimensions_latest.json")
+    if not d or d.get("signal_date") != hkt_date(now or datetime.now(timezone.utc)):
+        return {"today": False, "note": "dimensions not computed yet today (08:08 HKT job)"}
+    try:
+        return {"today": True, **giiq_dims.compact(d)}
+    except Exception as e:
+        return {"error": str(e)}
 
 
 def _dumps(obj: dict) -> str:
@@ -1588,6 +1617,37 @@ def _pending_view() -> list:
         return [{"error": str(e)}]
 
 
+def _scheduled_dims(manual: bool = False, mode: str = "snapshot") -> dict:
+    """GIIQ dimensions (shadow): 08:08 snapshot (whales + HL ctx + scores + ledger rows);
+    08:30 outcomes + report. Never places orders; failures only affect the measurement."""
+    job_name = ("manual_" if manual else "") + ("dims_" + mode)
+    res: dict = {}
+    try:
+        steps = [mode] if mode != "outcomes" else ["outcomes", "report"]
+        for step in steps:
+            rc, out, err = _run_worker("dims_job.py", [step], timeout=900, force_dry_run=True)
+            try:
+                res = json.loads(out.strip().splitlines()[-1]) if out.strip() else {}
+            except Exception:
+                res = {"status": "error", "message": (err or out)[-300:]}
+            ok = rc == 0 and res.get("status") in ("success", "skipped")
+            _update_job_status(job_name, res.get("status", "error") if ok else "error",
+                               f"{step}: {json.dumps(res, default=str)[:600]}", "" if ok else (err or out)[-800:])
+            sys.stderr.write(f"[SCHEDULER] {job_name} {step}: {json.dumps(res, default=str)[:400]}\n")
+            if not ok:
+                break
+        if mode == "snapshot":
+            _log_desk_data(job_name)
+    except Exception as e:
+        _update_job_status(job_name, "error", "", str(e))
+        res = {"status": "error", "message": str(e)}
+    return res
+
+
+def _scheduled_dims_outcomes(manual: bool = False) -> dict:
+    return _scheduled_dims(manual=manual, mode="outcomes")
+
+
 MANUAL_JOBS = {
     "1d": _scheduled_1d_scan,
     "1h": _scheduled_1h_scan_exits,
@@ -1595,6 +1655,8 @@ MANUAL_JOBS = {
     "executor": _scheduled_executor,
     "live": _scheduled_live_radar,
     "pending": _scheduled_pending,
+    "dims": _scheduled_dims,
+    "dims_outcomes": _scheduled_dims_outcomes,
 }
 _manual_running: set = set()
 _manual_lock = threading.Lock()
@@ -1659,6 +1721,10 @@ def _init_scheduler() -> BackgroundScheduler | None:
                           id="1h_scan_exits", name="1H Scan + Small/Tiny Exits", **common)
         scheduler.add_job(_scheduled_4h_scan_exits, CronTrigger(hour="0,4,8,12,16,20", minute=10, timezone=hkt),
                           id="4h_scan_exits", name="4H Scan + Mega/Large Exits", **common)
+        scheduler.add_job(_scheduled_dims, CronTrigger(hour=8, minute=8, timezone=hkt),
+                          id="dims_snapshot", name="GIIQ dimensions snapshot (shadow)", **common)
+        scheduler.add_job(_scheduled_dims_outcomes, CronTrigger(hour=8, minute=30, timezone=hkt),
+                          id="dims_outcomes", name="GIIQ dimension outcomes + report (shadow)", **common)
         scheduler.add_job(_scheduled_preflight, CronTrigger(hour=8, minute=45, timezone=hkt),
                           id="exec_preflight", name="LIVE executor preflight (agent/key/signing)",
                           **common)
@@ -1675,6 +1741,8 @@ def _init_scheduler() -> BackgroundScheduler | None:
         sys.stderr.write(
             "[SCHEDULER] APScheduler started (Asia/Hong_Kong)\n"
             "  - 08:05 HKT: 1D+4H scan + entry candidates\n"
+            "  - 08:08 HKT: GIIQ dimensions snapshot (shadow; whales + HL ctx)\n"
+            "  - 08:30 HKT: GIIQ dimension outcomes + report (shadow)\n"
             "  - Hourly :07: 1H scan + Small/Tiny exits\n"
             "  - Every 4h :10: 4H scan + Mega/Large exits\n"
             "  - boot + 08:45 HKT: LIVE executor preflight\n"
@@ -1844,6 +1912,23 @@ class Handler(SimpleHTTPRequestHandler):
         if path == "/api/exec/preflight":
             self._exec_preflight()
             return
+        if path == "/api/ai/dimensions":
+            if self._ai_key_ok():
+                d = _read_out_json("dimensions_latest.json")
+                self._send_json(200 if d else 404, d or {"ok": False, "error": "dimensions not computed yet"})
+            return
+        if path == "/api/dimensions/report":
+            if self._ai_key_ok():
+                self._dims_report(parsed.query)
+            return
+        if path == "/api/whales":
+            if self._ai_key_ok():
+                snap = _read_out_json(os.path.join("whales", "latest.json"))
+                wl = _read_out_json("whales_watchlist.json")
+                self._send_json(200, {"ok": bool(snap), "snapshot": {k: snap.get(k) for k in
+                                      ("ts", "n_wallets", "n_manual", "errors", "wallets")} if snap else None,
+                                      "coins": snap.get("coins") if snap else None, "watchlist": wl})
+            return
         if path == "/api/exec/pending":
             if self._ai_key_ok():
                 try:
@@ -1885,6 +1970,9 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if path == "/api/ai/decision":
             self._ai_decision()
+            return
+        if path == "/api/whales/watchlist":
+            self._whales_watchlist()
             return
         if path == "/api/ai/narrative":
             self._ai_narrative()
@@ -2154,6 +2242,43 @@ class Handler(SimpleHTTPRequestHandler):
             return
         self._send_json(200, {"ok": True, **res})
 
+    def _dims_report(self, query_str: str) -> None:
+        """GET /api/dimensions/report?since=YYYY-MM-DD&type=Base|Chase&metric=ret_7d_sl (keyed)."""
+        if not dim_ledger:
+            self._send_json(500, {"ok": False, "error": "dim_ledger not available"})
+            return
+        qs = parse_qs(query_str)
+        metric = (qs.get("metric") or ["ret_7d_sl"])[0]
+        if metric not in ("ret_7d_sl", "ret_7d", "ret_3d", "ret_1d", "mfe_7d"):
+            self._send_json(400, {"ok": False, "error": "bad metric"})
+            return
+        try:
+            conn = dim_ledger.connect()
+            rep = dim_ledger.report(conn, metric=metric, since=(qs.get("since") or [None])[0],
+                                    sig_type=(qs.get("type") or [None])[0])
+            conn.close()
+            self._send_json(200, {"ok": True, **rep})
+        except Exception as e:
+            self._send_json(500, {"ok": False, "error": str(e)})
+
+    def _whales_watchlist(self) -> None:
+        """POST /api/whales/watchlist (keyed) {"wallets": [{"address","label","source"}]} — replaces
+        the manual smart-money list (e.g. traders found on fomo.family / HyperDash). Public addresses only."""
+        if not self._ai_key_ok():
+            return
+        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            body = json.loads((self.rfile.read(length) if length else b"{}").decode() or "{}")
+        except Exception:
+            self._send_json(400, {"ok": False, "error": "invalid json"})
+            return
+        try:
+            import whales
+            res = whales.save_manual_watchlist(OUT_DIR, body.get("wallets") or [])
+            self._send_json(200 if res.get("ok") else 400, res)
+        except Exception as e:
+            self._send_json(500, {"ok": False, "error": str(e)})
+
     def _ai_key_ok(self) -> bool:
         provided = self.headers.get("X-AI-Key") or (parse_qs(urlparse(self.path).query).get("key") or [""])[0]
         if not AI_DECISION_KEY:
@@ -2245,9 +2370,23 @@ class Handler(SimpleHTTPRequestHandler):
         
         try:
             result = store_decisions(decisions)
-            self._send_json(200, result)
         except Exception as e:
             self._send_json(500, {"ok": False, "error": str(e)})
+            return
+        # Measurement ledger (Claude dims + decision per signal). Never blocks the decision itself.
+        if dim_ledger and result.get("stored"):
+            try:
+                src = "fallback" if str(body.get("source") or "").lower() == "fallback" else "claude"
+                conn = dim_ledger.connect()
+                today = hkt_date(datetime.now(timezone.utc))
+                result["ledger_recorded"] = dim_ledger.record_decisions(conn, today, result["stored"], source=src)
+                conn.close()
+            except Exception as e:
+                result["ledger_error"] = str(e)
+        result.pop("stored", None)
+        if not result.get("ok"):
+            sys.stderr.write(f"[AI_DECISION] !!!!!!!! nothing stored: {json.dumps(result)[:500]}\n")
+        self._send_json(200 if result.get("ok") else 422, result)
 
     def _public_radar(self) -> None:
         """GET /api/public/radar: public trimmed radar feed (no auth, no positions).
