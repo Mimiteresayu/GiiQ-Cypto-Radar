@@ -1307,12 +1307,73 @@ def _scheduled_live_radar(manual: bool = False) -> None:
     _log_desk_data(job_name, kind=kind)
 
 
-def _scheduled_executor(manual: bool = False) -> None:
-    """08:55 HKT: execute AI-approved candidates (manual runs are always DRY_RUN)."""
-    job_name = "manual_executor" if manual else "executor"
+_exec_lock = threading.Lock()  # one executor pass at a time (08:55 cron vs keyed /api/exec/run)
+EXEC_PREFLIGHT_PATH = os.path.join(OUT_DIR, "exec_preflight.json")
+
+
+def _read_exec_preflight() -> dict:
+    try:
+        with open(EXEC_PREFLIGHT_PATH) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _scheduled_preflight(manual: bool = False) -> dict:
+    """Boot + 08:45 HKT: LIVE preflight (mode, agent approval on HL, account, signed probe,
+    today's approvals). Never trades. Result -> out/exec_preflight.json + scheduler status
+    'exec_preflight' (shown as a red banner in the cockpit when it fails)."""
+    job_name = "exec_preflight"
+    res: dict = {}
+    try:
+        rc, out, err = _run_worker("exec_preflight.py", [], timeout=120)
+        try:
+            res = json.loads(out)
+        except Exception:
+            res = {"ok": False, "mode": "?", "checks": [], "error": (err or out)[-800:]}
+        res["ran_at"] = datetime.now(timezone.utc).isoformat()
+        failed = [f"{c['check']}: {c['detail']}" for c in res.get("checks", []) if not c.get("ok") and c.get("blocking")]
+        warns = res.get("warnings") or []
+        if res.get("ok"):
+            status = "warning" if warns else "success"
+            msg = f"{res.get('mode')} preflight OK: agent={((res.get('agent') or {}).get('name'))} " \
+                  f"approved={res.get('approved')}" + (f" | WARN {'; '.join(warns)}" if warns else "")
+        else:
+            status = "error"
+            msg = f"{res.get('mode')} preflight FAILED: " + "; ".join(failed or [res.get("error") or "unknown"])
+        try:
+            os.makedirs(OUT_DIR, exist_ok=True)
+            tmp = EXEC_PREFLIGHT_PATH + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(res, f, indent=2, default=str)
+            os.replace(tmp, EXEC_PREFLIGHT_PATH)
+        except Exception as e:
+            sys.stderr.write(f"[PREFLIGHT] persist failed: {e}\n")
+        _update_job_status(job_name, status, msg[:1500], "" if status != "error" else msg[:1500])
+        banner = "!!!!!!!! " if status == "error" else ""
+        sys.stderr.write(f"[PREFLIGHT] {banner}{status.upper()}: {msg}\n")
+    except Exception as e:
+        _update_job_status(job_name, "error", "", f"preflight exception: {e}")
+        sys.stderr.write(f"[PREFLIGHT] !!!!!!!! exception: {e}\n")
+        res = {"ok": False, "error": str(e)}
+    return res
+
+
+def _scheduled_executor(manual: bool = False, live_api: bool = False) -> dict:
+    """08:55 HKT: execute AI-approved candidates.
+
+    manual=True (password /api/jobs/run) is always DRY_RUN. live_api=True is the keyed
+    POST /api/exec/run re-run: same executor.py, same env (LIVE iff EXEC_DRY_RUN=0), same
+    fail-closed checks; idempotent because executor skips coins already held."""
+    job_name = "api_exec_run" if live_api else ("manual_executor" if manual else "executor")
+    res: dict = {}
+    if not _exec_lock.acquire(timeout=5):
+        _update_job_status(job_name, "skipped", "another executor pass is running")
+        return {"status": "busy", "message": "another executor pass is running"}
     try:
         sys.stderr.write(f"[SCHEDULER] Starting {job_name}\n")
-        rc, out, err = _run_worker("executor.py", [], timeout=600, force_dry_run=manual)
+        rc, out, err = _run_worker("executor.py", [], timeout=600, force_dry_run=manual and not live_api)
         try:
             res = json.loads(out)
         except Exception:
@@ -1321,16 +1382,26 @@ def _scheduled_executor(manual: bool = False) -> None:
         msg = (f"{res.get('mode', '?')} {status}: executed={len(res.get('executed', []))} "
                f"actions={len(res.get('actions', []))} skipped={len(res.get('skipped', []))}"
                + (f" | {res.get('message')}" if res.get("message") else ""))
+        if res.get("skipped"):
+            msg += " | skips: " + "; ".join(f"{x.get('symbol')}: {x.get('reason')}" for x in res["skipped"])[:900]
+        if res.get("alerts"):
+            msg += " | ALERTS: " + "; ".join(map(str, res["alerts"]))[:600]
         if rc == 0 and status in ("success", "fail_closed"):
             _update_job_status(job_name, status, msg)
         else:
             _update_job_status(job_name, "error", msg, (err or out)[-1500:])
-        sys.stderr.write(f"[SCHEDULER] {job_name} {status}: {msg}\n")
+        banner = "!!!!!!!! " if status not in ("success", "fail_closed") else ""
+        sys.stderr.write(f"[SCHEDULER] {banner}{job_name} {status}: {msg}\n")
     except subprocess.TimeoutExpired:
         _update_job_status(job_name, "error", "", "executor timed out (>600s)")
+        res = {"status": "error", "message": "executor timed out (>600s)"}
     except Exception as e:
         _update_job_status(job_name, "error", "", str(e))
-        sys.stderr.write(f"[SCHEDULER] {job_name} exception: {e}\n")
+        sys.stderr.write(f"[SCHEDULER] !!!!!!!! {job_name} exception: {e}\n")
+        res = {"status": "error", "message": str(e)}
+    finally:
+        _exec_lock.release()
+    return res
 
 
 MANUAL_JOBS = {
@@ -1384,7 +1455,8 @@ def _next_runs() -> dict:
 def _init_scheduler() -> BackgroundScheduler | None:
     """APScheduler cron jobs (Asia/Hong_Kong):
     08:05 1D+4H scan + candidates · hourly :07 1H + Small/Tiny exits ·
-    every 4h :10 4H + Mega/Large exits · 08:55 executor. Jobs wait for the scan lock."""
+    every 4h :10 4H + Mega/Large exits · boot + 08:45 preflight · 08:55 executor.
+    Jobs wait for the scan lock."""
     if not HAS_APSCHEDULER:
         sys.stderr.write("[SCHEDULER] APScheduler not available, skipping\n")
         return None
@@ -1402,6 +1474,11 @@ def _init_scheduler() -> BackgroundScheduler | None:
                           id="1h_scan_exits", name="1H Scan + Small/Tiny Exits", **common)
         scheduler.add_job(_scheduled_4h_scan_exits, CronTrigger(hour="0,4,8,12,16,20", minute=10, timezone=hkt),
                           id="4h_scan_exits", name="4H Scan + Mega/Large Exits", **common)
+        scheduler.add_job(_scheduled_preflight, CronTrigger(hour=8, minute=45, timezone=hkt),
+                          id="exec_preflight", name="LIVE executor preflight (agent/key/signing)",
+                          **common)
+        scheduler.add_job(_scheduled_preflight, "date", run_date=datetime.now(hkt) + timedelta(seconds=20),
+                          id="exec_preflight_boot", name="LIVE preflight at boot", **common)
         scheduler.add_job(_scheduled_executor, CronTrigger(hour=8, minute=55, timezone=hkt),
                           id="executor", name="Auto-Executor", **common)
         # LIVE radar every 10 min; first run ~30s after boot (does boot scans if cache missing)
@@ -1415,6 +1492,7 @@ def _init_scheduler() -> BackgroundScheduler | None:
             "  - 08:05 HKT: 1D+4H scan + entry candidates\n"
             "  - Hourly :07: 1H scan + Small/Tiny exits\n"
             "  - Every 4h :10: 4H scan + Mega/Large exits\n"
+            "  - boot + 08:45 HKT: LIVE executor preflight\n"
             "  - 08:55 HKT: Auto-executor\n"
             f"  - cron minute {LIVE_RADAR_MINUTES}: LIVE radar 1D/4H/1H + candidates sync + DESK_DATA\n"
         )
@@ -1577,6 +1655,9 @@ class Handler(SimpleHTTPRequestHandler):
         if path == "/api/scheduler/status":
             self._scheduler_status()
             return
+        if path == "/api/exec/preflight":
+            self._exec_preflight()
+            return
         if self._need_auth():
             return
         if path == "/api/desk-data":
@@ -1612,6 +1693,12 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if path == "/api/ai/narrative":
             self._ai_narrative()
+            return
+        if path == "/api/exec/run":
+            self._exec_run()
+            return
+        if path == "/api/exec/preflight":
+            self._exec_preflight()
             return
         if path == "/api/jobs/run":
             # Password-gated manual trigger. executor/exit workers are FORCED DRY_RUN here.
@@ -1764,6 +1851,7 @@ class Handler(SimpleHTTPRequestHandler):
         # 6) Scheduler status (if enabled)
         if SCHEDULER_ENABLED:
             result["scheduler"] = _get_scheduler_status()
+        result["exec_preflight"] = _read_exec_preflight()
         
         result["ts"] = datetime.now(timezone.utc).isoformat()
         result["address"] = HL_ADDRESS
@@ -1866,6 +1954,50 @@ class Handler(SimpleHTTPRequestHandler):
             self._send_json(500, {"ok": False, "error": str(e)})
             return
         self._send_json(200, {"ok": True, **res})
+
+    def _ai_key_ok(self) -> bool:
+        provided = self.headers.get("X-AI-Key") or (parse_qs(urlparse(self.path).query).get("key") or [""])[0]
+        if not AI_DECISION_KEY:
+            self._send_json(404, {"ok": False, "error": "AI endpoints disabled"})
+            return False
+        if not provided or not hmac.compare_digest(provided, AI_DECISION_KEY):
+            self._send_json(403, {"ok": False, "error": "forbidden"})
+            return False
+        return True
+
+    def _exec_preflight(self) -> None:
+        """GET /api/exec/preflight (keyed): last preflight result. POST: run it now (never trades)."""
+        if not self._ai_key_ok():
+            return
+        if self.command == "POST":
+            res = _scheduled_preflight(manual=True)
+        else:
+            res = _read_exec_preflight()
+        self._send_json(200, {"ok": True, "preflight": res})
+
+    def _exec_run(self) -> None:
+        """POST /api/exec/run (keyed, X-AI-Key): run executor.py ONCE for today's (HKT) stored
+        decisions with the service env (LIVE iff EXEC_DRY_RUN=0). Same fail-closed checks as the
+        08:55 cron (fresh candidates, liq beyond Hard SL, 80% margin cap, SoT bands); idempotent
+        (coins already held are skipped). Optional body {"date": "YYYY-MM-DD"} must equal today HKT."""
+        if not self._ai_key_ok():
+            return
+        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            body = json.loads((self.rfile.read(length) if length else b"{}").decode() or "{}")
+        except Exception:
+            self._send_json(400, {"ok": False, "error": "invalid json"})
+            return
+        today = datetime.now(HKT).strftime("%Y-%m-%d")
+        want = str((body or {}).get("date") or today)
+        if want != today:
+            self._send_json(400, {"ok": False, "error": f"only today's decisions can run (today HKT={today})"})
+            return
+        res = _scheduled_executor(live_api=True)
+        if res.get("status") == "busy":
+            self._send_json(409, {"ok": False, **res})
+            return
+        self._send_json(200, {"ok": res.get("status") in ("success", "fail_closed"), "date": today, "result": res})
 
     def _ai_decision(self) -> None:
         """POST /api/ai/decision: store AI approval/veto decisions.

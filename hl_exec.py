@@ -5,8 +5,10 @@
 - Signed actions use the official hyperliquid-python-sdk ``Exchange`` with the API (agent)
   wallet key HL_API_PRIVATE_KEY acting for the main account HL_ADDRESS.
 - The exchange client is only built when exec_common.is_live_mode() is True
-  (EXEC_DRY_RUN=0 AND HL_API_PRIVATE_KEY present) and the key's address matches
-  HL_API_WALLET_ADDRESS (defaults to the registered API wallet). Otherwise it refuses.
+  (EXEC_DRY_RUN=0 AND HL_API_PRIVATE_KEY present) and Hyperliquid itself reports the key's
+  address as an approved, unexpired agent of HL_ADDRESS (info ``extraAgents``), or the key IS
+  HL_ADDRESS. Otherwise it refuses (fail-closed). HL_API_WALLET_ADDRESS is informational only
+  (a mismatch is logged as a warning) so a rotated agent key never silently blocks entries.
 
 Margin mode: ISOLATED. Each entry's liquidation price then depends only on that position's
 own margin/leverage, so the SoT check "liq beyond Hard SL" is deterministic at entry time,
@@ -27,7 +29,7 @@ from exec_common import is_live_mode, round_price, floor_to_decimals
 
 HL_INFO_URL = "https://api.hyperliquid.xyz/info"
 DEFAULT_MAIN_ADDRESS = "0xcFCda0F8576a268BaA17935368081F4e687dB122"
-DEFAULT_API_WALLET_ADDRESS = "0xb74a9E2EA3e12511aDfc34a0a8327FbE4bc4e4D0"
+AGENT_EXPIRY_WARN_DAYS = 14
 USE_ISOLATED_MARGIN = True
 SL_SLIPPAGE_PCT = 5.0      # limit_px band for the stop-market SL (market on trigger)
 CLOSE_SLIPPAGE = 0.05      # 5% band for reduce-only IOC market closes
@@ -129,6 +131,40 @@ class HLClient:
         """frontendOpenOrders (includes isTrigger / triggerPx / reduceOnly)."""
         return self.info({"type": "frontendOpenOrders", "user": self.address}) or []
 
+    def agent_status(self, api_address: str, now_ms: Optional[int] = None) -> Dict[str, Any]:
+        """Ask HL whether api_address may sign for self.address.
+
+        ok=True iff api_address == main account, or it is listed in extraAgents(main) with
+        validUntil in the future. Any info error -> ok=False (fail-closed)."""
+        now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+        out: Dict[str, Any] = {"ok": False, "api_address": api_address, "account": self.address,
+                               "name": None, "valid_until_ms": None, "days_left": None, "reason": ""}
+        if not api_address:
+            out["reason"] = "no API key address"
+            return out
+        if api_address.lower() == self.address.lower():
+            out.update(ok=True, name="main account key", reason="key is the main account")
+            return out
+        try:
+            agents = self.info({"type": "extraAgents", "user": self.address}) or []
+        except Exception as e:  # noqa: BLE001
+            out["reason"] = f"HL extraAgents query failed: {e}"
+            return out
+        for a in agents if isinstance(agents, list) else []:
+            if str(a.get("address", "")).lower() != api_address.lower():
+                continue
+            vu = int(a.get("validUntil") or 0)
+            days = (vu - now_ms) / 86_400_000.0 if vu else None
+            out.update(name=a.get("name"), valid_until_ms=vu or None,
+                       days_left=round(days, 1) if days is not None else None)
+            if vu and vu <= now_ms:
+                out["reason"] = f"agent '{a.get('name')}' EXPIRED"
+                return out
+            out.update(ok=True, reason=f"approved agent '{a.get('name')}'")
+            return out
+        out["reason"] = f"not an approved agent of {self.address} on Hyperliquid"
+        return out
+
     # ------------------------------------------------------------ signed (LIVE only)
     def exchange(self):
         if self._exchange is not None:
@@ -140,12 +176,31 @@ class HLClient:
         from hyperliquid.utils import constants
 
         wallet = Account.from_key(os.environ["HL_API_PRIVATE_KEY"].strip())
-        expected = (os.environ.get("HL_API_WALLET_ADDRESS") or DEFAULT_API_WALLET_ADDRESS).strip()
-        if wallet.address.lower() != expected.lower():
-            raise LiveModeRefused(f"HL_API_PRIVATE_KEY address {wallet.address} != expected API wallet {expected}")
+        st = self.agent_status(wallet.address)
+        if not st["ok"]:
+            raise LiveModeRefused(f"API key address {wallet.address} not usable for {self.address}: {st['reason']}")
+        hint = (os.environ.get("HL_API_WALLET_ADDRESS") or "").strip()
+        if hint and hint.lower() != wallet.address.lower():
+            _log(f"WARNING: HL_API_WALLET_ADDRESS={hint} != key address {wallet.address} "
+                 f"(ignored: HL reports key as approved agent '{st.get('name')}')")
         self._exchange = Exchange(wallet=wallet, base_url=constants.MAINNET_API_URL, account_address=self.address)
         _log(f"LIVE exchange client ready: api_wallet={wallet.address[:10]}.. account={self.address[:10]}..")
         return self._exchange
+
+    def probe_signing(self, coin: str = "BTC") -> Dict[str, Any]:
+        """Side-effect-free signed probe: cancel a non-existent oid.
+
+        HL authenticates the signature/agent before looking up the order, so a top-level
+        status "ok" (with a per-order "never placed" error) proves the key can sign for the
+        account; an auth problem comes back as status "err" (e.g. "User or API Wallet ... does
+        not exist"). Nothing is ever cancelled (oid 1 is not ours)."""
+        try:
+            resp = self.exchange().cancel(coin, 1)
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": str(e)[:300]}
+        if _ok(resp):
+            return {"ok": True}
+        return {"ok": False, "error": str(resp)[:300]}
 
     def set_leverage(self, coin: str, leverage: int) -> Dict[str, Any]:
         resp = self.exchange().update_leverage(int(leverage), coin, is_cross=not USE_ISOLATED_MARGIN)
