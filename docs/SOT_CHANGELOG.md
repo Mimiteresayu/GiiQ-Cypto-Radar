@@ -15,8 +15,7 @@ header, the executor / pending run reports, the preflight JSON and `[DESK_DATA]`
 ## GIIQ-SoT-2 (2026-09-28): sizing / leverage / ADD_ON rule change (approved by MMT)
 
 Entry and exit **triggers are unchanged**. These rules apply to Base entries (08:55 executor and
-`/api/exec/run`) and to pending fills (ADD_ON / CONTINUATION, 4H :10 job). Code:
-`exec_common.size_by_risk`, `exec_common.addon_gates`, `exec_common.open_risk_usd`.
+`/api/exec/run`) and to pending fills (ADD_ON / CONTINUATION, 4H :10 job).
 
 ### 1. ADD_ON pending fills: extra gates at fill time
 - The existing position's **ROE must be ≥ +10%**. ROE = HL `returnOnEquity`, falling back to
@@ -28,34 +27,31 @@ Entry and exit **triggers are unchanged**. These rules apply to Base entries (08
 - A failed gate means no order. The record stays pending, and the reason appears in the daily
   run report (`skipped`).
 
-### 2. Leverage 3–5x isolated, chosen by risk (replaces the flat 2x and the old size bands)
-- **Margin per coin: 2–4% of NAV**, with a hard cap of 4%. This replaces P 4–8%, P+N 8–12%,
-  P+N+CR 10–15% and Continuation 2–4%. The old BTC-bearish "fixed 4%" rule is subsumed by the 4%
-  cap.
+### 2. Margin = risk, leverage 3–5x isolated (replaces the flat 2x and the old size bands)
+MMT corrected the first draft of this rule on 2026-09-28. **Per-trade risk is the isolated margin
+itself, not a size based on SL distance.** SL and exits are dynamic (tier-based), so SL-risk caps
+were dropped: there is **no** "1.5% NAV risk at Hard SL" cap and **no** "6% total SL-risk" cap.
+
+- **Margin per coin: 2–4% of NAV**, with a hard cap of 4%.
+  - This replaces P 4–8%, P+N 8–12%, P+N+CR 10–15% and Continuation 2–4%. The old BTC-bearish
+    "fixed 4%" rule is subsumed by the 4% cap.
+  - Margin = Claude's `size_pct` clamped to [2%, 4%]. If Claude gives no size, the 4% cap is used.
 - **Leverage 3–5x isolated** and never above the coin's HL maxLeverage. A coin with maxLeverage
-  below 3x is skipped.
-- **Risk at Hard SL** = notional × SL distance, where SL distance is measured from the worst-case
-  entry (IOC limit). Risk must be **≤ 1.5% NAV per trade, with a target of 1%**.
-- **Total open risk ≤ 6% NAV.** For open LONGs this is size × (mid − tier Hard SL). New entries in
-  the same run count cumulatively.
-- **Liquidation buffer:** the isolated liquidation price must sit below the Hard SL by at least
-  **2× the SL distance**, i.e. (Hard SL − liq) ≥ 2 × (entry − Hard SL).
-- **Algorithm:** try leverage from the maximum allowed (5x, coin max, AI max) down to 3x.
-  - Skip a leverage step if its liquidation buffer fails.
-  - Margin = the margin that targets 1% risk, clamped to [2%, cap].
-  - Margin is then reduced so that risk ≤ 1.5% and total open risk ≤ 6%.
-  - Accept the first leverage whose margin is still ≥ 2%.
-  - If it is impossible even at 3x / 2% margin, the coin is **skipped** and the reason is
-    reported.
+  below 3x is skipped. Claude's `leverage` is a maximum inside 3–5x.
+- **Liquidation must sit beyond the Hard SL.** For a LONG, the isolated liquidation price from the
+  worst-case entry (IOC limit) must be strictly below the tier Hard SL.
+  - Try leverage from the maximum allowed (min of 5x, coin max and AI max) down to 3x, and use the
+    first one that passes.
+  - If even 3x fails, the coin is **skipped** and the reason is reported.
+- The existing **80% total margin cap** is unchanged.
 - **ADD_ON keeps the existing position's leverage.** It is fixed and not stepped, even if the
-  existing leverage is below 3x (e.g. MON at 2x).
-- **Claude's `size_pct` / `leverage` are maximums**, clamped by these rules. AI values below the
-  floors are lifted to the floor (2% margin, 3x) and noted in `sizing_notes`, because the legacy
-  default of 2x can't comply with 3–5x.
+  existing leverage is below 3x (e.g. MON at 2x). The +10% ROE and 5.5% NAV coin-margin gates
+  above still apply.
+- **Claude's values are maximums.** AI values below the floors are lifted to the floor (2% margin,
+  3x) and noted in `sizing_notes`, because the legacy default of 2x can't comply with 3–5x.
   - If a lower AI value should mean "skip", that needs a new MMT decision.
 - Unchanged:
   - SL distance ≥ 1.5%
-  - 80% total margin cap
   - minimum order max($10, 1% NAV)
   - price sanity
   - radar row-count
@@ -64,6 +60,7 @@ Entry and exit **triggers are unchanged**. These rules apply to Base entries (08
 - The cockpit/AI candidate suggestions (`suggested_size_pct` / `suggested_leverage`, desk
   `sot2`) use the same sizing on the 1D close.
 - Open positions are **not** resized. MON stays as is.
+- Code: `exec_common.size_by_margin` and `exec_common.addon_gates`.
 
 ---
 

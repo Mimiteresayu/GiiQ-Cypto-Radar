@@ -128,57 +128,57 @@ class TestRunReport(unittest.TestCase):
 
 
 class TestSot2Sizing(unittest.TestCase):
-    """GIIQ-SoT-2 (MMT 2026-09-28): 3-5x isolated, margin 2-4% NAV, risk <= 1.5% (target 1%),
-    total open risk <= 6%, liq >= 2x SL distance below Hard SL, AI size/lev = maximums."""
+    """GIIQ-SoT-2 (MMT 2026-09-28, corrected): risk = isolated margin 2-4% NAV (not SL-distance
+    based), 3-5x isolated, liq strictly below the Hard SL (step down toward 3x, else skip),
+    AI size/lev = maximums."""
 
-    def test_target_one_pct_risk_at_5x(self):
-        r = ec.size_by_risk(1000, 100.0, 95.0, 10)  # SL 5%, 5x liq frac ~15.8% >= 3x5%
+    def test_default_max_margin_and_5x(self):
+        r = ec.size_by_margin(1000, 100.0, 95.0, 10)
         self.assertTrue(r["ok"], r)
-        self.assertEqual(r["leverage"], 5)
-        self.assertAlmostEqual(r["margin_pct"], 4.0)
-        self.assertAlmostEqual(r["risk_pct"], 1.0)
-
-    def test_small_sl_capped_at_4pct_margin(self):
-        r = ec.size_by_risk(1000, 100.0, 98.0, 10)  # SL 2%
         self.assertEqual((r["leverage"], r["margin_pct"]), (5, 4.0))
-        self.assertAlmostEqual(r["risk_pct"], 0.4)
+        self.assertAlmostEqual(r["notional_usd"], 200.0)
 
-    def test_liq_buffer_steps_leverage_down(self):
-        r = ec.size_by_risk(1000, 100.0, 94.0, 10)  # SL 6%: 5x/4x liq too close -> 4x? 3x
-        self.assertTrue(r["ok"], r)
-        self.assertLess(r["leverage"], 5)
-        self.assertTrue(ec.liq_buffer_ok(100.0, 94.0, r["liq"]))
+    def test_not_sized_by_sl_distance(self):
+        a = ec.size_by_margin(1000, 100.0, 98.0, 10, ai_size_pct=3)
+        b = ec.size_by_margin(1000, 100.0, 90.0, 10, ai_size_pct=3)  # 10% SL: same margin
+        self.assertEqual(a["margin_pct"], b["margin_pct"])
+
+    def test_liq_steps_leverage_down(self):
+        r = ec.size_by_margin(1000, 100.0, 85.0, 10)  # 5x liq 84.2 < 85 ok
+        self.assertEqual(r["leverage"], 5)
+        r = ec.size_by_margin(1000, 100.0, 80.0, 10)  # 5x liq 84.2, 4x 78.9 -> 4x
+        self.assertEqual(r["leverage"], 4)
         self.assertTrue(any("5x liq" in n for n in r["notes"]))
+        self.assertLess(r["liq"], 80.0)
 
     def test_impossible_at_3x_skips(self):
-        r = ec.size_by_risk(1000, 100.0, 90.0, 10)  # SL 10%: even 3x liq too close
+        r = ec.size_by_margin(1000, 100.0, 72.0, 10)  # 3x liq 70.2 < 72 ok
+        self.assertEqual(r["leverage"], 3)
+        r = ec.size_by_margin(1000, 100.0, 70.0, 10)  # 3x liq 70.18 >= 70 -> skip
         self.assertFalse(r["ok"])
-        self.assertIn("SoT-2 sizing impossible", r["reason"])
+        self.assertIn("SoT-2 leverage impossible", r["reason"])
 
     def test_ai_values_are_maximums_inside_band(self):
-        r = ec.size_by_risk(1000, 100.0, 98.0, 10, ai_size_pct=3, ai_leverage=4)
+        r = ec.size_by_margin(1000, 100.0, 98.0, 10, ai_size_pct=3, ai_leverage=4)
         self.assertEqual((r["leverage"], r["margin_pct"]), (4, 3.0))
-        r = ec.size_by_risk(1000, 100.0, 98.0, 10, ai_size_pct=1, ai_leverage=2)  # legacy 2x -> 3x floor
+        r = ec.size_by_margin(1000, 100.0, 98.0, 10, ai_size_pct=6, ai_leverage=9)
+        self.assertEqual((r["leverage"], r["margin_pct"]), (5, 4.0))  # hard caps
+        r = ec.size_by_margin(1000, 100.0, 98.0, 10, ai_size_pct=1, ai_leverage=2)  # floors 2% / 3x
         self.assertEqual((r["leverage"], r["margin_pct"]), (3, 2.0))
         self.assertEqual(len(r["notes"]), 2)
 
-    def test_total_open_risk_cap(self):
-        r = ec.size_by_risk(1000, 100.0, 95.0, 10, open_risk=55.0)  # room 0.5%: 5x at 2% margin = 0.5% fits
-        self.assertEqual((r["leverage"], r["margin_pct"]), (5, 2.0))
-        self.assertAlmostEqual(r["risk_pct"], 0.5)
-        r = ec.size_by_risk(1000, 100.0, 95.0, 10, open_risk=58.0)  # room 0.2% < 3x x 2% x 5% = 0.3%
-        self.assertFalse(r["ok"])
-        self.assertIn("total-risk room", r["reason"])
-        r = ec.size_by_risk(1000, 100.0, 98.0, 10, open_risk=58.0)  # SL 2%: 5x x 2% x 2% = 0.2% fits
-        self.assertTrue(r["ok"])
-        self.assertLessEqual(r["risk_pct"] + 5.8, 6.0 + 1e-9)
-
     def test_coin_max_below_3x_skips(self):
-        self.assertFalse(ec.size_by_risk(1000, 100.0, 98.0, 2)["ok"])
+        self.assertFalse(ec.size_by_margin(1000, 100.0, 98.0, 2)["ok"])
+        self.assertEqual(ec.size_by_margin(1000, 100.0, 98.0, 3)["leverage"], 3)
 
-    def test_fixed_leverage_for_add_on(self):
-        r = ec.size_by_risk(1000, 100.0, 97.0, 10, fixed_leverage=2)
-        self.assertEqual(r["leverage"], 2)
+    def test_fixed_leverage_and_room_for_add_on(self):
+        r = ec.size_by_margin(1000, 100.0, 97.0, 10, fixed_leverage=2, max_margin_pct=2.5)
+        self.assertEqual((r["leverage"], r["margin_pct"]), (2, 2.5))
+        self.assertFalse(ec.size_by_margin(1000, 100.0, 97.0, 10, fixed_leverage=2, max_margin_pct=1.5)["ok"])
+
+    def test_no_sl_risk_caps_in_code(self):
+        for name in ("SOT2_MAX_RISK_PCT", "SOT2_MAX_TOTAL_RISK_PCT", "SOT2_TARGET_RISK_PCT", "size_by_risk"):
+            self.assertFalse(hasattr(ec, name), name)
 
     def test_addon_gates(self):
         self.assertFalse(ec.addon_gates({"roe_pct": 9.9, "margin_used": 10}, 1000)[0])
@@ -187,11 +187,6 @@ class TestSot2Sizing(unittest.TestCase):
         self.assertTrue(ok)
         self.assertAlmostEqual(room, 2.5)
         self.assertFalse(ec.addon_gates(None, 1000)[0])
-
-    def test_open_risk(self):
-        tot, parts = ec.open_risk_usd([{"coin": "MON", "side": "LONG", "size": 7232}], {"MON": 0.02722},
-                                      {"MON": 0.025654})
-        self.assertAlmostEqual(tot, 7232 * (0.02722 - 0.025654), 6)
 
 
 class TestExecutorGuardrails(EnvMixin, unittest.TestCase):

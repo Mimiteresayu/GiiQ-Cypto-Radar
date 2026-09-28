@@ -3,7 +3,7 @@
 
 SoT enforcement (see exec_common.py):
 - Candidates must be fresh (built today HKT, <= EXEC_MAX_CANDIDATE_AGE_H old, not stale)
-- Min notional $10; leverage 1-5x AND <= coin HL maxLeverage (integer)
+- Min notional max($10, 1% NAV); leverage GIIQ-SoT-2 3-5x isolated AND <= coin HL maxLeverage (integer)
 - SL distance >= 1.5% from the LIVE mid; Hard SL per tier (Mega/Large 4H Lower, Small/Tiny 4H Filter)
 - Isolated liq price must lie below the Hard SL
 - Base (fresh 1D dual-cross-up) enters now, guarded: a live HL mid fetched right before the
@@ -25,11 +25,11 @@ Guardrails (GIIQ-SoT-1, see docs/SOT_CHANGELOG.md; no strategy change):
 - Minimum order: skip if notional < max(HL $10 minimum, 1% of NAV)
 - run_report: executed / skipped / downsized / failed with reasons (cockpit + DESK_DATA)
 
-Sizing (GIIQ-SoT-2, exec_common.size_by_risk; replaces the old 2x / P-band sizing):
-- isolated 3-5x (<= coin maxLeverage), margin 2-4% NAV (hard cap 4%); AI size/leverage = maximums
-- risk at Hard SL (notional x SL distance) <= 1.5% NAV (target 1%); total open risk <= 6% NAV
-- isolated liq below the Hard SL by >= 2x the SL distance; else step leverage down (min 3x) or
-  reduce size; impossible at 3x / 2% -> skip
+Sizing (GIIQ-SoT-2, exec_common.size_by_margin; replaces the old 2x / P-band sizing):
+- per-trade risk = the isolated margin: 2-4% NAV per coin (hard cap 4%); NOT sized by SL distance
+- isolated 3-5x (<= coin maxLeverage); AI size/leverage = maximums inside the bands
+- isolated liq must sit below the Hard SL; else step leverage down toward 3x; impossible at 3x -> skip
+- existing 80% total margin cap
 
 Entry: IOC limit buy at live mid + EXEC_ENTRY_SLIPPAGE_PCT (default 0.5%), isolated margin,
 then an immediate reduce-only stop-market Hard SL for the filled size. If the SL cannot be
@@ -58,8 +58,7 @@ from exec_common import (  # noqa: E402
     price_sane,
     radar_ref_price,
     radar_rowcount_ok,
-    open_risk_usd,
-    size_by_risk,
+    size_by_margin,
     MAX_LEVERAGE,
     MAX_MARGIN_UTILIZATION_PCT,
     MIN_LEVERAGE,
@@ -92,7 +91,7 @@ except ImportError as e:  # pragma: no cover
 
 HL_ADDRESS = os.environ.get("HL_ADDRESS", "0xcFCda0F8576a268BaA17935368081F4e687dB122").strip()
 
-# LEGACY (GIIQ-SoT-1) size bands, no longer used for sizing: GIIQ-SoT-2 = exec_common.size_by_risk
+# LEGACY (GIIQ-SoT-1) size bands, no longer used for sizing: GIIQ-SoT-2 = exec_common.size_by_margin
 SIZE_BANDS = {
     "P": (4.0, 8.0),              # Primary only
     "P+N": (8.0, 12.0),           # Primary + Narrative
@@ -317,12 +316,6 @@ def _execute(
     if btc_4h and btc_4h.get("close") and btc_4h.get("filter") and btc_4h["close"] < btc_4h["filter"]:
         btc_bearish = True
 
-    r4h_all = {r.get("symbol"): r for r in radar_4h.get("rows", []) or []}
-    cum_risk, risk_parts = open_risk_usd(
-        account["positions"], mids,
-        {p["coin"]: hard_sl_for_tier(tier_for(p["coin"]), r4h_all.get(p["coin"]))[0] for p in account["positions"]})
-    result["open_risk"] = {"usd": round(cum_risk, 2), "pct_nav": round(cum_risk / equity * 100.0, 3) if equity > 0 else None,
-                           "positions": risk_parts}
     liq_safe, unsafe = _check_all_positions_liq_safe(account["positions"], radar_1h, radar_4h)
     if not liq_safe:
         result.update(status="fail_closed", message=f"Unsafe liquidation prices for: {', '.join(unsafe)}")
@@ -423,8 +416,7 @@ def _execute(
             continue
 
         limit_px = round_price(mid * (1 + slip / 100.0), sz_dec)
-        sz = size_by_risk(equity, limit_px, hard_sl, coin_max, decision.get("size_pct"), decision.get("leverage"),
-                          open_risk=cum_risk)
+        sz = size_by_margin(equity, limit_px, hard_sl, coin_max, decision.get("size_pct"), decision.get("leverage"))
         if not sz["ok"]:
             skip(sz["reason"], mid=mid)
             continue
@@ -443,8 +435,7 @@ def _execute(
         if not ok_cap:
             skip(f"Margin utilization {util:.1f}% > {MAX_MARGIN_UTILIZATION_PCT}% (cumulative)", size_pct=size_pct, leverage=leverage)
             continue
-        est_liq = sz["liq"]  # worst-case (highest) entry; >= 2x SL distance below the Hard SL
-        risk_usd = qty * (limit_px - hard_sl)
+        est_liq = sz["liq"]  # worst-case (highest) entry; strictly below the Hard SL
 
         r1d = next((r for r in radar_1d.get("rows", []) if r.get("symbol") == symbol), None)
         upper_ref, upper_label = entry_upper_ref(cand, r1d, r4h)
@@ -464,14 +455,12 @@ def _execute(
             "sl_dist_pct": round(sl_dist_pct, 3), "estimated_liq": est_liq, "coin_max_leverage": coin_max,
             "margin_util_after_pct": round(util, 2), "btc_bearish": btc_bearish,
             "entry_upper_ref": upper_ref, "entry_upper_label": upper_label,
-            "risk_usd": round(risk_usd, 2), "risk_pct": round(risk_usd / equity * 100.0, 3),
-            "open_risk_pct_before": round(cum_risk / equity * 100.0, 3), "sizing_notes": sz.get("notes"),
+            "risk_margin_pct": round(margin_usd / equity * 100.0, 3), "sizing_notes": sz.get("notes"),
             "ai_size_pct": decision.get("size_pct"), "ai_leverage": decision.get("leverage"),
         }
 
         if not live:
             cum_margin += margin_usd
-            cum_risk += risk_usd
             result["actions"].append(intent)
             _log(
                 f"DRY_RUN would place: BUY {symbol} qty={qty} IOC limit={limit_px} (mid {mid}) {leverage}x isolated "
@@ -492,7 +481,6 @@ def _execute(
         st = r.get("status")
         if st == "executed":
             cum_margin += (r.get("filled_sz") or qty) * (r.get("avg_px") or limit_px) / leverage
-            cum_risk += (r.get("filled_sz") or qty) * max(0.0, (r.get("avg_px") or limit_px) - hard_sl)
             result["executed"].append(intent)
             log_entry(trade_id=trade_id, symbol=symbol, entry_type=entry_type, tier=tier,
                       trend_1d=cand.get("trend_1d", ""), trend_4h=cand.get("trend_4h", ""),

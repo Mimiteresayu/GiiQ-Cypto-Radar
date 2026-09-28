@@ -207,7 +207,7 @@ class TestWorker(unittest.TestCase):
         self.assertEqual(f["size_pct"], 4.0)                  # SoT-2 hard cap 4%
         self.assertEqual(f["leverage"], 3)                    # AI 2x lifted to the SoT-2 3x floor
         self.assertEqual(f["hard_sl"], 0.88)                  # tiny -> 4H Filter
-        self.assertLessEqual(f["risk_pct"], 1.5)
+        self.assertLessEqual(f["risk_margin_pct"], 4.0)
         self.assertEqual(ents[0]["status"], "filled")
         self.assertEqual(self.log[0]["entry_type"], "CONTINUATION")
         # idempotent: second run does nothing

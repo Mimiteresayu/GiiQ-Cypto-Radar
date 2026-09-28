@@ -326,7 +326,7 @@ class TestExecutorDryRun(EnvMixin, unittest.TestCase):
         self.assertEqual(a["size_pct"], 4.0)                   # SoT-2 hard cap 4% margin (AI 6% = max)
         self.assertEqual(a["qty"], 119.0)                      # floor(40*3/1.005)
         self.assertAlmostEqual(a["notional_usd"], 119.0, 2)    # qty*mid ~= margin*lev, not margin
-        self.assertLessEqual(a["risk_pct"], 1.5)
+        self.assertAlmostEqual(a["risk_margin_pct"], 3.967, 3)  # risk = isolated margin (119/3/1000)
         self.assertGreater(a["estimated_liq"], 0)
         self.assertLess(a["estimated_liq"], a["hard_sl"])
         self.assertEqual(a["margin_mode"], "isolated")
@@ -765,8 +765,9 @@ class TestDeskDataLog(unittest.TestCase):
         for k in ("symbol", "tier", "type", "sl_pct", "size_pct", "lev", "liq", "hard_sl"):
             self.assertIn(k, c)
         self.assertGreater(c["liq"], 0)
-        self.assertEqual(c["lev"], 3)  # GIIQ-SoT-2 3x floor (10% SL -> sizing impossible, flagged)
-        self.assertFalse(c["sot2"]["ok"])
+        self.assertEqual(c["lev"], 3)  # GIIQ-SoT-2: 3-5x capped by coin maxLeverage 3
+        self.assertTrue(c["sot2"]["ok"])
+        self.assertEqual(c["size_pct"], 4.0)  # risk = isolated margin, 4% NAV cap
 
     def test_single_line_when_small(self):
         lines = self.serve._desk_data_lines({"ts": "t", "candidates": []}, max_bytes=60000)
