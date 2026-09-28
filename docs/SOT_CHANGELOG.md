@@ -12,6 +12,39 @@ header, the executor / pending run reports, the preflight JSON and `[DESK_DATA]`
 
 ---
 
+## GIIQ-SoT-3 (2026-09-28): portfolio caps, price-based ADD_ON, fallback + POST alert (approved by MMT)
+
+Entry and exit **triggers are unchanged**, and so is per-trade risk (isolated margin 2–4% NAV, 3–5x).
+
+### 1. Portfolio caps (Base 08:55 and pending fills)
+- **Total isolated margin ≤ 30% of NAV**, cumulative across the run (existing + new). The old 80%
+  utilization check stays as an outer bound.
+- **One coin's notional ≤ 20% of NAV**, including after an ADD_ON.
+- **At most 3 new fills per HKT day**, counting Base, CONTINUATION and ADD_ON together (LIVE fills
+  in the trade log + fills in the current run).
+
+### 2. ADD_ON gate: price gain, not leveraged ROE
+- The base position's **price gain vs entry must be ≥ +10%** (live mid ÷ entryPx − 1), which is
+  Signum's 1x meaning. At 3–5x, +10% ROE was only a +2–3.3% move.
+- The 5.5% coin-margin cap is replaced by the 20% NAV coin-notional cap. Margin room =
+  (20% − current coin notional %) ÷ existing leverage, capped at 4%. Room below 2% → no add.
+
+### 3. Decisions: fallback and missing-POST alert
+- `POST /api/ai/decision` accepts the ENTRY_DESK shape `{coin, action: APPROVE|VETO, type, dims}` as
+  well as `{symbol, decision}`. If nothing valid is sent it returns **422** and logs loudly (it used
+  to return 200 with 0 stored).
+- `"source": "fallback"` (Harbor 08:40) is **ignored when Claude already posted today (409)**.
+  Fallback approvals execute as **Base only at 2% margin**; Chase / pending adds are skipped.
+- The executor reports `claude_post.missing_days`: 1 → alert, **≥ 2 consecutive days → RED alert**.
+- Decisions received after 08:50 HKT are stored but flagged `late`.
+
+### 4. EXIT health (report only)
+`GET /api/exit/health` (keyed) and `exit_health` in `[DESK_DATA]`: NO_SL, EXIT_NOT_DONE, JOB_FAILED,
+JOB_MISSED, MARGIN_HIGH (> 80%), ORPHAN_SL, PENDING_STALE, LEVERAGE_OFF, RADAR_STALE, HL_FETCH.
+`summary` = "OK · n 倉" when clean.
+
+---
+
 ## GIIQ-SoT-2 (2026-09-28): sizing / leverage / ADD_ON rule change (approved by MMT)
 
 Entry and exit **triggers are unchanged**. These rules apply to Base entries (08:55 executor and

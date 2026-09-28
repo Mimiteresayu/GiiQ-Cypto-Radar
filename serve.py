@@ -1084,6 +1084,7 @@ def _build_desk_data_payload(event: str = "", now: datetime | None = None, kind:
         "run_report": _today_run_report(now),
         "pending_entries": _pending_view(),
         "dimensions": _dims_compact(now),
+        "exit_health": _exit_health(now, hl_data),
     }
     if kind == "full":
         payload["narrative"] = narrative
@@ -1093,6 +1094,29 @@ def _build_desk_data_payload(event: str = "", now: datetime | None = None, kind:
     for tf in ("1d", "4h", "1h"):
         payload[f"gc_radar_{tf}"] = _trim_radar(radars[tf], focus)
     return payload
+
+
+def _exit_health(now: datetime | None = None, hl_data: dict | None = None) -> dict:
+    """EXIT_DESK health (report only): NO_SL / EXIT_NOT_DONE / JOB_FAILED / MARGIN_HIGH / ... (exit_health.py)."""
+    try:
+        import exit_health
+        from mcap_tiers import tier_for as _tier_for
+        hl_data = hl_data if hl_data is not None else _get_hl_cached()
+        account = _compute_unified_equity(hl_data) if not hl_data.get("fetch_error") else {}
+        radars = {tf: _read_out_json(f"gc_radar_{tf}.json") for tf in ("1h", "4h")}
+        with _scheduler_lock:
+            jobs = dict(_scheduler_jobs_status)
+        try:
+            from pending_entries import load_pending
+            pend = load_pending()
+        except Exception:
+            pend = []
+        return exit_health.check(perp=hl_data.get("hl_perp"), open_orders=hl_data.get("hl_open_orders"),
+                                 nav=account.get("equity"), radar_1h=radars["1h"], radar_4h=radars["4h"],
+                                 tier_for=_tier_for, job_status=jobs, pending=pend, now=now)
+    except Exception as e:
+        return {"ok": False, "problems": [{"code": "HEALTH_ERROR", "coin": None, "msg": str(e)}],
+                "summary": f"health check error: {e}"}
 
 
 def _read_out_json(name: str) -> dict:
@@ -1912,6 +1936,10 @@ class Handler(SimpleHTTPRequestHandler):
         if path == "/api/exec/preflight":
             self._exec_preflight()
             return
+        if path == "/api/exit/health":
+            if self._ai_key_ok():
+                self._send_json(200, _exit_health())
+            return
         if path == "/api/ai/dimensions":
             if self._ai_key_ok():
                 d = _read_out_json("dimensions_latest.json")
@@ -2368,15 +2396,15 @@ class Handler(SimpleHTTPRequestHandler):
             self._send_json(500, {"ok": False, "error": "decisions module not available"})
             return
         
+        src = "fallback" if str(body.get("source") or "").lower() == "fallback" else "claude"
         try:
-            result = store_decisions(decisions)
+            result = store_decisions(decisions, source=src)
         except Exception as e:
             self._send_json(500, {"ok": False, "error": str(e)})
             return
         # Measurement ledger (Claude dims + decision per signal). Never blocks the decision itself.
         if dim_ledger and result.get("stored"):
             try:
-                src = "fallback" if str(body.get("source") or "").lower() == "fallback" else "claude"
                 conn = dim_ledger.connect()
                 today = hkt_date(datetime.now(timezone.utc))
                 result["ledger_recorded"] = dim_ledger.record_decisions(conn, today, result["stored"], source=src)
@@ -2386,7 +2414,8 @@ class Handler(SimpleHTTPRequestHandler):
         result.pop("stored", None)
         if not result.get("ok"):
             sys.stderr.write(f"[AI_DECISION] !!!!!!!! nothing stored: {json.dumps(result)[:500]}\n")
-        self._send_json(200 if result.get("ok") else 422, result)
+        code = 200 if result.get("ok") else (409 if "fallback ignored" in str(result.get("error")) else 422)
+        self._send_json(code, result)
 
     def _public_radar(self) -> None:
         """GET /api/public/radar: public trimmed radar feed (no auth, no positions).

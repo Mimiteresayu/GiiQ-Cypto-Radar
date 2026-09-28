@@ -336,12 +336,13 @@ class TestExecutorDryRun(EnvMixin, unittest.TestCase):
         self.assertEqual(self.log_entry.call_args.kwargs["entry_size"], 119.0)
 
     def test_cumulative_margin_cap(self):
-        hl = FakeHL(equity=1000, margin_used=740, meta=self.META, mids={"AAA": 1.0, "BBB": 1.0})
+        # GIIQ-SoT-3: total margin <= 30% NAV (cumulative across the run)
+        hl = FakeHL(equity=1000, margin_used=240, meta=self.META, mids={"AAA": 1.0, "BBB": 1.0})
         res = self.run_exec(hl, _cands(_cand("AAA", filt=0.97, lower=0.95), _cand("BBB", filt=0.97, lower=0.95)),
                             {"AAA": {"decision": "approve", "size_pct": 6, "leverage": 2},
                              "BBB": {"decision": "approve", "size_pct": 6, "leverage": 2}})
-        self.assertEqual([a["symbol"] for a in res["actions"]], ["AAA"])  # 74%+~4% ok
-        self.assertEqual(res["skipped"][0]["symbol"], "BBB")               # ~78%+~4% > 80%
+        self.assertEqual([a["symbol"] for a in res["actions"]], ["AAA"])  # 24%+~4% ok
+        self.assertEqual(res["skipped"][0]["symbol"], "BBB")               # ~28%+~4% > 30%
         self.assertIn("cumulative", res["skipped"][0]["reason"])
 
     def test_stale_candidates_fail_closed(self):

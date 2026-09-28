@@ -350,3 +350,26 @@ if __name__ == "__main__":
     
     print(f"\nTrade log path: {TRADE_LOG_PATH}")
     print(f"Storage type: {'SQLite' if _is_sqlite(TRADE_LOG_PATH) else 'JSON'}")
+
+
+def count_entries_today(now: Optional[datetime] = None, dry_run: bool = False) -> int:
+    """GIIQ-SoT-3 daily cap: number of entries (Base / CONTINUATION / ADD_ON) logged today (HKT day).
+    dry_run=False counts only real (LIVE) fills."""
+    from datetime import timedelta
+    now = now or datetime.now(timezone.utc)
+    hkt = timezone(timedelta(hours=8))
+    today = now.astimezone(hkt).date()
+    n = 0
+    for t in get_all_trades():
+        if bool(t.get("dry_run")) != bool(dry_run):
+            continue
+        ts = t.get("entry_timestamp")
+        try:
+            dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            continue
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        if dt.astimezone(hkt).date() == today:
+            n += 1
+    return n
