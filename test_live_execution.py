@@ -375,11 +375,67 @@ class TestHLClientSigned(unittest.TestCase):
             with self.assertRaises(hl_exec.LiveModeRefused):
                 hl_exec.HLClient().exchange()
 
-    def test_refuses_wrong_api_wallet(self):
+    def test_refuses_key_not_approved_agent(self):
         with patch.dict(os.environ, {"EXEC_DRY_RUN": "0", "HL_API_PRIVATE_KEY": "0x" + "11" * 32}):
-            os.environ.pop("HL_API_WALLET_ADDRESS", None)
-            with self.assertRaises(hl_exec.LiveModeRefused):
-                hl_exec.HLClient().exchange()  # derived address != 0xb74a...
+            c = hl_exec.HLClient("0x" + "cd" * 20)
+            with patch.object(c, "info", return_value=[{"name": "other", "address": "0x" + "ab" * 20, "validUntil": 9e15}]):
+                with self.assertRaises(hl_exec.LiveModeRefused):
+                    c.exchange()
+
+    def test_refuses_when_agent_query_fails(self):
+        with patch.dict(os.environ, {"EXEC_DRY_RUN": "0", "HL_API_PRIVATE_KEY": "0x" + "11" * 32}):
+            c = hl_exec.HLClient("0x" + "cd" * 20)
+            with patch.object(c, "info", side_effect=RuntimeError("HL down")):
+                with self.assertRaises(hl_exec.LiveModeRefused):
+                    c.exchange()
+
+    def test_agent_status_expired_and_valid(self):
+        from eth_account import Account
+        addr = Account.from_key("0x" + "11" * 32).address
+        c = hl_exec.HLClient("0x" + "cd" * 20)
+        with patch.object(c, "info", return_value=[{"name": "k", "address": addr.lower(), "validUntil": 1000}]):
+            st = c.agent_status(addr, now_ms=2000)
+            self.assertFalse(st["ok"])
+            self.assertIn("EXPIRED", st["reason"])
+            st = c.agent_status(addr, now_ms=500)
+            self.assertTrue(st["ok"])
+
+    def test_accepts_approved_agent_ignoring_stale_hint(self):
+        from eth_account import Account
+        addr = Account.from_key("0x" + "11" * 32).address
+        env = {"EXEC_DRY_RUN": "0", "HL_API_PRIVATE_KEY": "0x" + "11" * 32, "HL_API_WALLET_ADDRESS": "0x" + "b7" * 20}
+        with patch.dict(os.environ, env):
+            c = hl_exec.HLClient("0x" + "cd" * 20)
+            with patch.object(c, "info", return_value=[{"name": "Railway Key", "address": addr.lower(), "validUntil": 9e15}]), \
+                 patch("hyperliquid.exchange.Exchange") as ex_cls:
+                c.exchange()
+                kwargs = ex_cls.call_args.kwargs
+                self.assertEqual(kwargs["account_address"], "0x" + "cd" * 20)  # signs as agent FOR main account
+                self.assertEqual(kwargs["wallet"].address, addr)
+
+    def test_probe_signing(self):
+        c = hl_exec.HLClient("0xmain")
+        ex = MagicMock()
+        c._exchange = ex
+        ex.cancel.return_value = {"status": "ok", "response": {"type": "cancel", "data": {"statuses": [{"error": "Order was never placed"}]}}}
+        self.assertTrue(c.probe_signing()["ok"])
+        ex.cancel.return_value = {"status": "err", "response": "User or API Wallet 0x.. does not exist."}
+        self.assertFalse(c.probe_signing()["ok"])
+
+    def test_executor_errors_loudly_when_signing_refused(self):
+        class RefusingHL(FakeHL):
+            def exchange(self):
+                raise hl_exec.LiveModeRefused("not an approved agent")
+        with patch.dict(os.environ, {"EXEC_DRY_RUN": "0", "HL_API_PRIVATE_KEY": "0x" + "11" * 32}):
+            hl = RefusingHL(meta={"AAA": {"szDecimals": 0, "maxLeverage": 5.0}}, mids={"AAA": 1.0})
+            cands = {"generated_at": NOW.isoformat(), "candidates": [{"symbol": "AAA", "type": "Base", "tier": "tiny"}]}
+            with patch.object(executor, "log_entry"):
+                res = executor.execute_approved_candidates(
+                    hl=hl, candidates_data=cands, decisions={"AAA": {"decision": "approve", "size_pct": 4, "leverage": 2}},
+                    radar_1h={"rows": []}, radar_4h={"rows": [{"symbol": "AAA", "filter": 0.9, "lower": 0.8}]}, now=NOW)
+            self.assertEqual(res["status"], "error")
+            self.assertIn("signing client refused", res["message"])
+            self.assertEqual(hl.calls, [])
 
     def test_order_payloads(self):
         c = hl_exec.HLClient("0xmain")

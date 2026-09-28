@@ -420,6 +420,7 @@
 </head>
 <body>
 
+<div id="execPreflightBanner" style="display:none;margin:0;padding:8px 14px;background:#7f1d1d;color:#fff;font-weight:700;font-size:0.82rem;border-bottom:2px solid #ef4444"></div>
 <header class="app-header">
   <div class="header-row1">
     <!-- Brand -->
@@ -920,6 +921,28 @@
       const r = await fetch("/api/desk-data?t="+Date.now(), {cache:"no-store"});
       if (r.ok) deskData = await r.json();
     } catch {}
+    updateExecPreflightBanner();
+  }
+
+  // LIVE executor preflight (Railway boot + 08:45 HKT) and last executor result: red banner on failure
+  function updateExecPreflightBanner() {
+    const b = el("execPreflightBanner");
+    if (!b || !deskData) return;
+    const pf = deskData.exec_preflight || {};
+    const jobs = deskData.scheduler || {};
+    const msgs = [];
+    if (pf.ran_at && pf.ok === false) {
+      const failed = (pf.checks || []).filter(c => !c.ok && c.blocking).map(c => c.check + ": " + c.detail);
+      msgs.push("EXECUTOR PREFLIGHT FAILED (" + (pf.mode || "?") + ", " + ageStr(pf.ran_at) + "): " + (failed.join(" · ") || pf.error || "unknown"));
+    } else if (pf.ok && (pf.warnings || []).length) {
+      msgs.push("Preflight warning: " + pf.warnings.join(" · "));
+    }
+    ["executor", "api_exec_run"].forEach(k => {
+      const j = jobs[k];
+      if (j && j.status === "error") msgs.push("EXECUTOR " + k + " ERROR (" + ageStr(j.last_run) + "): " + (j.message || j.error || "").slice(0, 400));
+    });
+    b.style.display = msgs.length ? "block" : "none";
+    b.textContent = msgs.join("  |  ");
   }
 
   // ── Header breadth ─────────────────────────────────────────────────────

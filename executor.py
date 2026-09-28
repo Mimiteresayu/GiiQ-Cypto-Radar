@@ -236,6 +236,19 @@ def execute_approved_candidates(
         _log(f"{mode} fail_closed: unsafe liq {unsafe}")
         return result
 
+    if live and hasattr(hl, "exchange"):
+        # Build + authenticate the signing client ONCE, before any coin. A key/agent problem is
+        # an executor ERROR (loud, shown in the cockpit), not three silent per-coin skips.
+        try:
+            hl.exchange()
+        except Exception as e:  # noqa: BLE001
+            msg = f"LIVE signing client refused: {e}"
+            result.update(status="error", message=msg)
+            result["alerts"].append(msg)
+            result["skipped"] = [{"symbol": s, "reason": "signing client refused"} for s in approved]
+            _log(f"LIVE ERROR: {msg}")
+            return result
+
     slip = _entry_slippage_pct()
     for cand in candidates:
         symbol = cand.get("symbol", "")
@@ -332,6 +345,13 @@ def execute_approved_candidates(
                       ai_decision_reason=decision.get("reason", ""), dry_run=False)
         else:
             skip(f"live entry {st}", live_result=r)
+            if st in ("leverage_failed", "entry_failed"):
+                result["alerts"].append(f"{symbol}: {st}")
+                if result["status"] == "success":
+                    result["status"] = "error"
+                    result["message"] = f"LIVE entry failures: {', '.join(result['alerts'])}"
+                else:
+                    result["message"] = f"LIVE entry failures: {', '.join(result['alerts'])}"
             if st and st.startswith("sl_failed"):
                 result["alerts"].append(f"{symbol}: {st}")
                 if st == "sl_failed_CLOSE_FAILED":
