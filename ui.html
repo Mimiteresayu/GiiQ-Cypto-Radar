@@ -940,6 +940,8 @@
     ["executor", "api_exec_run"].forEach(k => {
       const j = jobs[k];
       if (j && j.status === "error") msgs.push("EXECUTOR " + k + " ERROR (" + ageStr(j.last_run) + "): " + (j.message || j.error || "").slice(0, 400));
+      else if (j && (j.message || "").includes("ALERTS:") && j.last_run && (Date.now() - Date.parse(j.last_run)) < 24*3600*1000)
+        msgs.push("Executor " + k + " alerts (" + ageStr(j.last_run) + "): " + j.message.split("ALERTS:")[1].trim().slice(0, 400));
     });
     b.style.display = msgs.length ? "block" : "none";
     b.textContent = msgs.join("  |  ");
