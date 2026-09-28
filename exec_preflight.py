@@ -158,7 +158,19 @@ def run_preflight(hl: Any = None, signed_probe: bool = True, now: Optional[datet
             cmap = {c.get("symbol"): c for c in (cand.get("candidates") or [])}
             guard = {}
             for sym in sorted(approved):
-                c = cmap.get(sym) or {}
+                c = cmap.get(sym)
+                if not c:
+                    guard[sym] = {"type": None, "note": "not in current candidate list"}
+                    add(f"guard:{sym}", False, "approved but not in the current candidate list -> executor will skip",
+                        blocking=False)
+                    continue
+                if c.get("type") == "Chase" and not c.get("is_base"):
+                    kind = "ADD_ON" if sym in held else "CONTINUATION"
+                    guard[sym] = {"type": "Chase", "pending_kind": kind}
+                    add(f"guard:{sym}", True, f"Chase -> no 08:55 entry; becomes pending {kind} "
+                        f"({'4H' if kind == 'ADD_ON' else '1D'} pullback zone, N+1 confirmation)", blocking=False)
+                    continue
+                c = dict(c, type="Base")
                 up, label = entry_upper_ref(c, rows_1d.get(sym), rows_4h.get(sym))
                 mid = mids.get(sym)
                 ok = above_upper_at_entry(mid, up)
