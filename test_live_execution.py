@@ -258,7 +258,7 @@ class TestExecutorDryRun(EnvMixin, unittest.TestCase):
     # ---- Base at-entry 1D Upper guard
     def test_guard_base_above_1d_upper_passes(self):
         hl = FakeHL(equity=1000, meta=self.META, mids={"AAA": 1.0})
-        res = self.run_exec(hl, _cands(_cand("AAA", typ="Base", upper_1d=0.99, upper_4h=1.5)),
+        res = self.run_exec(hl, _cands(_cand("AAA", typ="Base", filt=0.97, lower=0.95, upper_1d=0.99, upper_4h=1.5)),
                             {"AAA": {"decision": "approve"}})
         self.assertEqual(len(res["actions"]), 1)          # Base ignores the 4H Upper
         self.assertEqual(res["actions"][0]["entry_upper_label"], "1D Upper")
@@ -266,7 +266,7 @@ class TestExecutorDryRun(EnvMixin, unittest.TestCase):
     def test_guard_base_uses_1d_upper(self):
         hl = FakeHL(equity=1000, meta=self.META, mids={"AAA": 1.0})
         r1d = {"rows": [{"symbol": "AAA", "upper": 1.0}]}  # mid == Upper -> not above -> skip
-        res = self.run_exec(hl, _cands(_cand("AAA", typ="Base", upper_4h=2.0)), {"AAA": {"decision": "approve"}}, r1d=r1d)
+        res = self.run_exec(hl, _cands(_cand("AAA", typ="Base", filt=0.97, lower=0.95, upper_4h=2.0)), {"AAA": {"decision": "approve"}}, r1d=r1d)
         self.assertEqual(res["actions"], [])
         self.assertIn("below 1D Upper at entry", res["skipped"][0]["reason"])
         self.assertTrue(any("below 1D Upper at entry" in a for a in res["alerts"]))
@@ -279,7 +279,7 @@ class TestExecutorDryRun(EnvMixin, unittest.TestCase):
 
     def test_guard_missing_upper_fails_closed(self):
         hl = FakeHL(equity=1000, meta=self.META, mids={"AAA": 1.0})
-        c = _cand("AAA", typ="Base")
+        c = _cand("AAA", typ="Base", filt=0.97, lower=0.95)
         c["upper_1d"] = None
         res = self.run_exec(hl, _cands(c), {"AAA": {"decision": "approve"}})
         self.assertEqual(res["actions"], [])
@@ -298,7 +298,7 @@ class TestExecutorDryRun(EnvMixin, unittest.TestCase):
 
     def test_base_and_chase_row_is_treated_as_base(self):
         hl = FakeHL(equity=1000, meta=self.META, mids={"AAA": 1.0})
-        c = _cand("AAA", typ="Chase", upper_4h=1.5)
+        c = _cand("AAA", typ="Chase", filt=0.97, lower=0.95, upper_4h=1.5)
         c["is_base"] = True
         res = self.run_exec(hl, _cands(c), {"AAA": {"decision": "approve"}})
         self.assertEqual(len(res["actions"]), 1)
@@ -316,30 +316,32 @@ class TestExecutorDryRun(EnvMixin, unittest.TestCase):
 
     def test_qty_notional_liq_and_no_orders(self):
         hl = FakeHL(equity=1000, meta=self.META, mids={"AAA": 1.0})
-        res = self.run_exec(hl, _cands(_cand("AAA", filt=0.9)),
+        res = self.run_exec(hl, _cands(_cand("AAA", filt=0.97, lower=0.95)),
                             {"AAA": {"decision": "approve", "size_pct": 6, "leverage": 5}})
         self.assertEqual(res["mode"], "DRY_RUN")
         self.assertEqual(res["status"], "success")
         a = res["actions"][0]
-        self.assertEqual(a["leverage"], 3)                     # clamped to coin max 3x
+        self.assertEqual(a["leverage"], 3)                     # SoT-2 3-5x, clamped to coin max 3x
         self.assertEqual(a["limit_px"], 1.005)                 # live mid + 0.5%
-        self.assertEqual(a["qty"], 179.0)                      # floor(60*3/1.005)
-        self.assertAlmostEqual(a["notional_usd"], 179.0, 2)    # qty*mid ~= margin*lev, not margin
+        self.assertEqual(a["size_pct"], 4.0)                   # SoT-2 hard cap 4% margin (AI 6% = max)
+        self.assertEqual(a["qty"], 119.0)                      # floor(40*3/1.005)
+        self.assertAlmostEqual(a["notional_usd"], 119.0, 2)    # qty*mid ~= margin*lev, not margin
+        self.assertAlmostEqual(a["risk_margin_pct"], 3.967, 3)  # risk = isolated margin (119/3/1000)
         self.assertGreater(a["estimated_liq"], 0)
         self.assertLess(a["estimated_liq"], a["hard_sl"])
         self.assertEqual(a["margin_mode"], "isolated")
         self.assertEqual(hl.calls, [])                         # nothing signed/sent
         self.log_entry.assert_called_once()
         self.assertTrue(self.log_entry.call_args.kwargs["dry_run"])
-        self.assertEqual(self.log_entry.call_args.kwargs["entry_size"], 179.0)
+        self.assertEqual(self.log_entry.call_args.kwargs["entry_size"], 119.0)
 
     def test_cumulative_margin_cap(self):
-        hl = FakeHL(equity=1000, margin_used=700, meta=self.META, mids={"AAA": 1.0, "BBB": 1.0})
-        res = self.run_exec(hl, _cands(_cand("AAA"), _cand("BBB")),
+        hl = FakeHL(equity=1000, margin_used=740, meta=self.META, mids={"AAA": 1.0, "BBB": 1.0})
+        res = self.run_exec(hl, _cands(_cand("AAA", filt=0.97, lower=0.95), _cand("BBB", filt=0.97, lower=0.95)),
                             {"AAA": {"decision": "approve", "size_pct": 6, "leverage": 2},
                              "BBB": {"decision": "approve", "size_pct": 6, "leverage": 2}})
-        self.assertEqual([a["symbol"] for a in res["actions"]], ["AAA"])  # 70%+6% ok
-        self.assertEqual(res["skipped"][0]["symbol"], "BBB")               # 76%+6% > 80%
+        self.assertEqual([a["symbol"] for a in res["actions"]], ["AAA"])  # 74%+~4% ok
+        self.assertEqual(res["skipped"][0]["symbol"], "BBB")               # ~78%+~4% > 80%
         self.assertIn("cumulative", res["skipped"][0]["reason"])
 
     def test_stale_candidates_fail_closed(self):
@@ -387,19 +389,19 @@ class TestExecutorLive(EnvMixin, unittest.TestCase):
 
     def test_live_entry_then_sl(self):
         hl = FakeHL(equity=1000, meta=self.META, mids={"AAA": 1.0})
-        res = executor.execute_approved_candidates(hl=hl, candidates_data=_cands(_cand("AAA", filt=0.9)),
+        res = executor.execute_approved_candidates(hl=hl, candidates_data=_cands(_cand("AAA", filt=0.97, lower=0.95)),
                                                    decisions={"AAA": {"decision": "approve", "size_pct": 6, "leverage": 2}},
                                                    radar_1h={}, radar_4h={"rows": []}, now=NOW)
         self.assertEqual(res["mode"], "LIVE")
         self.assertEqual(len(res["executed"]), 1)
         self.assertEqual(hl.names(), ["set_leverage", "open_long_ioc", "place_stop_loss"])
-        self.assertEqual(hl.calls[0], ("set_leverage", "AAA", 2))
-        self.assertEqual(hl.calls[2], ("place_stop_loss", "AAA", 119.0, 0.9))  # SL for the filled qty at Hard SL
+        self.assertEqual(hl.calls[0], ("set_leverage", "AAA", 3))  # SoT-2: AI 2x lifted to the 3x floor
+        self.assertEqual(hl.calls[2], ("place_stop_loss", "AAA", 119.0, 0.97))  # SL for the filled qty at Hard SL
         self.assertFalse(self.log_entry.call_args.kwargs["dry_run"])
 
     def test_live_guard_skip_places_nothing(self):
         hl = FakeHL(equity=1000, meta=self.META, mids={"AAA": 1.0})
-        res = executor.execute_approved_candidates(hl=hl, candidates_data=_cands(_cand("AAA", typ="Base", upper_1d=1.05)),
+        res = executor.execute_approved_candidates(hl=hl, candidates_data=_cands(_cand("AAA", typ="Base", filt=0.97, lower=0.95, upper_1d=1.05)),
                                                    decisions={"AAA": {"decision": "approve"}},
                                                    radar_1h={}, radar_4h={"rows": []}, radar_1d={"rows": []}, now=NOW)
         self.assertEqual(hl.calls, [])
@@ -443,7 +445,7 @@ class TestExecutorLive(EnvMixin, unittest.TestCase):
 
     def test_live_sl_failure_closes_position(self):
         hl = FakeHL(equity=1000, meta=self.META, mids={"AAA": 1.0}, sl_ok=False)
-        res = executor.execute_approved_candidates(hl=hl, candidates_data=_cands(_cand("AAA")),
+        res = executor.execute_approved_candidates(hl=hl, candidates_data=_cands(_cand("AAA", filt=0.97, lower=0.95)),
                                                    decisions={"AAA": {"decision": "approve"}},
                                                    radar_1h={}, radar_4h={"rows": []}, now=NOW)
         self.assertEqual(hl.names(), ["set_leverage", "open_long_ioc", "place_stop_loss", "market_close"])
@@ -763,7 +765,9 @@ class TestDeskDataLog(unittest.TestCase):
         for k in ("symbol", "tier", "type", "sl_pct", "size_pct", "lev", "liq", "hard_sl"):
             self.assertIn(k, c)
         self.assertGreater(c["liq"], 0)
-        self.assertEqual(c["lev"], 2)
+        self.assertEqual(c["lev"], 3)  # GIIQ-SoT-2: 3-5x capped by coin maxLeverage 3
+        self.assertTrue(c["sot2"]["ok"])
+        self.assertEqual(c["size_pct"], 4.0)  # risk = isolated margin, 4% NAV cap
 
     def test_single_line_when_small(self):
         lines = self.serve._desk_data_lines({"ts": "t", "candidates": []}, max_bytes=60000)

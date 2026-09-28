@@ -12,6 +12,58 @@ header, the executor / pending run reports, the preflight JSON and `[DESK_DATA]`
 
 ---
 
+## GIIQ-SoT-2 (2026-09-28): sizing / leverage / ADD_ON rule change (approved by MMT)
+
+Entry and exit **triggers are unchanged**. These rules apply to Base entries (08:55 executor and
+`/api/exec/run`) and to pending fills (ADD_ON / CONTINUATION, 4H :10 job).
+
+### 1. ADD_ON pending fills: extra gates at fill time
+- The existing position's **ROE must be ≥ +10%**. ROE = HL `returnOnEquity`, falling back to
+  uPnL ÷ marginUsed.
+- The coin's **total margin after the add must be ≤ 5.5% of NAV** (per-run NAV snapshot):
+  existing `marginUsed` + new margin ≤ 5.5%.
+  - The new margin is capped by the room left under 5.5%.
+  - If the room is below the 2% minimum margin, the add is skipped.
+- A failed gate means no order. The record stays pending, and the reason appears in the daily
+  run report (`skipped`).
+
+### 2. Margin = risk, leverage 3–5x isolated (replaces the flat 2x and the old size bands)
+MMT corrected the first draft of this rule on 2026-09-28. **Per-trade risk is the isolated margin
+itself, not a size based on SL distance.** SL and exits are dynamic (tier-based), so SL-risk caps
+were dropped: there is **no** "1.5% NAV risk at Hard SL" cap and **no** "6% total SL-risk" cap.
+
+- **Margin per coin: 2–4% of NAV**, with a hard cap of 4%.
+  - This replaces P 4–8%, P+N 8–12%, P+N+CR 10–15% and Continuation 2–4%. The old BTC-bearish
+    "fixed 4%" rule is subsumed by the 4% cap.
+  - Margin = Claude's `size_pct` clamped to [2%, 4%]. If Claude gives no size, the 4% cap is used.
+- **Leverage 3–5x isolated** and never above the coin's HL maxLeverage. A coin with maxLeverage
+  below 3x is skipped. Claude's `leverage` is a maximum inside 3–5x.
+- **Liquidation must sit beyond the Hard SL.** For a LONG, the isolated liquidation price from the
+  worst-case entry (IOC limit) must be strictly below the tier Hard SL.
+  - Try leverage from the maximum allowed (min of 5x, coin max and AI max) down to 3x, and use the
+    first one that passes.
+  - If even 3x fails, the coin is **skipped** and the reason is reported.
+- The existing **80% total margin cap** is unchanged.
+- **ADD_ON keeps the existing position's leverage.** It is fixed and not stepped, even if the
+  existing leverage is below 3x (e.g. MON at 2x). The +10% ROE and 5.5% NAV coin-margin gates
+  above still apply.
+- **Claude's values are maximums.** AI values below the floors are lifted to the floor (2% margin,
+  3x) and noted in `sizing_notes`, because the legacy default of 2x can't comply with 3–5x.
+  - If a lower AI value should mean "skip", that needs a new MMT decision.
+- Unchanged:
+  - SL distance ≥ 1.5%
+  - minimum order max($10, 1% NAV)
+  - price sanity
+  - radar row-count
+  - the Base above-Upper guard
+  - all exits and Hard SL placement
+- The cockpit/AI candidate suggestions (`suggested_size_pct` / `suggested_leverage`, desk
+  `sot2`) use the same sizing on the 1D close.
+- Open positions are **not** resized. MON stays as is.
+- Code: `exec_common.size_by_margin` and `exec_common.addon_gates`.
+
+---
+
 ## GIIQ-SoT-1 (2026-09-28)
 
 This is the first versioned SoT. It collects every executor change made on 2026-09-28 (HKT).
@@ -55,7 +107,7 @@ This is the first versioned SoT. It collects every executor change made on 2026-
   - radar freshness
   - liquidation safety of open positions
   - tier Hard SL, with SL distance ≥ 1.5%
-  - size band 2–4% (ADD_ON uses the same band until MMT defines one)
+  - size band 2–4% (ADD_ON used the same band; superseded by GIIQ-SoT-2)
   - leverage 1–5x and ≤ the coin's maxLeverage
   - minimum order
   - 80% margin cap

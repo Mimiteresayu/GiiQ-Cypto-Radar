@@ -8,7 +8,7 @@ For each ACTIVE pending entry (created by the executor from AI-approved Chase de
   the entry is then placed at the live HL mid.
 On trigger the SAME fail-closed SoT checks as the executor run again at fill time:
   radar freshness, all open positions liq beyond tier Hard SL, Hard SL per tier (4H radar),
-  SL distance >= 1.5% from live mid, SoT size band + 1-5x/coin maxLeverage, min notional,
+  SL distance >= 1.5% from live mid, GIIQ-SoT-2 margin 2-4% NAV + 3-5x (liq below Hard SL), min notional,
   cumulative 80% margin cap, isolated liq beyond Hard SL. LIVE entry = hl_exec.enter_long_with_sl
   (IOC + reduce-only Hard SL, fill closed if the SL fails).
 Guardrails (GIIQ-SoT-1): radar row-count check on 1D + 4H (fail-closed, no state change),
@@ -16,6 +16,11 @@ NAV snapshot once per run, price sanity (HL mid vs radar price <= 50%), minimum 
 max($10, 1% NAV), run_report (executed/skipped/downsized/failed). In the 4H job this runs only
 after the exit worker finished OK (exits -> re-fetch positions here -> entries); serve.py passes
 --after-exits <ts>.
+Sizing (GIIQ-SoT-2): exec_common.size_by_margin (risk = isolated margin 2-4% NAV, 3-5x isolated,
+liq strictly below the Hard SL - step leverage down toward 3x, skip if impossible; 80% margin cap).
+ADD_ON keeps the existing position's leverage and additionally needs existing ROE >= +10% and
+coin margin after the add <= 5.5% NAV (exec_common.addon_gates); otherwise it stays pending with
+the reason in the run report.
 DRY_RUN unless EXEC_DRY_RUN=0 AND HL_API_PRIVATE_KEY (exec_common.is_live_mode). In DRY_RUN the
 store is not modified. Prints one JSON object; exit 0 ok, 1 error.
 """
@@ -38,6 +43,8 @@ from exec_common import (  # noqa: E402
     price_sane,
     radar_ref_price,
     radar_rowcount_ok,
+    addon_gates,
+    size_by_margin,
     MAX_MARGIN_UTILIZATION_PCT,
     MIN_NOTIONAL_USD,
     MIN_SL_DIST_PCT,
@@ -164,6 +171,7 @@ def _run_pending(hl: Any = None, radar_1d: Optional[dict] = None, radar_4h: Opti
         except (TypeError, ValueError):
             pass
     liq_safe, unsafe = _check_all_positions_liq_safe(account["positions"], {}, radar_4h)
+
     if log_entry_fn is None:
         from trade_log import log_entry as log_entry_fn  # noqa: N813
     slip = 0.5
@@ -236,17 +244,17 @@ def _run_pending(hl: Any = None, radar_1d: Optional[dict] = None, radar_4h: Opti
         if not hard_sl or hard_sl <= 0:
             note(f"no Hard SL level ({sl_label})")
             continue
-        lo_b, hi_b = PENDING_SIZE_BANDS[kind]
-        try:
-            size_pct = float(rec.get("size_pct") if rec.get("size_pct") is not None else lo_b)
-        except (TypeError, ValueError):
-            size_pct = lo_b
-        size_pct = max(lo_b, min(hi_b, size_pct))
-        leverage = clamp_leverage(rec.get("leverage", 2.0), coin_max)
-        lev_note = ""
-        if kind == ADD_ON and lev_by_coin.get(sym) and lev_by_coin[sym] != leverage:
-            lev_note = f" (approved {leverage}x -> existing isolated {lev_by_coin[sym]}x)"
-            leverage = clamp_leverage(lev_by_coin[sym], coin_max)
+        fixed_lev, room, lev_note = None, None, ""
+        if kind == ADD_ON:
+            ok_add, why_add, room = addon_gates(pos_by_coin.get(sym), equity)
+            if not ok_add:
+                note(f"in zone but {why_add}")
+                continue
+            fixed_lev = lev_by_coin.get(sym) or (pos_by_coin.get(sym) or {}).get("leverage")
+            if not fixed_lev:
+                note("ADD_ON: existing position leverage unknown")
+                continue
+            lev_note = f" (ADD_ON keeps existing isolated {fixed_lev}x; {why_add})"
         ok_px, _diff, why_px = price_sane(mid, radar_ref_price(rows_4h.get(sym), rows_1d.get(sym)))
         if not ok_px:
             note(f"in zone but {why_px}")
@@ -256,6 +264,13 @@ def _run_pending(hl: Any = None, radar_1d: Optional[dict] = None, radar_4h: Opti
             note(f"in zone but SL distance {sl_dist:.2f}% to {sl_label} {hard_sl:.6g} < {MIN_SL_DIST_PCT}%")
             continue
         limit_px = round_price(mid * (1 + slip / 100.0), sz_dec)
+        ref_px = max(limit_px, (pos_by_coin.get(sym) or {}).get("entry_px") or 0)  # add-on: worst of both
+        sz = size_by_margin(equity, limit_px, hard_sl, coin_max, rec.get("size_pct"), rec.get("leverage"),
+                            fixed_leverage=fixed_lev, max_margin_pct=room, liq_ref_px=ref_px)
+        if not sz["ok"]:
+            note(f"in zone but {sz['reason']}")
+            continue
+        size_pct, leverage = sz["margin_pct"], sz["leverage"]
         qty = order_qty(equity * size_pct / 100.0 * leverage, limit_px, sz_dec)
         notional = qty * mid
         min_usd = min_order_usd(equity)
@@ -267,16 +282,13 @@ def _run_pending(hl: Any = None, radar_1d: Optional[dict] = None, radar_4h: Opti
         if not ok_cap:
             note(f"margin utilization {util:.1f}% > {MAX_MARGIN_UTILIZATION_PCT}% (cumulative)")
             continue
-        ref_px = max(limit_px, (pos_by_coin.get(sym) or {}).get("entry_px") or 0)  # add-on: worst of both
-        est_liq = isolated_liq_price_long(ref_px, leverage, coin_max)
-        if not liq_beyond_sl_long(est_liq, hard_sl):
-            note(f"isolated liq {est_liq:.6g} not below Hard SL {hard_sl:.6g}")
-            continue
+        est_liq = sz["liq"]
         intent = {"id": rec["id"], "symbol": sym, "kind": kind, "mid": mid, "limit_px": limit_px, "qty": qty,
                   "size_pct": size_pct, "leverage": leverage, "notional_usd": round(notional, 2),
                   "margin_usd": round(margin_usd, 2), "hard_sl": hard_sl, "hard_sl_label": sl_label,
                   "sl_dist_pct": round(sl_dist, 3), "estimated_liq": est_liq, "margin_util_after_pct": round(util, 2),
                   "zone": [bnd["lower"], bnd["filter"]], "note": lev_note.strip(),
+                  "risk_margin_pct": round(margin_usd / equity * 100.0, 3), "sizing_notes": sz.get("notes"),
                   "approved_size_pct": rec.get("size_pct"), "approved_leverage": rec.get("leverage")}
         trade_id = f"{sym}_{kind}_{now.strftime('%Y%m%d_%H%M%S')}"
         if not live:
