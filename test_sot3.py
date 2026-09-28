@@ -164,3 +164,53 @@ class TestEntryCounter(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRailwayFallback(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.env = patch.dict(os.environ, {"DECISIONS_DIR": self.tmp, "DIM_LEDGER_PATH": os.path.join(self.tmp, "l.db")})
+        self.env.start()
+
+    def tearDown(self):
+        self.env.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _cd(self, **kw):
+        return {"generated_at": datetime.now(timezone.utc).isoformat(), "stale": False, "candidates": [
+            {"symbol": "MON", "type": "Base", "is_base": True}, {"symbol": "TIA", "type": "Chase", "is_chase": True}], **kw}
+
+    def test_build(self):
+        import serve
+        fb, why = serve.build_fallback_decisions(self._cd())
+        self.assertEqual(why, "")
+        self.assertEqual({d["symbol"]: (d["decision"], d["size_pct"]) for d in fb},
+                         {"MON": ("approve", 2.0), "TIA": ("veto", 0)})
+        self.assertEqual(serve.build_fallback_decisions(self._cd(stale=True))[1], "candidates stale")
+        old = self._cd(generated_at=(datetime.now(timezone.utc) - timedelta(days=1)).isoformat())
+        self.assertEqual(serve.build_fallback_decisions(old)[1], "candidates not generated today")
+
+    def test_job_stores_only_without_claude(self):
+        import serve
+        from decisions import get_decisions_for_today, store_decisions
+        with patch.object(serve, "_load_candidates_file", lambda: self._cd()), patch.object(serve, "AUTO_FALLBACK", True):
+            prev = serve._scheduled_fallback(manual=True)
+            self.assertEqual(prev["status"], "preview")
+            self.assertEqual(get_decisions_for_today(), {})
+            res = serve._scheduled_fallback()
+            self.assertEqual(res["status"], "success", res)
+            d = get_decisions_for_today()
+            self.assertEqual((d["MON"]["source"], d["MON"]["decision"], d["TIA"]["decision"]), ("fallback", "approve", "veto"))
+            self.assertEqual(serve._scheduled_fallback()["status"], "skipped")
+        shutil.rmtree(self.tmp)
+        os.makedirs(self.tmp)
+        store_decisions([{"coin": "MON", "action": "VETO"}], source="claude")
+        with patch.object(serve, "_load_candidates_file", lambda: self._cd()):
+            self.assertIn("Claude decisions present", serve._scheduled_fallback()["message"])
+
+    def test_auto_fallback_off_does_not_store(self):
+        import serve
+        from decisions import get_decisions_for_today
+        with patch.object(serve, "_load_candidates_file", lambda: self._cd()), patch.object(serve, "AUTO_FALLBACK", False):
+            self.assertEqual(serve._scheduled_fallback()["status"], "preview")
+        self.assertEqual(get_decisions_for_today(), {})

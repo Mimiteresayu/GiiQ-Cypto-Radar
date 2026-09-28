@@ -37,6 +37,9 @@ Entry and exit **triggers are unchanged**, and so is per-trade risk (isolated ma
   Fallback approvals execute as **Base only at 2% margin**; Chase / pending adds are skipped.
 - The executor reports `claude_post.missing_days`: 1 → alert, **≥ 2 consecutive days → RED alert**.
 - Decisions received after 08:50 HKT are stored but flagged `late`.
+- **08:50 HKT Railway fallback** (`decision_fallback` job): if no Claude decision is stored today,
+  Railway stores fallback decisions itself (Base → approve at 2%, Chase → veto), so nothing depends
+  on a desktop or an outside agent. `AUTO_FALLBACK=0` turns it off (then no Claude POST = no trade).
 
 ### 4. EXIT health (report only)
 `GET /api/exit/health` (keyed) and `exit_health` in `[DESK_DATA]`: NO_SL, EXIT_NOT_DONE, JOB_FAILED,

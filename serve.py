@@ -66,6 +66,10 @@ DESK_DATA_CHUNK_BYTES = int(os.environ.get("DESK_DATA_CHUNK_BYTES") or "32000")
 # LIVE radar loop (APScheduler cron minutes, HKT). :03/:13/... sits after the :07 1H and
 # :10 4H closed-bar jobs so it never races them (it also takes the scan lock).
 LIVE_RADAR_MINUTES = (os.environ.get("OTR_LIVE_MINUTES") or "3-59/10").strip()
+# GIIQ-SoT-3: at 08:50 HKT, if Claude's ENTRY_DESK POST never arrived, Railway stores fallback decisions
+# itself (Base only, 2% margin; Chase vetoed) so the system does not depend on any desktop/agent.
+# AUTO_FALLBACK=0 disables it (then no Claude POST = no trade, fail-closed).
+AUTO_FALLBACK = (os.environ.get("AUTO_FALLBACK") or "1").strip().lower() not in ("0", "false", "no", "off")
 LIVE_LOCK_WAIT_S = int(os.environ.get("OTR_LIVE_LOCK_WAIT_S") or "240")
 # DESK_DATA volume: full set on every closed-bar job + at least every DESK_FULL_EVERY_S;
 # other 10-min live cycles log a compact set (focus rows only).
@@ -1668,6 +1672,72 @@ def _scheduled_dims(manual: bool = False, mode: str = "snapshot") -> dict:
     return res
 
 
+def build_fallback_decisions(cd: dict, now: datetime | None = None) -> tuple[list, str]:
+    """Fallback decisions from today's candidates: Base -> approve at 2% margin, Chase -> veto.
+    Returns (decisions, why_not) — decisions empty with a reason when candidates are unusable."""
+    now = now or datetime.now(timezone.utc)
+    gen = parse_ts((cd or {}).get("generated_at"))
+    if not gen or hkt_date(gen) != hkt_date(now):
+        return [], "candidates not generated today"
+    if cd.get("stale"):
+        return [], "candidates stale"
+    out = []
+    for c in cd.get("candidates") or []:
+        sym = str(c.get("symbol") or "").upper()
+        if not sym:
+            continue
+        base = bool(c.get("is_base")) or c.get("type") == "Base"
+        out.append({"symbol": sym, "decision": "approve" if base else "veto", "type": "BASE" if base else "CHASE",
+                    "size_pct": 2.0 if base else 0, "leverage": None if base else 0,
+                    "reason": ("RAILWAY_FALLBACK: no Claude POST by 08:50 - Base only, 2% margin" if base
+                               else "RAILWAY_FALLBACK: no Claude POST - Chase not allowed in fallback")})
+    return out, ""
+
+
+def _scheduled_fallback(manual: bool = False) -> dict:
+    """08:50 HKT: if no Claude decision is stored today, store fallback decisions (source=fallback).
+    Manual (password) runs only preview; they never store."""
+    job_name = "manual_decision_fallback" if manual else "decision_fallback"
+    res: dict = {}
+    try:
+        from decisions import _rec_source
+        decs = get_decisions_for_today() if get_decisions_for_today else {}
+        if any(_rec_source(r) == "claude" for r in (decs or {}).values()):
+            res = {"status": "skipped", "message": "Claude decisions present - no fallback"}
+        elif decs:
+            res = {"status": "skipped", "message": f"fallback already stored ({len(decs)} decisions)"}
+        else:
+            fb, why = build_fallback_decisions(_load_candidates_file())
+            if why:
+                res = {"status": "skipped", "message": f"no fallback: {why}"}
+            elif manual or not AUTO_FALLBACK:
+                res = {"status": "preview", "would_store": fb,
+                       "message": "preview only" if manual else "AUTO_FALLBACK=0 - not stored (no trade today)"}
+            else:
+                stored = store_decisions(fb, source="fallback")
+                if dim_ledger and stored.get("stored"):
+                    try:
+                        conn = dim_ledger.connect()
+                        dim_ledger.record_decisions(conn, hkt_date(datetime.now(timezone.utc)), stored["stored"],
+                                                    source="fallback")
+                        conn.close()
+                    except Exception as e:
+                        stored["ledger_error"] = str(e)
+                stored.pop("stored", None)
+                res = {"status": "success" if stored.get("ok") else "error",
+                       "message": f"RAILWAY_FALLBACK stored: {stored.get('stored_count')} decisions "
+                                  f"({sum(1 for d in fb if d['decision'] == 'approve')} Base approvals @2%)",
+                       "result": stored}
+        _update_job_status(job_name, res.get("status", "error") if res.get("status") != "preview" else "success",
+                           res.get("message", ""))
+        banner = "!!!!!!!! " if res.get("status") == "success" and not manual else ""
+        sys.stderr.write(f"[SCHEDULER] {banner}{job_name}: {res.get('message')}\n")
+    except Exception as e:
+        _update_job_status(job_name, "error", "", str(e))
+        res = {"status": "error", "message": str(e)}
+    return res
+
+
 def _scheduled_dims_outcomes(manual: bool = False) -> dict:
     return _scheduled_dims(manual=manual, mode="outcomes")
 
@@ -1681,6 +1751,7 @@ MANUAL_JOBS = {
     "pending": _scheduled_pending,
     "dims": _scheduled_dims,
     "dims_outcomes": _scheduled_dims_outcomes,
+    "fallback": _scheduled_fallback,
 }
 _manual_running: set = set()
 _manual_lock = threading.Lock()
@@ -1749,6 +1820,8 @@ def _init_scheduler() -> BackgroundScheduler | None:
                           id="dims_snapshot", name="GIIQ dimensions snapshot (shadow)", **common)
         scheduler.add_job(_scheduled_dims_outcomes, CronTrigger(hour=8, minute=30, timezone=hkt),
                           id="dims_outcomes", name="GIIQ dimension outcomes + report (shadow)", **common)
+        scheduler.add_job(_scheduled_fallback, CronTrigger(hour=8, minute=50, timezone=hkt),
+                          id="decision_fallback", name="Decision fallback if no Claude POST (Base only, 2%)", **common)
         scheduler.add_job(_scheduled_preflight, CronTrigger(hour=8, minute=45, timezone=hkt),
                           id="exec_preflight", name="LIVE executor preflight (agent/key/signing)",
                           **common)
@@ -1767,6 +1840,7 @@ def _init_scheduler() -> BackgroundScheduler | None:
             "  - 08:05 HKT: 1D+4H scan + entry candidates\n"
             "  - 08:08 HKT: GIIQ dimensions snapshot (shadow; whales + HL ctx)\n"
             "  - 08:30 HKT: GIIQ dimension outcomes + report (shadow)\n"
+            f"  - 08:50 HKT: decision fallback if no Claude POST (AUTO_FALLBACK={'on' if AUTO_FALLBACK else 'off'})\n"
             "  - Hourly :07: 1H scan + Small/Tiny exits\n"
             "  - Every 4h :10: 4H scan + Mega/Large exits\n"
             "  - boot + 08:45 HKT: LIVE executor preflight\n"
