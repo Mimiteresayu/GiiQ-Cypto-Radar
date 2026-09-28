@@ -11,6 +11,8 @@ Surfaces, BEFORE the 08:55 executor, every reason LIVE entries would fail:
      approved coins listed on HL with maxLeverage >= requested (clamped) leverage, and the
      at-entry Upper guard (Base only: live mid vs 1D Upper; Chase approvals become pending)
   6. pending pullback entries (ADD_ON / CONTINUATION) with trigger zones
+  7. GIIQ-SoT-1 guardrails preview: radar row-count (1D/4H/1H; entries fail closed below the
+     threshold), NAV snapshot definition, minimum order = max($10, 1% NAV)
 
 Prints one JSON object. Exit 0 = ok (or DRY_RUN), 1 = a check that would block LIVE entries failed.
 Never places, modifies or cancels a real order.
@@ -28,6 +30,10 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 from exec_common import (  # noqa: E402
+    SOT_ID,
+    min_order_usd,
+    nav_snapshot,
+    radar_rowcount_ok,
     above_upper_at_entry,
     candidates_fresh,
     clamp_leverage,
@@ -52,7 +58,7 @@ def run_preflight(hl: Any = None, signed_probe: bool = True, now: Optional[datet
     now = now or datetime.now(timezone.utc)
     checks: List[Dict[str, Any]] = []
     res: Dict[str, Any] = {"ok": True, "mode": "LIVE" if is_live_mode() else "DRY_RUN",
-                           "ts": now.isoformat(), "checks": checks, "warnings": []}
+                           "ts": now.isoformat(), "checks": checks, "warnings": [], "sot": SOT_ID}
 
     def add(name: str, ok: bool, detail: str, blocking: bool = True) -> None:
         checks.append({"check": name, "ok": ok, "detail": detail, "blocking": blocking})
@@ -104,16 +110,23 @@ def run_preflight(hl: Any = None, signed_probe: bool = True, now: Optional[datet
     try:
         perp = hl.perp_state()
         spot = hl.spot_state()
-        eq = 0.0
-        for b in spot.get("balances", []) or []:
-            if b.get("coin") == "USDC":
-                eq = float(b.get("total") or 0)
+        ab = None
+        if callable(getattr(hl, "user_abstraction", None)):
+            try:
+                ab = hl.user_abstraction()
+            except Exception:  # noqa: BLE001
+                ab = None
+        nav = nav_snapshot(spot, perp, ab, now)
+        res["nav"] = nav
+        eq = nav["nav"]
         for g in perp.get("assetPositions", []) or []:
             p = g.get("position") or {}
             if abs(float(p.get("szi") or 0)) > 0:
                 held.add(p.get("coin"))
         res["equity"] = eq
         add("account", eq > 0, f"equity ${eq:,.2f}, open positions {sorted(held) or 'none'}")
+        add("nav", eq > 0, f"NAV snapshot ${eq:,.2f} = {nav['source']}; min order ${min_order_usd(eq):,.2f} "
+            f"(max of $10, 1% NAV)", blocking=False)
     except Exception as e:  # noqa: BLE001
         add("account", False, f"HL account state failed: {e}")
 
@@ -121,6 +134,12 @@ def run_preflight(hl: Any = None, signed_probe: bool = True, now: Optional[datet
         pr = hl.probe_signing()
         add("signing", bool(pr.get("ok")), "HL accepted signed probe (agent can trade for account)"
             if pr.get("ok") else f"HL rejected signed probe: {pr.get('error')}")
+
+    # Radar row-count guardrail (entries fail closed if 1D/4H below threshold; 1H informational)
+    for tf in ("1d", "4h", "1h"):
+        ok_rc, why_rc = radar_rowcount_ok(_load(f"gc_radar_{tf}.json"), tf)
+        add(f"radar_rows:{tf}", ok_rc, why_rc + ("" if ok_rc or tf == "1h" else " -> executor/pending FAIL CLOSED"),
+            blocking=False)
 
     # Informational: today's decisions / candidates / leverage feasibility
     try:

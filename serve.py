@@ -84,6 +84,7 @@ except ImportError:
     build_candidates = None  # type: ignore
 
 from exec_common import (  # noqa: E402
+    SOT_ID,
     clamp_leverage,
     hard_sl_for_tier,
     hkt_date,
@@ -882,7 +883,7 @@ def _exec_mode() -> dict:
         live = is_live_mode()
     except Exception:
         live = False
-    return {"mode": "LIVE" if live else "DRY_RUN",
+    return {"mode": "LIVE" if live else "DRY_RUN", "sot": SOT_ID,
             "exec_dry_run": (os.environ.get("EXEC_DRY_RUN") or "1").strip(),
             "key_present": bool((os.environ.get("HL_API_PRIVATE_KEY") or "").strip())}
 
@@ -1063,6 +1064,10 @@ def _build_desk_data_payload(event: str = "", now: datetime | None = None, kind:
         "hl_spot": _trim_hl_spot(hl_data.get("hl_spot", {})),
         "hl_perp": perp,
         "hl_open_orders": orders,
+        "sot": SOT_ID,
+        "exec_mode": _exec_mode(),
+        "run_report": _today_run_report(now),
+        "pending_entries": _pending_view(),
     }
     if kind == "full":
         payload["narrative"] = narrative
@@ -1240,16 +1245,21 @@ def _scheduled_1d_scan(manual: bool = False) -> None:
     _log_desk_data(job_name)
 
 
-def _scan_and_exits(job_name: str, tf: str, max_symbols: int, exit_arg: str, manual: bool) -> None:
+def _scan_and_exits(job_name: str, tf: str, max_symbols: int, exit_arg: str, manual: bool) -> dict:
+    """Closed-bar scan -> candidates -> exit worker. Returns {"exits_ok": bool, "at": iso, "why": str}
+    so a caller that also enters (4H job -> pending entries) can enforce exits -> re-fetch -> entries."""
+    done = {"exits_ok": False, "at": None, "why": "not run"}
     if not _acquire_scan_lock(job_name):
-        return
+        done["why"] = "scan lock busy"
+        return done
     try:
         sys.stderr.write(f"[SCHEDULER] Starting {job_name}\n")
         ok, note = _run_scan([tf], max_symbols=max_symbols)
         if not ok:
             _update_job_status(job_name, "error", "", note)
             sys.stderr.write(f"[SCHEDULER] {job_name} scan failed: {note[:200]}\n")
-            return
+            done["why"] = f"scan failed: {note[:200]}"
+            return done
         # Keep ENTRY tab == AI candidates list (never stale/empty while radar is fresh)
         count = _generate_entry_candidates()
         note = f"{note}; candidates={count}"
@@ -1266,16 +1276,20 @@ def _scan_and_exits(job_name: str, tf: str, max_symbols: int, exit_arg: str, man
             except Exception:
                 msg = f"{note}; exits ok"
             _update_job_status(job_name, "success", msg)
+            done.update(exits_ok=True, at=datetime.now(timezone.utc).isoformat(), why="ok")
         else:
             msg = f"{note}; exit_worker rc={rc}"
             _update_job_status(job_name, "error", msg, (err or out)[-1500:])
+            done["why"] = f"exit_worker rc={rc}"
         sys.stderr.write(f"[SCHEDULER] {job_name} completed: {msg}\n")
     except Exception as e:
         _update_job_status(job_name, "error", "", str(e))
         sys.stderr.write(f"[SCHEDULER] {job_name} exception: {e}\n")
+        done["why"] = f"exception: {e}"
     finally:
         _scan_lock.release()
     _log_desk_data(job_name)
+    return done
 
 
 def _scheduled_1h_scan_exits(manual: bool = False) -> None:
@@ -1285,10 +1299,17 @@ def _scheduled_1h_scan_exits(manual: bool = False) -> None:
 
 def _scheduled_4h_scan_exits(manual: bool = False) -> None:
     """Every 4h :10 HKT: 4H scan + Mega/Large exits + SL align, then pending pullback entries
-    on the just-closed 4H bar (manual runs: pending forced DRY_RUN)."""
-    _scan_and_exits("manual_4h_scan_exits" if manual else "4h_scan_exits", "4h", SCAN_MAX, "4h", manual)
+    on the just-closed 4H bar (manual runs: pending forced DRY_RUN).
+    Order is enforced (GIIQ-SoT-1): exits first; entries only if the exit step completed OK;
+    pending_worker re-fetches positions itself after the exits."""
+    done = _scan_and_exits("manual_4h_scan_exits" if manual else "4h_scan_exits", "4h", SCAN_MAX, "4h", manual)
+    if not done.get("exits_ok"):
+        why = f"exits step did not complete ({done.get('why')}) -> pending entries skipped (exits -> re-fetch -> entries)"
+        _update_job_status("manual_pending_entries" if manual else "pending_entries", "skipped", why)
+        sys.stderr.write(f"[PENDING] skipped: {why}\n")
+        return
     try:
-        _scheduled_pending(manual=manual)
+        _scheduled_pending(manual=manual, after_exits=done.get("at"))
     except Exception as e:
         _update_job_status("pending_entries", "error", "", f"pending exception: {e}")
         sys.stderr.write(f"[PENDING] !!!!!!!! exception: {e}\n")
@@ -1407,7 +1428,8 @@ def _scheduled_executor(manual: bool = False, live_api: bool = False) -> dict:
         except Exception:
             res = {}
         status = res.get("status", "unknown")
-        msg = (f"{res.get('mode', '?')} {status}: executed={len(res.get('executed', []))} "
+        _record_run_report(job_name, res)
+        msg = (f"[{SOT_ID}] {res.get('mode', '?')} {status}: executed={len(res.get('executed', []))} "
                f"actions={len(res.get('actions', []))} skipped={len(res.get('skipped', []))}"
                + (f" | {res.get('message')}" if res.get("message") else ""))
         if res.get("skipped"):
@@ -1432,7 +1454,7 @@ def _scheduled_executor(manual: bool = False, live_api: bool = False) -> dict:
     return res
 
 
-def _scheduled_pending(manual: bool = False) -> dict:
+def _scheduled_pending(manual: bool = False, after_exits: str | None = None) -> dict:
     """Every 4h at :10 HKT, right after the 4H closed-bar scan (called from the 4H job):
     pending pullback entries (ADD_ON / CONTINUATION) -> pending_worker.py.
     Same env as the executor (LIVE iff EXEC_DRY_RUN=0); manual (password) runs are forced DRY_RUN."""
@@ -1442,20 +1464,23 @@ def _scheduled_pending(manual: bool = False) -> dict:
         _update_job_status(job_name, "skipped", "executor/pending pass already running")
         return {"status": "busy"}
     try:
-        rc, out, err = _run_worker("pending_worker.py", [], timeout=300, force_dry_run=manual)
+        args = ["--after-exits", after_exits] if after_exits else []
+        rc, out, err = _run_worker("pending_worker.py", args, timeout=300, force_dry_run=manual)
         try:
             res = json.loads(out)
         except Exception:
             res = {}
         status = res.get("status", "unknown")
+        if res.get("checked") or res.get("filled") or res.get("cancelled") or status != "success":
+            _record_run_report(job_name, res)
         checks = "; ".join(f"{c.get('symbol')} {c.get('kind')}: {c.get('result') or c.get('action')} ({c.get('reason')})"
                            for c in res.get("checked", []))
-        msg = (f"{res.get('mode', '?')} {status}: active={len(res.get('pending_active', []))} "
+        msg = (f"[{SOT_ID}] {res.get('mode', '?')} {status}: active={len(res.get('pending_active', []))} "
                f"filled={len(res.get('filled', []))} cancelled={len(res.get('cancelled', []))}"
                + (f" | {res.get('message')}" if res.get("message") else "")
                + (f" | {checks[:900]}" if checks else "")
                + (f" | ALERTS: {'; '.join(map(str, res['alerts']))[:500]}" if res.get("alerts") else ""))
-        if rc == 0 and status == "success":
+        if rc == 0 and status in ("success", "fail_closed"):
             _update_job_status(job_name, status, msg)
         else:
             _update_job_status(job_name, "error", msg, (err or out)[-1500:])
@@ -1469,6 +1494,67 @@ def _scheduled_pending(manual: bool = False) -> dict:
     finally:
         _exec_lock.release()
     return res
+
+
+RUN_REPORT_DIR = os.environ.get("RUN_REPORT_DIR") or os.path.join(OUT_DIR, "run_reports")
+RUN_REPORT_MAX_RUNS = 30
+_run_report_lock = threading.Lock()
+
+
+def _run_report_path(day: str) -> str:
+    return os.path.join(RUN_REPORT_DIR, f"{day}.json")
+
+
+def _record_run_report(job_name: str, res: dict, now: datetime | None = None) -> None:
+    """Append this run's report (executor / pending) to out/run_reports/<HKT date>.json."""
+    try:
+        rep = dict((res or {}).get("run_report") or {})
+        if not rep:
+            rep = {"sot": SOT_ID, "run": job_name, "mode": (res or {}).get("mode"),
+                   "status": (res or {}).get("status") or "unknown", "message": (res or {}).get("message"),
+                   "executed": [], "skipped": [], "downsized": [], "failed": []}
+        rep["job"] = job_name
+        now = now or datetime.now(timezone.utc)
+        rep.setdefault("ts", now.isoformat())
+        day = now.astimezone(HKT).strftime("%Y-%m-%d")
+        with _run_report_lock:
+            os.makedirs(RUN_REPORT_DIR, exist_ok=True)
+            path = _run_report_path(day)
+            try:
+                with open(path) as f:
+                    doc = json.load(f)
+            except Exception:
+                doc = {"date": day, "runs": []}
+            doc["sot"] = SOT_ID
+            doc["runs"] = (doc.get("runs") or [])[-(RUN_REPORT_MAX_RUNS - 1):] + [rep]
+            tmp = path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(doc, f, indent=1, default=str)
+            os.replace(tmp, path)
+    except Exception as e:
+        sys.stderr.write(f"[RUN_REPORT] persist failed: {e}\n")
+
+
+def _today_run_report(now: datetime | None = None) -> dict:
+    """Daily run report (HKT day): every executor / pending run + merged executed / skipped /
+    downsized / failed lists with reasons (cockpit + [DESK_DATA])."""
+    now = now or datetime.now(timezone.utc)
+    day = now.astimezone(HKT).strftime("%Y-%m-%d")
+    try:
+        with open(_run_report_path(day)) as f:
+            doc = json.load(f)
+    except Exception:
+        doc = {"date": day, "runs": []}
+    out = {"date": day, "sot": SOT_ID, "runs": [], "executed": [], "skipped": [], "downsized": [], "failed": []}
+    for r in doc.get("runs") or []:
+        tag = {"job": r.get("job") or r.get("run"), "mode": r.get("mode"), "ts": r.get("ts")}
+        out["runs"].append({**tag, "status": r.get("status"), "message": r.get("message"), "nav": r.get("nav"),
+                            "sequence": r.get("sequence"),
+                            "counts": {k: len(r.get(k) or []) for k in ("executed", "skipped", "downsized", "failed")}})
+        for k in ("executed", "skipped", "downsized", "failed"):
+            for item in r.get(k) or []:
+                out[k].append({**item, **{f"run_{a}": b for a, b in tag.items()}})
+    return out
 
 
 def _pending_view() -> list:
@@ -1955,6 +2041,8 @@ class Handler(SimpleHTTPRequestHandler):
         result["exec_preflight"] = _read_exec_preflight()
         result["pending_entries"] = _pending_view()
         result["exec_mode"] = _exec_mode()
+        result["sot"] = SOT_ID
+        result["run_report"] = _today_run_report()
         
         result["ts"] = datetime.now(timezone.utc).isoformat()
         result["address"] = HL_ADDRESS

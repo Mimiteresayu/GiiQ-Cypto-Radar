@@ -127,6 +127,16 @@ class HLClient:
     def spot_state(self) -> dict:
         return self.info({"type": "spotClearinghouseState", "user": self.address})
 
+    def user_abstraction(self) -> str:
+        """HL account mode ("unifiedAccount", "default", ...) or "unknown" if the lookup fails.
+        Used only for the NAV definition (exec_common.nav_snapshot)."""
+        try:
+            v = self.info({"type": "userAbstraction", "user": self.address}, retries=2)
+            return v if isinstance(v, str) and v else "unknown"
+        except Exception as e:  # noqa: BLE001
+            _log(f"userAbstraction lookup failed: {e}")
+            return "unknown"
+
     def open_orders(self) -> List[dict]:
         """frontendOpenOrders (includes isTrigger / triggerPx / reduceOnly)."""
         return self.info({"type": "frontendOpenOrders", "user": self.address}) or []

@@ -19,13 +19,31 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Tuple
 
 # ---------------------------------------------------------------- constants
-MIN_NOTIONAL_USD = 10.0
+# SoT version id. Bump (GIIQ-SoT-2, ...) whenever an executor rule changes and add an entry to
+# docs/SOT_CHANGELOG.md. Shown in the cockpit header, executor/pending run reports and DESK_DATA.
+SOT_ID = "GIIQ-SoT-1"
+
+MIN_NOTIONAL_USD = 10.0  # Hyperliquid minimum order value (USD)
 MIN_LEVERAGE = 1.0
 MAX_LEVERAGE = 5.0
 MIN_SL_DIST_PCT = 1.5
 MAX_MARGIN_UTILIZATION_PCT = 80.0
 DEFAULT_MAX_CANDIDATE_AGE_H = 3.0  # 08:05 build -> 08:55 execute (+ slack)
 HKT = timezone(timedelta(hours=8))
+
+# ---------------------------------------------------------------- guardrails (GIIQ-SoT-1)
+# Radar row-count check. Closed-bar scans on 2026-09-28 had 173 (1D) / 176 (4H) / 177 (1H)
+# rows = the whole HL liquid universe (dayNtlVlm >= $75k, ~160-180 names). A scan is treated
+# as broken (fail-closed, no entries) when it has fewer than RADAR_MIN_ROWS rows (~70% of the
+# normal count) OR fewer than RADAR_MIN_UNIVERSE_FRAC of the symbols it asked for
+# (payload `universe_requested`), i.e. >15% of the requested coins failed to load.
+RADAR_MIN_ROWS = 120
+RADAR_MIN_UNIVERSE_FRAC = 0.85
+# Price sanity (ticker collision / bad data): skip a coin if the HL live mid differs from the
+# radar price by more than this (radar price = latest closed 4H close, fallback 1D close).
+PRICE_SANITY_MAX_DIFF_PCT = 50.0
+# Minimum order: notional must be >= max(HL minimum $10, 1% of the run's NAV snapshot).
+MIN_ORDER_NAV_PCT = 1.0
 
 
 def is_live_mode() -> bool:
@@ -187,6 +205,163 @@ def candidates_fresh(candidates_data: dict, now: Optional[datetime] = None,
     if candidates_data.get("stale"):
         return False, "candidates flagged stale (radar too old)"
     return True, "ok"
+
+
+# ---------------------------------------------------------------- guardrails
+def _env_float(name: str, default: float) -> float:
+    try:
+        v = os.environ.get(name)
+        return float(v) if v not in (None, "") else default
+    except ValueError:
+        return default
+
+
+def radar_rowcount_ok(radar: Optional[dict], tf: str = "") -> Tuple[bool, str]:
+    """Fail-closed row-count check for a closed-bar radar payload (see RADAR_MIN_ROWS).
+
+    Thresholds can be overridden with EXEC_RADAR_MIN_ROWS / EXEC_RADAR_MIN_UNIVERSE_FRAC."""
+    min_rows = int(_env_float("EXEC_RADAR_MIN_ROWS", RADAR_MIN_ROWS))
+    frac = _env_float("EXEC_RADAR_MIN_UNIVERSE_FRAC", RADAR_MIN_UNIVERSE_FRAC)
+    label = f"{tf.upper()} radar" if tf else "radar"
+    if min_rows <= 0:  # EXEC_RADAR_MIN_ROWS=0 disables the check (unit tests with tiny fixtures only)
+        return True, f"{label} row-count check disabled (EXEC_RADAR_MIN_ROWS=0)"
+    if not isinstance(radar, dict) or not radar:
+        return False, f"{label} missing"
+    rows = radar.get("rows")
+    n = len(rows) if isinstance(rows, list) else 0
+    uni = radar.get("universe_requested")
+    n_uni = len(uni) if isinstance(uni, list) else 0
+    if n < min_rows:
+        return False, f"{label} has {n} rows < minimum {min_rows} (normal ~170+) - scan looks broken"
+    if n_uni and n < math.ceil(frac * n_uni):
+        return False, (f"{label} has {n} rows < {frac:.0%} of the {n_uni} requested symbols "
+                       f"- scan looks broken")
+    return True, f"{label} {n} rows" + (f" / {n_uni} requested" if n_uni else "") + f" (min {min_rows})"
+
+
+def radar_ref_price(row_4h: Optional[dict], row_1d: Optional[dict] = None) -> Optional[float]:
+    """Radar price for the price-sanity check: latest closed 4H close, else latest closed 1D close."""
+    for row in (row_4h, row_1d):
+        v = _f((row or {}).get("close"))
+        if v and v > 0:
+            return v
+    return None
+
+
+def price_sane(mid: Optional[float], radar_px: Optional[float]) -> Tuple[bool, Optional[float], str]:
+    """(ok, diff_pct, detail). Fail-closed: both prices required, |mid/radar - 1| <= 50%."""
+    if not mid or mid <= 0:
+        return False, None, "no HL live mid"
+    if not radar_px or radar_px <= 0:
+        return False, None, "no radar price for price-sanity check"
+    diff = abs(mid - radar_px) / radar_px * 100.0
+    lim = _env_float("EXEC_PRICE_SANITY_MAX_DIFF_PCT", PRICE_SANITY_MAX_DIFF_PCT)
+    if diff > lim:
+        return False, diff, (f"price sanity: HL mid {mid:.6g} vs radar {radar_px:.6g} differ {diff:.1f}% > "
+                             f"{lim:g}% (ticker collision / bad data)")
+    return True, diff, f"price ok ({diff:.1f}% vs radar)"
+
+
+def min_order_usd(nav: float) -> float:
+    """Minimum entry notional = max(HL minimum $10, 1% of the NAV snapshot)."""
+    return max(MIN_NOTIONAL_USD, max(0.0, float(nav or 0.0)) * MIN_ORDER_NAV_PCT / 100.0)
+
+
+def _usdc_row(spot: dict) -> dict:
+    for bal in (spot or {}).get("balances", []) or []:
+        if bal.get("coin") == "USDC":
+            return bal
+    return {}
+
+
+def nav_snapshot(spot: dict, perp: dict, abstraction: Optional[str] = None,
+                 now: Optional[datetime] = None) -> Dict[str, Any]:
+    """NAV used for ALL sizing in one run (taken once per run, never refreshed mid-run).
+
+    NAV definition (GIIQ-SoT-1):
+    - Unified account (HL userAbstraction == "unifiedAccount", our main wallet): NAV = spot USDC
+      `total`. In unified mode the perp collateral (perp marginSummary.accountValue, incl. the
+      isolated margin + uPnL of open positions) is already inside spot USDC as `hold`, so adding
+      accountValue again would double count.
+    - Standard (split) account: NAV = perp marginSummary.accountValue + spot USDC total.
+    - Unknown mode (abstraction lookup failed): NAV = max(spot USDC total, perp accountValue)
+      - never double counts, equals the unified value for our wallet.
+    Non-USDC spot tokens are not counted (the account holds none)."""
+    usdc = _usdc_row(spot)
+    spot_total = _f(usdc.get("total")) or 0.0
+    spot_hold = _f(usdc.get("hold")) or 0.0
+    ms = (perp or {}).get("marginSummary") or {}
+    perp_av = _f(ms.get("accountValue")) or 0.0
+    margin_used = _f(ms.get("totalMarginUsed")) or 0.0
+    ab = (abstraction or "").strip()
+    if ab == "unifiedAccount":
+        nav, source = spot_total, "unified: spot USDC total (perp accountValue already included as hold)"
+    elif ab and ab not in ("unifiedAccount", "unknown"):
+        nav, source = perp_av + spot_total, f"{ab}: perp accountValue + spot USDC total"
+    else:
+        nav, source = max(spot_total, perp_av), "abstraction unknown: max(spot USDC total, perp accountValue)"
+    return {"nav": round(nav, 6), "source": source, "abstraction": ab or "unknown",
+            "spot_usdc_total": spot_total, "spot_usdc_hold": spot_hold, "perp_account_value": perp_av,
+            "margin_used": margin_used, "ts": (now or datetime.now(timezone.utc)).isoformat()}
+
+
+def build_run_report(run: str, result: Dict[str, Any], nav: Optional[dict] = None,
+                     approved: Optional[Dict[str, dict]] = None) -> Dict[str, Any]:
+    """Compact per-run report: executed / skipped / downsized / failed with reasons.
+
+    - executed: orders filled (LIVE) or that WOULD be placed (DRY_RUN, `dry_run`: true)
+    - skipped:  guard skips (no order attempted) with reason
+    - failed:   LIVE order attempted but not executed (no fill, leverage/entry/SL failure)
+    - downsized: executed/would-execute entries whose final size % or leverage is below the
+                 AI-approved value (SoT band / coin maxLeverage clamp / BTC-bearish fixed size)"""
+    approved = approved or {}
+    rep: Dict[str, Any] = {"sot": SOT_ID, "run": run, "mode": result.get("mode"),
+                           "status": result.get("status"), "message": result.get("message"),
+                           "ts": result.get("timestamp"),
+                           "nav": (nav or {}).get("nav"), "nav_source": (nav or {}).get("source"),
+                           "executed": [], "skipped": [], "downsized": [], "failed": []}
+    if result.get("sequence"):
+        rep["sequence"] = result["sequence"]
+
+    def _ex(x: dict, dry: bool) -> dict:
+        lr = x.get("live_result") or {}
+        return {"symbol": x.get("symbol"), "kind": x.get("kind") or x.get("entry_type"),
+                "qty": lr.get("filled_sz") or x.get("qty"), "px": lr.get("avg_px") or x.get("limit_px"),
+                "size_pct": x.get("size_pct"), "leverage": x.get("leverage"),
+                "notional_usd": x.get("notional_usd"), "hard_sl": x.get("hard_sl"), "dry_run": dry}
+
+    done = [(x, False) for x in result.get("executed", []) or []]
+    done += [(x, True) for x in result.get("actions", []) or []]
+    done += [(x, bool(x.get("dry_run"))) for x in result.get("filled", []) or []]
+    for x, dry in done:
+        rep["executed"].append(_ex(x, dry))
+        a = approved.get(x.get("symbol")) or {}
+        a_sz, a_lev = _f(a.get("size_pct")), _f(a.get("leverage"))
+        why = []
+        if a_sz is not None and x.get("size_pct") is not None and float(x["size_pct"]) < a_sz - 1e-9:
+            why.append(f"size {a_sz:g}% -> {float(x['size_pct']):g}%")
+        if a_lev is not None and x.get("leverage") is not None and float(x["leverage"]) < a_lev - 1e-9:
+            why.append(f"leverage {a_lev:g}x -> {float(x['leverage']):g}x")
+        if why:
+            rep["downsized"].append({"symbol": x.get("symbol"), "reason": "; ".join(why) + " (SoT clamp)"})
+    for s in result.get("skipped", []) or []:
+        item = {"symbol": s.get("symbol"), "reason": s.get("reason")}
+        (rep["failed"] if s.get("live_result") else rep["skipped"]).append(item)
+    for c in result.get("checked", []) or []:  # pending worker: waits / cancels are "skipped" today
+        if c.get("result") in ("filled", "would_fill"):
+            continue
+        rep["skipped"].append({"symbol": c.get("symbol"), "kind": c.get("kind"),
+                               "reason": f"{c.get('result') or c.get('action')}: {c.get('reason')}"})
+    for p in result.get("pending", []) or []:
+        rep.setdefault("pending_created", []).append(
+            {"symbol": p.get("symbol"), "kind": p.get("kind"), "zone": [p.get("zone_lower"), p.get("zone_filter")],
+             "band_tf": p.get("band_tf"), "stored": bool(p.get("id")), "created": p.get("created")})
+    for a in result.get("alerts", []) or []:
+        rep.setdefault("alerts", []).append(str(a))
+    if result.get("status") in ("fail_closed", "error") and not (rep["executed"] or rep["skipped"] or rep["failed"]):
+        for sym in sorted(approved):
+            rep["skipped"].append({"symbol": sym, "reason": f"run {result.get('status')}: {result.get('message')}"})
+    return rep
 
 
 # ---------------------------------------------------------------- misc
