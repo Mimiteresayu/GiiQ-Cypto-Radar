@@ -36,6 +36,9 @@ class FakeHL:
     def meta(self):
         return {"AAA": {"szDecimals": 0, "maxLeverage": 3.0}}
 
+    def all_mids(self):
+        return {"AAA": 1.0}
+
 
 class TestPreflight(unittest.TestCase):
     def run_pf(self, hl, env=None):
@@ -68,6 +71,20 @@ class TestPreflight(unittest.TestCase):
             r = exec_preflight.run_preflight(hl=FakeHL())
         self.assertFalse(r["ok"])
         self.assertEqual(r["mode"], "DRY_RUN")
+
+    def test_entry_guard_preview(self):
+        from datetime import datetime, timezone
+        cands = {"generated_at": datetime.now(timezone.utc).isoformat(),
+                 "candidates": [{"symbol": "AAA", "type": "Chase", "upper_4h": 1.05, "upper_1d": 0.5}]}
+        with patch.object(exec_preflight, "_load", return_value={}), \
+             patch("pathlib.Path.read_text", return_value=__import__("json").dumps(cands)), \
+             patch.dict(os.environ, {"EXEC_DRY_RUN": "0", "HL_API_PRIVATE_KEY": KEY}), \
+             patch("decisions.get_decisions_for_today", return_value={"AAA": {"decision": "approve", "leverage": 2}}):
+            r = exec_preflight.run_preflight(hl=FakeHL())
+        self.assertTrue(r["ok"])                          # guard is informational, not blocking
+        g = r["entry_guard"]["AAA"]
+        self.assertEqual((g["upper_label"], g["upper"], g["above"]), ("4H Upper", 1.05, False))
+        self.assertTrue(any("guard:AAA" in w and "SKIP" in w for w in r["warnings"]))
 
     def test_never_prints_key(self):
         r = self.run_pf(FakeHL())

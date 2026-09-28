@@ -8,7 +8,8 @@ Surfaces, BEFORE the 08:55 executor, every reason LIVE entries would fail:
   3. account: HL clearinghouse / spot state reachable, equity > 0
   4. signing: side-effect-free signed probe (cancel of a non-existent oid) is accepted by HL
   5. decisions/candidates (informational before 08:55): today's approvals, candidate freshness,
-     approved coins listed on HL with maxLeverage >= requested (clamped) leverage
+     approved coins listed on HL with maxLeverage >= requested (clamped) leverage, and the
+     at-entry Upper guard (live mid vs Chase 4H Upper / Base 1D Upper from the closed-bar scan)
 
 Prints one JSON object. Exit 0 = ok (or DRY_RUN), 1 = a check that would block LIVE entries failed.
 Never places, modifies or cancels a real order.
@@ -25,7 +26,20 @@ from typing import Any, Dict, List, Optional
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-from exec_common import candidates_fresh, clamp_leverage, is_live_mode  # noqa: E402
+from exec_common import (  # noqa: E402
+    above_upper_at_entry,
+    candidates_fresh,
+    clamp_leverage,
+    entry_upper_ref,
+    is_live_mode,
+)
+
+
+def _load(name: str) -> dict:
+    try:
+        return json.loads((ROOT / "out" / name).read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return {}
 
 
 def _log(msg: str) -> None:
@@ -135,6 +149,24 @@ def run_preflight(hl: Any = None, signed_probe: bool = True, now: Optional[datet
                     + (" (already held -> executor will skip)" if sym in held else ""), blocking=False)
         except Exception as e:  # noqa: BLE001
             add("meta", False, f"HL meta failed: {e}", blocking=False)
+        # At-entry Upper guard preview (the executor re-checks with a fresh mid at order time)
+        try:
+            mids = hl.all_mids()
+            rows_1d = {r.get("symbol"): r for r in (_load("gc_radar_1d.json").get("rows") or [])}
+            rows_4h = {r.get("symbol"): r for r in (_load("gc_radar_4h.json").get("rows") or [])}
+            cmap = {c.get("symbol"): c for c in (cand.get("candidates") or [])}
+            guard = {}
+            for sym in sorted(approved):
+                c = cmap.get(sym) or {}
+                up, label = entry_upper_ref(c, rows_1d.get(sym), rows_4h.get(sym))
+                mid = mids.get(sym)
+                ok = above_upper_at_entry(mid, up)
+                guard[sym] = {"type": c.get("type"), "upper_label": label, "upper": up, "mid": mid, "above": ok}
+                add(f"guard:{sym}", ok, f"{c.get('type') or '?'}: live mid {mid} {'>' if ok else '<='} {label} {up}"
+                    + ("" if ok else " -> executor would SKIP (below Upper at entry)"), blocking=False)
+            res["entry_guard"] = guard
+        except Exception as e:  # noqa: BLE001
+            add("guard", False, f"at-entry Upper guard preview failed: {e}", blocking=False)
     else:
         add("decisions", True, "no approvals stored yet for today (AI desk posts before 08:55)", blocking=False)
     return res

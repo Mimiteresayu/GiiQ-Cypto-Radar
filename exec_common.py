@@ -48,6 +48,25 @@ def hard_sl_for_tier(tier: str, row_4h: Optional[dict]) -> Tuple[Optional[float]
     return _f(row_4h.get("filter")), "4H Filter"
 
 
+def entry_upper_ref(cand: dict, row_1d: Optional[dict], row_4h: Optional[dict]) -> Tuple[Optional[float], str]:
+    """Signal-TF Upper for the at-entry guard (latest CLOSED-bar scan).
+
+    Chase -> 4H Upper; Base (and anything else) -> 1D Upper. Prefers the current radar row
+    (newest closed-bar scan) and falls back to the value frozen in the candidate."""
+    if (cand.get("type") or "") == "Chase":
+        v = _f((row_4h or {}).get("upper"))
+        return (v if v else _f(cand.get("upper_4h"))), "4H Upper"
+    v = _f((row_1d or {}).get("upper"))
+    return (v if v else _f(cand.get("upper_1d"))), "1D Upper"
+
+
+def above_upper_at_entry(mid: Optional[float], upper: Optional[float]) -> bool:
+    """Fail-closed: entry only if live mid is strictly above the signal-TF Upper."""
+    if not mid or mid <= 0 or not upper or upper <= 0:
+        return False
+    return mid > upper
+
+
 # ---------------------------------------------------------------- liquidation
 def maintenance_rate(max_leverage: Optional[float], leverage: float) -> float:
     """HL maintenance margin rate = 1 / (2 * maxLeverage).

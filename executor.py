@@ -6,6 +6,8 @@ SoT enforcement (see exec_common.py):
 - Min notional $10; leverage 1-5x AND <= coin HL maxLeverage (integer)
 - SL distance >= 1.5% from the LIVE mid; Hard SL per tier (Mega/Large 4H Lower, Small/Tiny 4H Filter)
 - Isolated liq price must lie below the Hard SL
+- At-entry Upper guard: a live HL mid fetched right before the order must be ABOVE the signal
+  TF Upper from the latest closed-bar scan (Chase: 4H Upper, Base: 1D Upper), else skip
 - Total margin (existing + all new entries, cumulative) <= 80% equity
 - All open positions must already have liq beyond their tier Hard SL
 - BTC 4H close < 4H Filter -> fixed 4% per coin
@@ -37,7 +39,9 @@ from exec_common import (  # noqa: E402
     MIN_NOTIONAL_USD,
     MIN_SL_DIST_PCT,
     candidates_fresh,
+    above_upper_at_entry,
     clamp_leverage,
+    entry_upper_ref,
     hard_sl_for_tier,
     is_live_mode,
     isolated_liq_price_long,
@@ -178,6 +182,7 @@ def execute_approved_candidates(
     radar_1h: Optional[dict] = None,
     radar_4h: Optional[dict] = None,
     now: Optional[datetime] = None,
+    radar_1d: Optional[dict] = None,
 ) -> Dict[str, Any]:
     """Run one execution pass. All inputs injectable for tests; defaults read disk/HL."""
     live = is_live_mode()
@@ -205,6 +210,7 @@ def execute_approved_candidates(
 
     radar_1h = _load_radar("1h") if radar_1h is None else radar_1h
     radar_4h = _load_radar("4h") if radar_4h is None else radar_4h
+    radar_1d = _load_radar("1d") if radar_1d is None else radar_1d
 
     if hl is None:
         from hl_exec import HLClient
@@ -278,6 +284,11 @@ def execute_approved_candidates(
             continue
 
         size_pct, leverage = _clamp_size_leverage(cand, decision, btc_bearish, coin_max)
+        try:  # fresh live mid at order time (fail-closed if unavailable)
+            mids = hl.all_mids() or mids
+        except Exception as e:  # noqa: BLE001
+            skip(f"live mid refresh failed: {e}")
+            continue
         mid = mids.get(symbol)
         if not mid or mid <= 0:
             skip("no live mid price")
@@ -305,6 +316,15 @@ def execute_approved_candidates(
             skip(f"Isolated liq ${est_liq:.6g} not below Hard SL ${hard_sl:.6g}", size_pct=size_pct, leverage=leverage)
             continue
 
+        r1d = next((r for r in radar_1d.get("rows", []) if r.get("symbol") == symbol), None)
+        upper_ref, upper_label = entry_upper_ref(cand, r1d, r4h)
+        if not above_upper_at_entry(mid, upper_ref):
+            why = (f"below {upper_label} at entry (live mid {mid:.6g} <= {upper_ref:.6g})" if upper_ref
+                   else f"no {upper_label} available for at-entry guard")
+            skip(why, size_pct=size_pct, leverage=leverage, mid=mid, upper_ref=upper_ref)
+            result["alerts"].append(f"{symbol}: {why}")
+            continue
+
         trade_id = f"{symbol}_{now.strftime('%Y%m%d_%H%M%S')}"
         intent = {
             "symbol": symbol, "trade_id": trade_id, "entry_type": entry_type, "tier": tier,
@@ -313,6 +333,7 @@ def execute_approved_candidates(
             "notional_usd": round(notional, 2), "hard_sl": hard_sl, "hard_sl_label": sl_label,
             "sl_dist_pct": round(sl_dist_pct, 3), "estimated_liq": est_liq, "coin_max_leverage": coin_max,
             "margin_util_after_pct": round(util, 2), "btc_bearish": btc_bearish,
+            "entry_upper_ref": upper_ref, "entry_upper_label": upper_label,
         }
 
         if not live:
