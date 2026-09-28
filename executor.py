@@ -25,6 +25,12 @@ Guardrails (GIIQ-SoT-1, see docs/SOT_CHANGELOG.md; no strategy change):
 - Minimum order: skip if notional < max(HL $10 minimum, 1% of NAV)
 - run_report: executed / skipped / downsized / failed with reasons (cockpit + DESK_DATA)
 
+Sizing (GIIQ-SoT-2, exec_common.size_by_risk; replaces the old 2x / P-band sizing):
+- isolated 3-5x (<= coin maxLeverage), margin 2-4% NAV (hard cap 4%); AI size/leverage = maximums
+- risk at Hard SL (notional x SL distance) <= 1.5% NAV (target 1%); total open risk <= 6% NAV
+- isolated liq below the Hard SL by >= 2x the SL distance; else step leverage down (min 3x) or
+  reduce size; impossible at 3x / 2% -> skip
+
 Entry: IOC limit buy at live mid + EXEC_ENTRY_SLIPPAGE_PCT (default 0.5%), isolated margin,
 then an immediate reduce-only stop-market Hard SL for the filled size. If the SL cannot be
 placed the fill is closed at once (fail-safe). See hl_exec.enter_long_with_sl.
@@ -52,6 +58,8 @@ from exec_common import (  # noqa: E402
     price_sane,
     radar_ref_price,
     radar_rowcount_ok,
+    open_risk_usd,
+    size_by_risk,
     MAX_LEVERAGE,
     MAX_MARGIN_UTILIZATION_PCT,
     MIN_LEVERAGE,
@@ -84,7 +92,7 @@ except ImportError as e:  # pragma: no cover
 
 HL_ADDRESS = os.environ.get("HL_ADDRESS", "0xcFCda0F8576a268BaA17935368081F4e687dB122").strip()
 
-# SoT size bands (margin % of equity)
+# LEGACY (GIIQ-SoT-1) size bands, no longer used for sizing: GIIQ-SoT-2 = exec_common.size_by_risk
 SIZE_BANDS = {
     "P": (4.0, 8.0),              # Primary only
     "P+N": (8.0, 12.0),           # Primary + Narrative
@@ -148,6 +156,12 @@ def _parse_account(spot: dict, perp: dict, abstraction: Optional[str] = None) ->
             "size": abs(szi),
             "entry_px": float(p.get("entryPx") or 0),
             "liquidation_px": float(p.get("liquidationPx") or 0),
+            "margin_used": float(p.get("marginUsed") or 0),
+            "unrealized_pnl": float(p.get("unrealizedPnl") or 0),
+            "roe_pct": (float(p["returnOnEquity"]) * 100.0 if p.get("returnOnEquity") not in (None, "")
+                        else (float(p.get("unrealizedPnl") or 0) / float(p["marginUsed"]) * 100.0
+                              if float(p.get("marginUsed") or 0) > 0 else None)),
+            "leverage": int(float((p.get("leverage") or {}).get("value") or 0)) or None,
         })
     return {"equity": equity, "margin_used": margin_used, "free_margin": max(0.0, equity - margin_used),
             "positions": positions, "nav": nav}
@@ -303,6 +317,12 @@ def _execute(
     if btc_4h and btc_4h.get("close") and btc_4h.get("filter") and btc_4h["close"] < btc_4h["filter"]:
         btc_bearish = True
 
+    r4h_all = {r.get("symbol"): r for r in radar_4h.get("rows", []) or []}
+    cum_risk, risk_parts = open_risk_usd(
+        account["positions"], mids,
+        {p["coin"]: hard_sl_for_tier(tier_for(p["coin"]), r4h_all.get(p["coin"]))[0] for p in account["positions"]})
+    result["open_risk"] = {"usd": round(cum_risk, 2), "pct_nav": round(cum_risk / equity * 100.0, 3) if equity > 0 else None,
+                           "positions": risk_parts}
     liq_safe, unsafe = _check_all_positions_liq_safe(account["positions"], radar_1h, radar_4h)
     if not liq_safe:
         result.update(status="fail_closed", message=f"Unsafe liquidation prices for: {', '.join(unsafe)}")
@@ -380,7 +400,7 @@ def _execute(
             skip(f"no Hard SL level ({sl_label})")
             continue
 
-        size_pct, leverage = _clamp_size_leverage(cand, decision, btc_bearish, coin_max)
+        size_pct, leverage = None, None
         try:  # fresh live mid at order time (fail-closed if unavailable)
             mids = hl.all_mids() or mids
         except Exception as e:  # noqa: BLE001
@@ -403,6 +423,12 @@ def _execute(
             continue
 
         limit_px = round_price(mid * (1 + slip / 100.0), sz_dec)
+        sz = size_by_risk(equity, limit_px, hard_sl, coin_max, decision.get("size_pct"), decision.get("leverage"),
+                          open_risk=cum_risk)
+        if not sz["ok"]:
+            skip(sz["reason"], mid=mid)
+            continue
+        size_pct, leverage = sz["margin_pct"], sz["leverage"]
         margin_usd = equity * size_pct / 100.0
         notional_target = margin_usd * leverage
         qty = order_qty(notional_target, limit_px, sz_dec)
@@ -417,10 +443,8 @@ def _execute(
         if not ok_cap:
             skip(f"Margin utilization {util:.1f}% > {MAX_MARGIN_UTILIZATION_PCT}% (cumulative)", size_pct=size_pct, leverage=leverage)
             continue
-        est_liq = isolated_liq_price_long(limit_px, leverage, coin_max)  # worst-case (highest) entry
-        if not liq_beyond_sl_long(est_liq, hard_sl):
-            skip(f"Isolated liq ${est_liq:.6g} not below Hard SL ${hard_sl:.6g}", size_pct=size_pct, leverage=leverage)
-            continue
+        est_liq = sz["liq"]  # worst-case (highest) entry; >= 2x SL distance below the Hard SL
+        risk_usd = qty * (limit_px - hard_sl)
 
         r1d = next((r for r in radar_1d.get("rows", []) if r.get("symbol") == symbol), None)
         upper_ref, upper_label = entry_upper_ref(cand, r1d, r4h)
@@ -440,10 +464,14 @@ def _execute(
             "sl_dist_pct": round(sl_dist_pct, 3), "estimated_liq": est_liq, "coin_max_leverage": coin_max,
             "margin_util_after_pct": round(util, 2), "btc_bearish": btc_bearish,
             "entry_upper_ref": upper_ref, "entry_upper_label": upper_label,
+            "risk_usd": round(risk_usd, 2), "risk_pct": round(risk_usd / equity * 100.0, 3),
+            "open_risk_pct_before": round(cum_risk / equity * 100.0, 3), "sizing_notes": sz.get("notes"),
+            "ai_size_pct": decision.get("size_pct"), "ai_leverage": decision.get("leverage"),
         }
 
         if not live:
             cum_margin += margin_usd
+            cum_risk += risk_usd
             result["actions"].append(intent)
             _log(
                 f"DRY_RUN would place: BUY {symbol} qty={qty} IOC limit={limit_px} (mid {mid}) {leverage}x isolated "
@@ -464,6 +492,7 @@ def _execute(
         st = r.get("status")
         if st == "executed":
             cum_margin += (r.get("filled_sz") or qty) * (r.get("avg_px") or limit_px) / leverage
+            cum_risk += (r.get("filled_sz") or qty) * max(0.0, (r.get("avg_px") or limit_px) - hard_sl)
             result["executed"].append(intent)
             log_entry(trade_id=trade_id, symbol=symbol, entry_type=entry_type, tier=tier,
                       trend_1d=cand.get("trend_1d", ""), trend_4h=cand.get("trend_4h", ""),

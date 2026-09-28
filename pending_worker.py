@@ -16,6 +16,11 @@ NAV snapshot once per run, price sanity (HL mid vs radar price <= 50%), minimum 
 max($10, 1% NAV), run_report (executed/skipped/downsized/failed). In the 4H job this runs only
 after the exit worker finished OK (exits -> re-fetch positions here -> entries); serve.py passes
 --after-exits <ts>.
+Sizing (GIIQ-SoT-2): exec_common.size_by_risk (3-5x isolated, margin 2-4% NAV, risk at Hard SL
+<= 1.5% NAV target 1%, total open risk <= 6% NAV, liq >= 2x SL distance below the Hard SL).
+ADD_ON keeps the existing position's leverage and additionally needs existing ROE >= +10% and
+coin margin after the add <= 5.5% NAV (exec_common.addon_gates); otherwise it stays pending with
+the reason in the run report.
 DRY_RUN unless EXEC_DRY_RUN=0 AND HL_API_PRIVATE_KEY (exec_common.is_live_mode). In DRY_RUN the
 store is not modified. Prints one JSON object; exit 0 ok, 1 error.
 """
@@ -38,6 +43,9 @@ from exec_common import (  # noqa: E402
     price_sane,
     radar_ref_price,
     radar_rowcount_ok,
+    addon_gates,
+    open_risk_usd,
+    size_by_risk,
     MAX_MARGIN_UTILIZATION_PCT,
     MIN_NOTIONAL_USD,
     MIN_SL_DIST_PCT,
@@ -164,6 +172,12 @@ def _run_pending(hl: Any = None, radar_1d: Optional[dict] = None, radar_4h: Opti
         except (TypeError, ValueError):
             pass
     liq_safe, unsafe = _check_all_positions_liq_safe(account["positions"], {}, radar_4h)
+    from mcap_tiers import tier_for
+    cum_risk, risk_parts = open_risk_usd(
+        account["positions"], mids,
+        {p["coin"]: hard_sl_for_tier(tier_for(p["coin"]), rows_4h.get(p["coin"]))[0] for p in account["positions"]})
+    res["open_risk"] = {"usd": round(cum_risk, 2), "pct_nav": round(cum_risk / equity * 100.0, 3) if equity > 0 else None,
+                        "positions": risk_parts}
     if log_entry_fn is None:
         from trade_log import log_entry as log_entry_fn  # noqa: N813
     slip = 0.5
@@ -236,17 +250,17 @@ def _run_pending(hl: Any = None, radar_1d: Optional[dict] = None, radar_4h: Opti
         if not hard_sl or hard_sl <= 0:
             note(f"no Hard SL level ({sl_label})")
             continue
-        lo_b, hi_b = PENDING_SIZE_BANDS[kind]
-        try:
-            size_pct = float(rec.get("size_pct") if rec.get("size_pct") is not None else lo_b)
-        except (TypeError, ValueError):
-            size_pct = lo_b
-        size_pct = max(lo_b, min(hi_b, size_pct))
-        leverage = clamp_leverage(rec.get("leverage", 2.0), coin_max)
-        lev_note = ""
-        if kind == ADD_ON and lev_by_coin.get(sym) and lev_by_coin[sym] != leverage:
-            lev_note = f" (approved {leverage}x -> existing isolated {lev_by_coin[sym]}x)"
-            leverage = clamp_leverage(lev_by_coin[sym], coin_max)
+        fixed_lev, room, lev_note = None, None, ""
+        if kind == ADD_ON:
+            ok_add, why_add, room = addon_gates(pos_by_coin.get(sym), equity)
+            if not ok_add:
+                note(f"in zone but {why_add}")
+                continue
+            fixed_lev = lev_by_coin.get(sym) or (pos_by_coin.get(sym) or {}).get("leverage")
+            if not fixed_lev:
+                note("ADD_ON: existing position leverage unknown")
+                continue
+            lev_note = f" (ADD_ON keeps existing isolated {fixed_lev}x; {why_add})"
         ok_px, _diff, why_px = price_sane(mid, radar_ref_price(rows_4h.get(sym), rows_1d.get(sym)))
         if not ok_px:
             note(f"in zone but {why_px}")
@@ -256,6 +270,13 @@ def _run_pending(hl: Any = None, radar_1d: Optional[dict] = None, radar_4h: Opti
             note(f"in zone but SL distance {sl_dist:.2f}% to {sl_label} {hard_sl:.6g} < {MIN_SL_DIST_PCT}%")
             continue
         limit_px = round_price(mid * (1 + slip / 100.0), sz_dec)
+        ref_px = max(limit_px, (pos_by_coin.get(sym) or {}).get("entry_px") or 0)  # add-on: worst of both
+        sz = size_by_risk(equity, limit_px, hard_sl, coin_max, rec.get("size_pct"), rec.get("leverage"),
+                          open_risk=cum_risk, fixed_leverage=fixed_lev, max_margin_pct=room, liq_ref_px=ref_px)
+        if not sz["ok"]:
+            note(f"in zone but {sz['reason']}")
+            continue
+        size_pct, leverage = sz["margin_pct"], sz["leverage"]
         qty = order_qty(equity * size_pct / 100.0 * leverage, limit_px, sz_dec)
         notional = qty * mid
         min_usd = min_order_usd(equity)
@@ -267,20 +288,20 @@ def _run_pending(hl: Any = None, radar_1d: Optional[dict] = None, radar_4h: Opti
         if not ok_cap:
             note(f"margin utilization {util:.1f}% > {MAX_MARGIN_UTILIZATION_PCT}% (cumulative)")
             continue
-        ref_px = max(limit_px, (pos_by_coin.get(sym) or {}).get("entry_px") or 0)  # add-on: worst of both
-        est_liq = isolated_liq_price_long(ref_px, leverage, coin_max)
-        if not liq_beyond_sl_long(est_liq, hard_sl):
-            note(f"isolated liq {est_liq:.6g} not below Hard SL {hard_sl:.6g}")
-            continue
+        est_liq = sz["liq"]
+        risk_usd = qty * (limit_px - hard_sl)
         intent = {"id": rec["id"], "symbol": sym, "kind": kind, "mid": mid, "limit_px": limit_px, "qty": qty,
                   "size_pct": size_pct, "leverage": leverage, "notional_usd": round(notional, 2),
                   "margin_usd": round(margin_usd, 2), "hard_sl": hard_sl, "hard_sl_label": sl_label,
                   "sl_dist_pct": round(sl_dist, 3), "estimated_liq": est_liq, "margin_util_after_pct": round(util, 2),
                   "zone": [bnd["lower"], bnd["filter"]], "note": lev_note.strip(),
+                  "risk_usd": round(risk_usd, 2), "risk_pct": round(risk_usd / equity * 100.0, 3),
+                  "open_risk_pct_before": round(cum_risk / equity * 100.0, 3), "sizing_notes": sz.get("notes"),
                   "approved_size_pct": rec.get("size_pct"), "approved_leverage": rec.get("leverage")}
         trade_id = f"{sym}_{kind}_{now.strftime('%Y%m%d_%H%M%S')}"
         if not live:
             cum_margin += margin_usd
+            cum_risk += risk_usd
             check["result"] = "would_fill"
             res["filled"].append({**intent, "dry_run": True})
             _log(f"DRY_RUN would fill {kind} {sym} qty={qty} limit={limit_px} {leverage}x | SL {hard_sl}{lev_note}")
@@ -292,6 +313,7 @@ def _run_pending(hl: Any = None, radar_1d: Optional[dict] = None, radar_4h: Opti
         st = r.get("status")
         if st == "executed":
             cum_margin += (r.get("filled_sz") or qty) * (r.get("avg_px") or limit_px) / leverage
+            cum_risk += (r.get("filled_sz") or qty) * max(0.0, (r.get("avg_px") or limit_px) - hard_sl)
             mark("filled", f"filled {r.get('filled_sz')} @ {r.get('avg_px')}")
             rec["fill"] = {"qty": r.get("filled_sz"), "avg_px": r.get("avg_px"), "sl_oid": r.get("sl_oid"),
                            "hard_sl": hard_sl, "leverage": leverage, "at": now.isoformat()}

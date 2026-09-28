@@ -180,7 +180,8 @@ class TestWorker(unittest.TestCase):
     def radars(self, d1=None, h4=None):
         ts = (NOW - timedelta(minutes=5)).isoformat()
         r1d = {"ts": ts, "rows": [dict(symbol="AAA", **(d1 or _row(0.80, 0.90, 1.00)))]}
-        r4h = {"ts": ts, "rows": [dict(symbol="AAA", **(h4 or _row(0.70, 0.75, 0.95)))]}
+        # 4H Filter 0.88 = tiny Hard SL ~2.7% below mid 0.9 (SoT-2 needs liq >= 2x SL distance below it)
+        r4h = {"ts": ts, "rows": [dict(symbol="AAA", **(h4 or _row(0.85, 0.88, 0.95)))]}
         return r1d, r4h
 
     def entry(self, kind=pe.CONTINUATION, size=3, lev=2, tier="tiny", setup_close=0.89):
@@ -203,8 +204,10 @@ class TestWorker(unittest.TestCase):
         self.assertEqual(res["status"], "success", res)
         self.assertEqual([c[0] for c in hl.calls], ["set_leverage", "open_long_ioc", "place_stop_loss"])
         f = res["filled"][0]
-        self.assertEqual(f["size_pct"], 4.0)
-        self.assertEqual(f["hard_sl"], 0.75)                  # tiny -> 4H Filter
+        self.assertEqual(f["size_pct"], 4.0)                  # SoT-2 hard cap 4%
+        self.assertEqual(f["leverage"], 3)                    # AI 2x lifted to the SoT-2 3x floor
+        self.assertEqual(f["hard_sl"], 0.88)                  # tiny -> 4H Filter
+        self.assertLessEqual(f["risk_pct"], 1.5)
         self.assertEqual(ents[0]["status"], "filled")
         self.assertEqual(self.log[0]["entry_type"], "CONTINUATION")
         # idempotent: second run does nothing
@@ -249,7 +252,8 @@ class TestWorker(unittest.TestCase):
         self.assertIn("stale", res["checked"][0]["reason"])
 
     def test_add_on_uses_4h_zone_and_existing_leverage(self):
-        pos = {"coin": "AAA", "szi": "50", "entryPx": "0.9", "liquidationPx": "0.4"}
+        pos = {"coin": "AAA", "szi": "50", "entryPx": "0.9", "liquidationPx": "0.4",
+               "returnOnEquity": "0.25", "marginUsed": "15"}  # ROE +25%, coin margin 1.5% NAV
         hl = FakeHL(mids={"AAA": 1.01}, positions=[pos], lev=3)
         ents = self.entry(kind=pe.ADD_ON, lev=2, tier="large")  # large: Hard SL = 4H Lower 0.95
         # 4H zone [0.95, 1.00]; bar low 0.99 touched, close 1.02 > Lower; mid 1.01 <= 1.0*1.01
@@ -260,13 +264,40 @@ class TestWorker(unittest.TestCase):
 
     def test_add_on_small_tiny_blocked_by_sl_distance(self):
         # Small/Tiny Hard SL = 4H Filter = top of the ADD_ON zone -> SL distance < 1.5% -> never fills (fail-closed)
-        pos = {"coin": "AAA", "szi": "50", "entryPx": "0.9", "liquidationPx": "0.4"}
+        pos = {"coin": "AAA", "szi": "50", "entryPx": "0.9", "liquidationPx": "0.4",
+               "returnOnEquity": "0.25", "marginUsed": "15"}
         hl = FakeHL(mids={"AAA": 1.0}, positions=[pos], lev=2)
         ents = self.entry(kind=pe.ADD_ON, tier="tiny")
         res = self.run_w(hl, ents, bar(0.99, 1.02), h4=_row(0.95, 1.00, 1.03))
         self.assertEqual(hl.calls, [])
         self.assertIn("SL distance", res["checked"][0]["reason"])
         self.assertEqual(ents[0]["status"], "pending")
+
+    def _add_on_run(self, roe, margin_used):
+        pos = {"coin": "AAA", "szi": "50", "entryPx": "0.9", "liquidationPx": "0.4",
+               "returnOnEquity": str(roe), "marginUsed": str(margin_used)}
+        hl = FakeHL(mids={"AAA": 1.01}, positions=[pos], lev=3)
+        ents = self.entry(kind=pe.ADD_ON, lev=2, tier="large")
+        res = self.run_w(hl, ents, bar(0.99, 1.02), h4=_row(0.95, 1.00, 1.03), d1=_row(0.5, 0.6, 1.0))
+        return hl, ents, res
+
+    def test_add_on_requires_roe_10pct(self):
+        hl, ents, res = self._add_on_run(0.08, 15)  # ROE +8%
+        self.assertEqual(hl.calls, [])
+        self.assertEqual(ents[0]["status"], "pending")
+        self.assertIn("ROE 8.0% < +10%", res["checked"][0]["reason"])
+        self.assertTrue(any("ROE 8.0%" in x["reason"] for x in res["run_report"]["skipped"]))
+
+    def test_add_on_coin_exposure_cap_5_5pct(self):
+        hl, ents, res = self._add_on_run(0.30, 40)  # 4.0% NAV used + 2% min add > 5.5%
+        self.assertEqual(hl.calls, [])
+        self.assertIn("5.5% cap", res["checked"][0]["reason"])
+
+    def test_add_on_margin_limited_by_exposure_room(self):
+        hl, ents, res = self._add_on_run(0.30, 30)  # 3.0% used -> room 2.5% (< 4% cap)
+        self.assertEqual(ents[0]["status"], "filled", res["checked"])
+        self.assertAlmostEqual(res["filled"][0]["size_pct"], 2.5, 3)
+        self.assertEqual(hl.calls[0], ("set_leverage", "AAA", 3))
 
     def test_live_state_persisted_bar_n_then_n1_fill(self):
         # no setup yet: first run sets bar N (no order); next run (N+1) fills

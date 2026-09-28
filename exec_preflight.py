@@ -31,6 +31,8 @@ sys.path.insert(0, str(ROOT))
 
 from exec_common import (  # noqa: E402
     SOT_ID,
+    SOT2_MAX_LEV,
+    SOT2_MIN_LEV,
     min_order_usd,
     nav_snapshot,
     radar_rowcount_ok,
@@ -164,9 +166,13 @@ def run_preflight(hl: Any = None, signed_probe: bool = True, now: Optional[datet
                 if not cm:
                     add(f"lev:{sym}", False, "not in HL meta (delisted/unknown)", blocking=False)
                     continue
-                lev = clamp_leverage(rec.get("leverage", 2.0), cm.get("maxLeverage"))
-                add(f"lev:{sym}", True, f"{lev}x isolated <= maxLeverage {cm.get('maxLeverage'):g}"
-                    + (" (already held -> executor will skip)" if sym in held else ""), blocking=False)
+                ml = cm.get("maxLeverage") or 0
+                add(f"lev:{sym}", ml >= SOT2_MIN_LEV,
+                    f"{SOT_ID}: isolated {SOT2_MIN_LEV}-{min(SOT2_MAX_LEV, int(ml)) if ml else '?'}x chosen by risk at order "
+                    f"time (AI max {rec.get('leverage')}x / {rec.get('size_pct')}%; coin maxLeverage {ml:g})"
+                    + (" (already held -> executor will skip)" if sym in held else "")
+                    + ("" if ml >= SOT2_MIN_LEV else f" -> maxLeverage < {SOT2_MIN_LEV}x: executor will SKIP"),
+                    blocking=False)
         except Exception as e:  # noqa: BLE001
             add("meta", False, f"HL meta failed: {e}", blocking=False)
         # At-entry Upper guard preview (the executor re-checks with a fresh mid at order time)

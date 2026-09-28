@@ -33,9 +33,10 @@ def _radar(n, requested=None):
 
 class TestSotId(unittest.TestCase):
     def test_sot_id(self):
-        self.assertEqual(ec.SOT_ID, "GIIQ-SoT-1")
+        self.assertEqual(ec.SOT_ID, "GIIQ-SoT-2")
         doc = (ROOT / "docs" / "SOT_CHANGELOG.md").read_text(encoding="utf-8")
         self.assertIn("GIIQ-SoT-1", doc)
+        self.assertIn("GIIQ-SoT-2", doc)
         self.assertTrue((ROOT / "docs" / "reference" / "signum_workflow_reference.md").is_file())
 
 
@@ -116,7 +117,7 @@ class TestRunReport(unittest.TestCase):
                "actions": [], "alerts": []}
         rep = ec.build_run_report("executor", res, {"nav": 1690.0, "source": "x"},
                                   {"AAA": {"size_pct": 6, "leverage": 3}})
-        self.assertEqual(rep["sot"], "GIIQ-SoT-1")
+        self.assertEqual(rep["sot"], ec.SOT_ID)
         self.assertEqual([x["symbol"] for x in rep["executed"]], ["AAA"])
         self.assertEqual(rep["executed"][0]["px"], 1.01)
         self.assertEqual([x["symbol"] for x in rep["skipped"]], ["BBB"])
@@ -124,6 +125,73 @@ class TestRunReport(unittest.TestCase):
         self.assertIn("size 6% -> 4%", rep["downsized"][0]["reason"])
         self.assertIn("leverage 3x -> 2x", rep["downsized"][0]["reason"])
         self.assertEqual(rep["nav"], 1690.0)
+
+
+class TestSot2Sizing(unittest.TestCase):
+    """GIIQ-SoT-2 (MMT 2026-09-28): 3-5x isolated, margin 2-4% NAV, risk <= 1.5% (target 1%),
+    total open risk <= 6%, liq >= 2x SL distance below Hard SL, AI size/lev = maximums."""
+
+    def test_target_one_pct_risk_at_5x(self):
+        r = ec.size_by_risk(1000, 100.0, 95.0, 10)  # SL 5%, 5x liq frac ~15.8% >= 3x5%
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(r["leverage"], 5)
+        self.assertAlmostEqual(r["margin_pct"], 4.0)
+        self.assertAlmostEqual(r["risk_pct"], 1.0)
+
+    def test_small_sl_capped_at_4pct_margin(self):
+        r = ec.size_by_risk(1000, 100.0, 98.0, 10)  # SL 2%
+        self.assertEqual((r["leverage"], r["margin_pct"]), (5, 4.0))
+        self.assertAlmostEqual(r["risk_pct"], 0.4)
+
+    def test_liq_buffer_steps_leverage_down(self):
+        r = ec.size_by_risk(1000, 100.0, 94.0, 10)  # SL 6%: 5x/4x liq too close -> 4x? 3x
+        self.assertTrue(r["ok"], r)
+        self.assertLess(r["leverage"], 5)
+        self.assertTrue(ec.liq_buffer_ok(100.0, 94.0, r["liq"]))
+        self.assertTrue(any("5x liq" in n for n in r["notes"]))
+
+    def test_impossible_at_3x_skips(self):
+        r = ec.size_by_risk(1000, 100.0, 90.0, 10)  # SL 10%: even 3x liq too close
+        self.assertFalse(r["ok"])
+        self.assertIn("SoT-2 sizing impossible", r["reason"])
+
+    def test_ai_values_are_maximums_inside_band(self):
+        r = ec.size_by_risk(1000, 100.0, 98.0, 10, ai_size_pct=3, ai_leverage=4)
+        self.assertEqual((r["leverage"], r["margin_pct"]), (4, 3.0))
+        r = ec.size_by_risk(1000, 100.0, 98.0, 10, ai_size_pct=1, ai_leverage=2)  # legacy 2x -> 3x floor
+        self.assertEqual((r["leverage"], r["margin_pct"]), (3, 2.0))
+        self.assertEqual(len(r["notes"]), 2)
+
+    def test_total_open_risk_cap(self):
+        r = ec.size_by_risk(1000, 100.0, 95.0, 10, open_risk=55.0)  # room 0.5%: 5x at 2% margin = 0.5% fits
+        self.assertEqual((r["leverage"], r["margin_pct"]), (5, 2.0))
+        self.assertAlmostEqual(r["risk_pct"], 0.5)
+        r = ec.size_by_risk(1000, 100.0, 95.0, 10, open_risk=58.0)  # room 0.2% < 3x x 2% x 5% = 0.3%
+        self.assertFalse(r["ok"])
+        self.assertIn("total-risk room", r["reason"])
+        r = ec.size_by_risk(1000, 100.0, 98.0, 10, open_risk=58.0)  # SL 2%: 5x x 2% x 2% = 0.2% fits
+        self.assertTrue(r["ok"])
+        self.assertLessEqual(r["risk_pct"] + 5.8, 6.0 + 1e-9)
+
+    def test_coin_max_below_3x_skips(self):
+        self.assertFalse(ec.size_by_risk(1000, 100.0, 98.0, 2)["ok"])
+
+    def test_fixed_leverage_for_add_on(self):
+        r = ec.size_by_risk(1000, 100.0, 97.0, 10, fixed_leverage=2)
+        self.assertEqual(r["leverage"], 2)
+
+    def test_addon_gates(self):
+        self.assertFalse(ec.addon_gates({"roe_pct": 9.9, "margin_used": 10}, 1000)[0])
+        self.assertFalse(ec.addon_gates({"roe_pct": 20, "margin_used": 36}, 1000)[0])  # 3.6% + 2% > 5.5%
+        ok, _why, room = ec.addon_gates({"roe_pct": 20, "margin_used": 30}, 1000)
+        self.assertTrue(ok)
+        self.assertAlmostEqual(room, 2.5)
+        self.assertFalse(ec.addon_gates(None, 1000)[0])
+
+    def test_open_risk(self):
+        tot, parts = ec.open_risk_usd([{"coin": "MON", "side": "LONG", "size": 7232}], {"MON": 0.02722},
+                                      {"MON": 0.025654})
+        self.assertAlmostEqual(tot, 7232 * (0.02722 - 0.025654), 6)
 
 
 class TestExecutorGuardrails(EnvMixin, unittest.TestCase):
@@ -138,16 +206,16 @@ class TestExecutorGuardrails(EnvMixin, unittest.TestCase):
     def test_rowcount_fail_closed_before_hl(self):
         hl = FakeHL(meta=self.META, mids={"AAA": 1.0})
         with patch.dict(os.environ, {"EXEC_RADAR_MIN_ROWS": "120"}):
-            res = self._run(hl, _cands(_cand("AAA", upper_1d=0.99)), r4h=_radar(170), r1d=_radar(50))
+            res = self._run(hl, _cands(_cand("AAA", filt=0.97, lower=0.95, upper_1d=0.99)), r4h=_radar(170), r1d=_radar(50))
         self.assertEqual(res["status"], "fail_closed")
         self.assertIn("1D radar has 50 rows", res["message"])
         self.assertEqual(hl.calls, [])
-        self.assertEqual(res["sot"], "GIIQ-SoT-1")
+        self.assertEqual(res["sot"], ec.SOT_ID)
         self.assertEqual(res["run_report"]["skipped"][0]["symbol"], "AAA")
 
     def test_price_sanity_skip(self):
         hl = FakeHL(meta=self.META, mids={"AAA": 2.0})  # candidate/radar close 1.0 -> +100%
-        res = self._run(hl, _cands(_cand("AAA", upper_1d=0.99)))
+        res = self._run(hl, _cands(_cand("AAA", filt=0.97, lower=0.95, upper_1d=0.99)))
         self.assertEqual(hl.calls, [])
         self.assertIn("price sanity", res["skipped"][0]["reason"])
         self.assertIn("price sanity", res["run_report"]["skipped"][0]["reason"])
@@ -155,18 +223,18 @@ class TestExecutorGuardrails(EnvMixin, unittest.TestCase):
     def test_min_order_one_pct_nav(self):
         hl = FakeHL(meta=self.META, mids={"AAA": 1.0})
         with patch.object(executor, "min_order_usd", side_effect=lambda nav: nav * 0.5):
-            res = self._run(hl, _cands(_cand("AAA", upper_1d=0.99)))
+            res = self._run(hl, _cands(_cand("AAA", filt=0.97, lower=0.95, upper_1d=0.99)))
         self.assertEqual(hl.calls, [])
         self.assertIn("< minimum $500.00", res["skipped"][0]["reason"])
 
     def test_nav_snapshot_and_downsized_report(self):
         hl = FakeHL(equity=1000, meta=self.META, mids={"AAA": 1.0})
-        res = self._run(hl, _cands(_cand("AAA", upper_1d=0.99)))  # DRY_RUN
+        res = self._run(hl, _cands(_cand("AAA", filt=0.97, lower=0.95, upper_1d=0.99)))  # DRY_RUN
         self.assertEqual(res["nav_snapshot"]["nav"], 1000.0)
         rep = res["run_report"]
         self.assertEqual(rep["executed"][0]["symbol"], "AAA")
         self.assertTrue(rep["executed"][0]["dry_run"])
-        self.assertIn("size 10% -> 8%", rep["downsized"][0]["reason"])  # Primary band 4-8%
+        self.assertIn("size 10% -> 4%", rep["downsized"][0]["reason"])  # SoT-2 hard cap 4%
 
 
 class TestPendingGuardrails(EnvMixin, unittest.TestCase):
@@ -181,7 +249,7 @@ class TestPendingGuardrails(EnvMixin, unittest.TestCase):
         self.assertEqual(res["status"], "fail_closed")
         self.assertEqual(entries, before)
         self.assertEqual(hl.calls, [])
-        self.assertEqual(res["run_report"]["sot"], "GIIQ-SoT-1")
+        self.assertEqual(res["run_report"]["sot"], ec.SOT_ID)
 
     def test_sequence_recorded(self):
         res = pending_worker.run_pending(hl=FakeHL(), radar_1d={"rows": []}, radar_4h={"rows": []}, now=NOW,
@@ -225,7 +293,7 @@ class TestServeOrderAndReport(unittest.TestCase):
                              now=now)
         s._record_run_report("pending_entries", {"mode": "LIVE", "status": "error", "message": "boom"}, now=now)
         rr = s._today_run_report(now)
-        self.assertEqual(rr["sot"], "GIIQ-SoT-1")
+        self.assertEqual(rr["sot"], ec.SOT_ID)
         self.assertEqual(rr["date"], "2026-09-28")
         self.assertEqual(len(rr["runs"]), 2)
         self.assertEqual(rr["executed"][0]["symbol"], "AAA")
@@ -235,10 +303,10 @@ class TestServeOrderAndReport(unittest.TestCase):
         s = self.serve
         with patch.object(s, "_get_hl_cached", return_value={"fetch_error": True, "hl_perp": {}, "hl_spot": {}}):
             p = s._build_desk_data_payload("test", kind="live")
-        self.assertEqual(p["sot"], "GIIQ-SoT-1")
+        self.assertEqual(p["sot"], ec.SOT_ID)
         self.assertIn("run_report", p)
         self.assertIn("exec_mode", p)
-        self.assertEqual(s._exec_mode()["sot"], "GIIQ-SoT-1")
+        self.assertEqual(s._exec_mode()["sot"], ec.SOT_ID)
 
 
 if __name__ == "__main__":

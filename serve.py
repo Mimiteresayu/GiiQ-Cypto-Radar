@@ -650,12 +650,17 @@ def _enhance_candidates(candidates: list, account: dict, meta: dict) -> list:
     except (TypeError, ValueError, AttributeError):
         equity = 0.0
     out = []
+    from exec_common import size_by_risk
     for c in candidates:
         coin_max = (meta.get(c.get("symbol")) or {}).get("maxLeverage")
-        size_pct = _suggested_size_pct(c.get("type", "Base"))
-        lev = clamp_leverage(2.0, coin_max)
         hard_sl, sl_label = hard_sl_for_tier(c.get("tier", ""), {"lower": c.get("lower_4h"), "filter": c.get("filter_4h")})
         close_1d = c.get("close_1d") or 0
+        # GIIQ-SoT-2 suggestion (the executor re-sizes at order time with live mid + open risk)
+        sz = size_by_risk(equity, close_1d, hard_sl, coin_max) if (equity and close_1d and hard_sl) else {"ok": False}
+        if sz.get("ok"):
+            size_pct, lev = round(sz["margin_pct"], 2), int(sz["leverage"])
+        else:
+            size_pct, lev = 2.0, clamp_leverage(3.0, coin_max)
         liq = isolated_liq_price_long(close_1d, lev, coin_max) if close_1d else None
         margin = equity * size_pct / 100.0 if equity else None
         out.append({
@@ -670,6 +675,8 @@ def _enhance_candidates(candidates: list, account: dict, meta: dict) -> list:
             "hard_sl_label": sl_label,
             "estimated_liq_price": liq,
             "liq_beyond_sl": liq_beyond_sl_long(liq, hard_sl) if liq is not None else None,
+            "sot2_sizing": ({"ok": True, "risk_pct": sz.get("risk_pct")} if sz.get("ok")
+                            else {"ok": False, "reason": sz.get("reason") or "no NAV / price / Hard SL"}),
         })
     return out
 
@@ -1039,6 +1046,7 @@ def _build_desk_data_payload(event: str = "", now: datetime | None = None, kind:
                         "size_pct": c.get("suggested_size_pct"), "lev": c.get("suggested_leverage"),
                         "max_lev": c.get("coin_max_leverage"), "liq": sig(c.get("estimated_liq_price")),
                         "liq_beyond_sl": c.get("liq_beyond_sl"), "held": c.get("already_held"),
+                        "sot2": c.get("sot2_sizing"),
                     })
     except Exception as e:
         cand_meta["error"] = str(e)

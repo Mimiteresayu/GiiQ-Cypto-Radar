@@ -21,7 +21,7 @@ from typing import Any, Dict, Optional, Tuple
 # ---------------------------------------------------------------- constants
 # SoT version id. Bump (GIIQ-SoT-2, ...) whenever an executor rule changes and add an entry to
 # docs/SOT_CHANGELOG.md. Shown in the cockpit header, executor/pending run reports and DESK_DATA.
-SOT_ID = "GIIQ-SoT-1"
+SOT_ID = "GIIQ-SoT-2"
 
 MIN_NOTIONAL_USD = 10.0  # Hyperliquid minimum order value (USD)
 MIN_LEVERAGE = 1.0
@@ -44,6 +44,24 @@ RADAR_MIN_UNIVERSE_FRAC = 0.85
 PRICE_SANITY_MAX_DIFF_PCT = 50.0
 # Minimum order: notional must be >= max(HL minimum $10, 1% of the run's NAV snapshot).
 MIN_ORDER_NAV_PCT = 1.0
+
+# ---------------------------------------------------------------- GIIQ-SoT-2 sizing (MMT 2026-09-28)
+# Leverage 3-5x isolated; margin 2-4% NAV per coin (hard cap 4%); leverage chosen by risk:
+# risk at Hard SL (notional x SL distance) <= 1.5% NAV per trade (target 1%), total open risk
+# <= 6% NAV, isolated liq beyond the Hard SL by >= 2x the SL distance. Step leverage down (min
+# 3x) / reduce size; impossible at 3x / 2% margin -> skip. ADD_ON keeps the existing leverage.
+# AI size/leverage are maximums inside these bands.
+SOT2_MIN_LEV = 3
+SOT2_MAX_LEV = 5
+SOT2_MIN_MARGIN_PCT = 2.0
+SOT2_MAX_MARGIN_PCT = 4.0
+SOT2_TARGET_RISK_PCT = 1.0
+SOT2_MAX_RISK_PCT = 1.5
+SOT2_MAX_TOTAL_RISK_PCT = 6.0
+SOT2_LIQ_SL_MULT = 2.0  # (Hard SL - liq) >= 2 x (entry - Hard SL)
+# ADD_ON (pending pullback add to an existing LONG) extra gates
+ADDON_MIN_ROE_PCT = 10.0        # existing position ROE >= +10% at fill time
+ADDON_MAX_COIN_MARGIN_PCT = 5.5  # coin margin (existing + add) <= 5.5% NAV
 
 
 def is_live_mode() -> bool:
@@ -362,6 +380,121 @@ def build_run_report(run: str, result: Dict[str, Any], nav: Optional[dict] = Non
         for sym in sorted(approved):
             rep["skipped"].append({"symbol": sym, "reason": f"run {result.get('status')}: {result.get('message')}"})
     return rep
+
+
+# ---------------------------------------------------------------- GIIQ-SoT-2 sizing
+def liq_buffer_ok(entry_px: float, hard_sl: float, liq_px: Optional[float], mult: float = SOT2_LIQ_SL_MULT) -> bool:
+    """LONG: liq must sit below the Hard SL by >= mult x the SL distance (entry - Hard SL)."""
+    if liq_px is None or not entry_px or not hard_sl or entry_px <= hard_sl:
+        return False
+    return (hard_sl - liq_px) >= mult * (entry_px - hard_sl) - 1e-12
+
+
+def open_risk_usd(positions: list, mids: Dict[str, float], hard_sl_by_coin: Dict[str, Optional[float]]) -> Tuple[float, list]:
+    """Total open risk = sum over LONG positions of size x max(0, mid - Hard SL).
+    Unknown Hard SL -> fall back to size x (mid - liq) (or the full notional if liq unknown)."""
+    total, parts = 0.0, []
+    for p in positions or []:
+        if p.get("side") != "LONG":
+            continue
+        coin, size = p.get("coin"), float(p.get("size") or 0)
+        px = _f((mids or {}).get(coin)) or _f(p.get("entry_px")) or 0.0
+        sl = hard_sl_by_coin.get(coin)
+        if sl:
+            r = size * max(0.0, px - sl)
+        elif _f(p.get("liquidation_px")):
+            r = size * max(0.0, px - float(p["liquidation_px"]))
+        else:
+            r = size * px
+        total += r
+        parts.append({"coin": coin, "risk_usd": round(r, 2), "hard_sl": sl})
+    return total, parts
+
+
+def size_by_risk(nav: float, entry_px: float, hard_sl: float, coin_max_leverage: Optional[float],
+                 ai_size_pct: Any = None, ai_leverage: Any = None, open_risk: float = 0.0,
+                 fixed_leverage: Optional[int] = None, max_margin_pct: Optional[float] = None,
+                 liq_ref_px: Optional[float] = None) -> Dict[str, Any]:
+    """GIIQ-SoT-2: choose (leverage, margin %) for a LONG entry.
+
+    - margin band 2-4% NAV (hard cap 4%); the AI size is a maximum inside the band (an AI value
+      below 2% is lifted to the 2% floor, above 4% capped). `max_margin_pct` can lower the cap
+      further (ADD_ON 5.5% coin exposure room).
+    - leverage 3-5x and <= coin maxLeverage; the AI leverage is a maximum inside the band (an AI
+      value below 3x, e.g. the legacy 2x default, is lifted to the 3x floor). fixed_leverage
+      (ADD_ON = existing position leverage) disables stepping.
+    - For L from the max down to 3x: skip L if isolated liq is not below the Hard SL by >= 2x
+      the SL distance; margin = clamp(target-1%-risk margin, 2%, cap); accept if risk <= 1.5% NAV
+      and open risk + risk <= 6% NAV (margin is reduced toward 2% to fit the 6% total).
+    Returns {"ok", "leverage", "margin_pct", "risk_pct", "notional_usd", "liq", "reason", "notes"}."""
+    notes: list = []
+    if not nav or nav <= 0 or not entry_px or entry_px <= 0 or not hard_sl or hard_sl <= 0 or hard_sl >= entry_px:
+        return {"ok": False, "reason": "sizing inputs invalid (NAV / entry / Hard SL)", "notes": notes}
+    sl = (entry_px - hard_sl) / entry_px
+    cap = SOT2_MAX_MARGIN_PCT
+    a_sz = _f(ai_size_pct)
+    if a_sz is not None and a_sz > 0:
+        if a_sz < SOT2_MIN_MARGIN_PCT:
+            notes.append(f"AI size {a_sz:g}% < {SOT2_MIN_MARGIN_PCT:g}% floor -> {SOT2_MIN_MARGIN_PCT:g}%")
+        cap = min(cap, max(SOT2_MIN_MARGIN_PCT, a_sz))
+    if max_margin_pct is not None:
+        cap = min(cap, max_margin_pct)
+    if cap < SOT2_MIN_MARGIN_PCT - 1e-9:
+        return {"ok": False, "reason": f"margin room {cap:.2f}% < {SOT2_MIN_MARGIN_PCT:g}% minimum", "notes": notes}
+    coin_cap = int(math.floor(float(coin_max_leverage))) if coin_max_leverage and coin_max_leverage > 0 else SOT2_MAX_LEV
+    if fixed_leverage:
+        levs = [int(fixed_leverage)]
+    else:
+        a_lev = _f(ai_leverage)
+        l_max = SOT2_MAX_LEV
+        if a_lev is not None and a_lev > 0:
+            if a_lev < SOT2_MIN_LEV:
+                notes.append(f"AI leverage {a_lev:g}x < {SOT2_MIN_LEV}x floor -> {SOT2_MIN_LEV}x")
+            l_max = min(l_max, max(SOT2_MIN_LEV, int(math.floor(a_lev + 1e-9))))
+        l_max = min(l_max, coin_cap)
+        if l_max < SOT2_MIN_LEV:
+            return {"ok": False, "reason": f"coin maxLeverage {coin_max_leverage} < {SOT2_MIN_LEV}x minimum", "notes": notes}
+        levs = list(range(l_max, SOT2_MIN_LEV - 1, -1))
+    room_total = SOT2_MAX_TOTAL_RISK_PCT - open_risk / nav * 100.0
+    fails = []
+    for L in levs:
+        liq = isolated_liq_price_long(liq_ref_px or entry_px, L, coin_max_leverage)
+        if not liq_buffer_ok(entry_px, hard_sl, liq):
+            fails.append(f"{L}x liq {liq:.6g} not >= {SOT2_LIQ_SL_MULT:g}x SL distance below Hard SL")
+            continue
+        per_pct_risk = L * sl  # risk % NAV per 1% margin
+        m = SOT2_TARGET_RISK_PCT / per_pct_risk
+        m = max(SOT2_MIN_MARGIN_PCT, min(cap, m))
+        m = min(m, SOT2_MAX_RISK_PCT / per_pct_risk, room_total / per_pct_risk)
+        if m < SOT2_MIN_MARGIN_PCT - 1e-9:
+            r2 = SOT2_MIN_MARGIN_PCT * per_pct_risk
+            fails.append(f"{L}x at {SOT2_MIN_MARGIN_PCT:g}% margin risk {r2:.2f}% NAV"
+                         + (f" > {SOT2_MAX_RISK_PCT:g}%" if r2 > SOT2_MAX_RISK_PCT else
+                            f" > total-risk room {room_total:.2f}% (open {open_risk / nav * 100:.2f}%)"))
+            continue
+        risk = m * per_pct_risk
+        return {"ok": True, "leverage": L, "margin_pct": round(m, 4), "risk_pct": round(risk, 4),
+                "notional_usd": nav * m / 100.0 * L, "liq": liq, "sl_dist_pct": round(sl * 100, 3),
+                "open_risk_pct_before": round(open_risk / nav * 100.0, 3), "notes": notes + fails}
+    return {"ok": False, "reason": "SoT-2 sizing impossible: " + "; ".join(fails), "notes": notes}
+
+
+def addon_gates(pos: Optional[dict], nav: float) -> Tuple[bool, str, float]:
+    """ADD_ON: existing ROE >= +10% and room under the 5.5% NAV coin-margin cap.
+    Returns (ok, reason, max_add_margin_pct)."""
+    if not pos:
+        return False, "ADD_ON base position not found", 0.0
+    roe = _f(pos.get("roe_pct"))
+    if roe is None:
+        return False, "ADD_ON: existing ROE unknown", 0.0
+    if roe < ADDON_MIN_ROE_PCT:
+        return False, f"ADD_ON: existing ROE {roe:.1f}% < +{ADDON_MIN_ROE_PCT:g}%", 0.0
+    used_pct = (_f(pos.get("margin_used")) or 0.0) / nav * 100.0 if nav else 100.0
+    room = ADDON_MAX_COIN_MARGIN_PCT - used_pct
+    if room < SOT2_MIN_MARGIN_PCT - 1e-9:
+        return False, (f"ADD_ON: coin margin {used_pct:.2f}% NAV + min add {SOT2_MIN_MARGIN_PCT:g}% > "
+                       f"{ADDON_MAX_COIN_MARGIN_PCT:g}% cap"), room
+    return True, f"ROE {roe:.1f}%, coin margin {used_pct:.2f}% NAV (room {room:.2f}%)", room
 
 
 # ---------------------------------------------------------------- misc
