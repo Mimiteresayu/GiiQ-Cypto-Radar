@@ -187,6 +187,10 @@ def backfill(days: int = 150) -> dict:
     without look-ahead (trend w/o 1H, extension, rel_strength, liquidity, btc_regime), then fill 7-day
     outcomes. Written to a SEPARATE ledger (giiq_ledger_backfill.db) so it never touches live rows.
     Not reconstructable (skipped): crowding (funding history), narrative, concentration, smart_money."""
+    try:  # lowest CPU priority: never compete with the scans / executor in the same service
+        os.nice(15)
+    except (OSError, AttributeError):
+        pass
     import scan_gc_radar as sgr
     try:
         from mcap_tiers import tier_for
@@ -278,15 +282,55 @@ def backfill(days: int = 150) -> dict:
             n_sig += len(cands)
     stats = L.fill_outcomes(conn, b1d, now_ms)
     rep = L.report(conn)
-    rep["note"] = ("Historical replay from the Railway candle caches. Dimensions rebuilt without look-ahead: trend "
-                   "(1D+4H alignment, no 1H), extension, rel_strength, liquidity, btc_regime. Not rebuildable: crowding, "
-                   "narrative, concentration, smart_money (live data only). Outcome = 7 closed days from the signal "
-                   "close or the tier Hard SL if hit first (Chase is a proxy: live Chase waits for a pullback).")
+    rep["note"] = ("HISTORICAL REPLAY — evidence only, do NOT change rules from it. Biases: (1) survivorship — the "
+                   "candle caches only hold coins listed on HL today, delisted/dead coins are missing, so results look "
+                   "better than reality; (2) tiers use TODAY's market cap, not the cap on the signal day. Dimensions "
+                   "rebuilt without look-ahead: trend (1D+4H alignment, no 1H), extension, rel_strength, liquidity, "
+                   "btc_regime. Not rebuildable: crowding, narrative, concentration, smart_money. Outcome = 7 closed days "
+                   "from the signal close or the tier Hard SL if hit first; Chase is measured from the signal close "
+                   "(live Chase waits for a pullback + N/N+1 confirmation), so Chase rows are a proxy only. A coin that "
+                   "is both Base and Chase is typed Chase, same as the live candidate builder.")
+    rep["consistency"] = _consistency_check(conn_path=L.backfill_db_path(), last_days=5)
     conn.close()
     _atomic("dimensions_report_backfill.json", rep)
     return {"status": "success", "days": len(day_ts), "signals": n_sig, "outcomes": stats,
+            "consistency": {k: rep["consistency"][k] for k in ("checked", "matching")},
             "with_outcome": rep["signals_with_outcome"],
             "top_dims": [(d["dim"], d["n"], d["ic"], d["veto_lift"], d["verdict"]) for d in rep["dimensions"]]}
+
+
+def _consistency_check(conn_path: str, last_days: int = 5) -> dict:
+    """Backfill vs live, per signal date: backfill symbols vs today's live candidate file and the
+    candidate lists recorded in past HKT decision files (decisions_YYYYMMDD.json cover every coin
+    Claude / fallback decided on = the live candidate list of that day). Mismatch = calc drift."""
+    conn = L.connect(conn_path)
+    dates = [r["signal_date"] for r in conn.execute(
+        "SELECT DISTINCT signal_date FROM signals ORDER BY signal_date DESC LIMIT ?", (last_days,))]
+    live_by_date = {}
+    cd = _read("entry_candidates_latest.json") or {}
+    gen = _parse(cd.get("generated_at"))
+    if gen:
+        live_by_date[_hkt(gen)] = {str(c.get("symbol")).upper() for c in cd.get("candidates") or []}
+    ddir = os.environ.get("DECISIONS_DIR") or os.path.join(OUT_DIR, "decisions")
+    for d in dates:
+        if d in live_by_date:
+            continue
+        try:
+            with open(os.path.join(ddir, f"decisions_{d.replace('-', '')}.json"), encoding="utf-8") as f:
+                live_by_date[d] = set(((json.load(f) or {}).get("decisions") or {}).keys())
+        except (OSError, ValueError):
+            pass
+    out = []
+    for d in dates:
+        bf = {r["symbol"] for r in conn.execute("SELECT symbol FROM signals WHERE signal_date=?", (d,))}
+        lv = live_by_date.get(d)
+        out.append({"date": d, "backfill": sorted(bf), "live": sorted(lv) if lv is not None else None,
+                    "only_backfill": sorted(bf - lv) if lv is not None else None,
+                    "only_live": sorted(lv - bf) if lv is not None else None,
+                    "match": (bf == lv) if lv is not None else None})
+    conn.close()
+    checked = [x for x in out if x["match"] is not None]
+    return {"dates": out, "checked": len(checked), "matching": sum(1 for x in checked if x["match"])}
 
 
 def main() -> int:

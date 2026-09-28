@@ -1743,12 +1743,29 @@ def _scheduled_dims_outcomes(manual: bool = False) -> dict:
 
 
 def _scheduled_dims_backfill(manual: bool = False) -> dict:
-    """Historical replay into the separate backfill ledger (shadow; manual trigger only)."""
+    """Historical replay into the separate backfill ledger (shadow; manual trigger only).
+    Refused inside trading windows (heavy_job_blocked)."""
+    why = heavy_job_blocked()
+    if why:
+        _update_job_status("manual_dims_backfill" if manual else "dims_backfill", "skipped", why)
+        return {"status": "skipped", "message": why}
     return _scheduled_dims(manual=manual, mode="backfill")
 
 
 # Shadow-only jobs Claude may trigger with the AI key (they never place, change or cancel orders).
 AI_SHADOW_JOBS = ("dims", "dims_outcomes", "dims_backfill")
+
+
+def heavy_job_blocked(now: datetime | None = None) -> str:
+    """The CPU-heavy backfill must not share the box with trading jobs: blocked 07:55-09:05 HKT
+    (scan / decisions / preflight / executor) and every hour :05-:12 (1H/4H scans + exits)."""
+    h = (now or datetime.now(timezone.utc)).astimezone(timezone(timedelta(hours=8)))
+    mins = h.hour * 60 + h.minute
+    if 7 * 60 + 55 <= mins <= 9 * 60 + 5:
+        return "blocked 07:55-09:05 HKT (entry window)"
+    if 5 <= h.minute <= 12:
+        return "blocked :05-:12 every hour (1H/4H scans + exits)"
+    return ""
 
 
 MANUAL_JOBS = {
@@ -2054,6 +2071,9 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if path == "/api/desk-data":
             self._desk_data()
+            return
+        if path == "/api/dims-ui":
+            self._dims_ui()
             return
         if path == "/api/trades":
             self._get_trades()
@@ -2379,6 +2399,33 @@ class Handler(SimpleHTTPRequestHandler):
         except Exception as e:
             self._send_json(500, {"ok": False, "error": str(e)})
 
+    def _dims_ui(self) -> None:
+        """GET /api/dims-ui (cockpit password): everything the 維度 tab shows in one call."""
+        out: dict = {"ok": True, "now": datetime.now(timezone.utc).isoformat()}
+        out["latest"] = _read_out_json("dimensions_latest.json") or None
+        try:
+            decs = get_decisions_for_today() if get_decisions_for_today else {}
+        except Exception:
+            decs = {}
+        out["decisions_today"] = decs
+        snap = _read_out_json(os.path.join("whales", "latest.json"))
+        out["whales"] = ({k: snap.get(k) for k in ("ts", "n_wallets", "n_manual", "errors")} if snap else None)
+        if dim_ledger:
+            for key, path_ in (("live", None), ("backfill", dim_ledger.backfill_db_path())):
+                try:
+                    if path_ and not os.path.isfile(path_):
+                        out[key] = None
+                        continue
+                    conn = dim_ledger.connect(path_)
+                    out[key] = {"report": dim_ledger.report(conn),
+                                "recent": dim_ledger.recent_signals(conn, 60 if key == "live" else 40)}
+                    conn.close()
+                except Exception as e:
+                    out[key] = {"error": str(e)}
+            if out.get("backfill") and isinstance(out["backfill"], dict) and out["backfill"].get("report"):
+                out["backfill"]["report"]["note"] = (_read_out_json("dimensions_report_backfill.json") or {}).get("note")
+        self._send_json(200, out)
+
     def _ai_shadow_job(self) -> None:
         """POST /api/ai/jobs/run (keyed) {"job": "dims"|"dims_outcomes"|"dims_backfill"} -> 202.
         Shadow measurement jobs only; trading jobs stay password-gated."""
@@ -2392,6 +2439,9 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if job not in AI_SHADOW_JOBS:
             self._send_json(400, {"ok": False, "error": f"job must be one of {list(AI_SHADOW_JOBS)}"})
+            return
+        if job == "dims_backfill" and heavy_job_blocked():
+            self._send_json(409, {"ok": False, "job": job, "error": heavy_job_blocked()})
             return
         ok, msg = _start_manual_job(job)
         self._send_json(202 if ok else 409, {"ok": ok, "job": job, "message": msg,

@@ -394,6 +394,25 @@
 
   /* ───── NARRATIVE tab ───── */
 
+  /* ───── 維度 tab ───── */
+  .dim-cell { text-align: center; font-family: var(--mono); font-weight: 700; min-width: 34px; }
+  .dim-p2 { background: rgba(34,197,94,0.32); color: #d9ffe6; }
+  .dim-p1 { background: rgba(34,197,94,0.15); color: var(--green); }
+  .dim-0  { color: var(--muted); }
+  .dim-m1 { background: rgba(239,68,68,0.15); color: var(--red); }
+  .dim-m2 { background: rgba(239,68,68,0.32); color: #ffe0e0; }
+  .dim-na { color: #3a4656; }
+  .verdict { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 0.7rem; font-weight: 700; }
+  .v-help { background: var(--green-dim); color: var(--green); border: 1px solid #1a5a30; }
+  .v-harm { background: var(--red-dim); color: var(--red); border: 1px solid #5a1a1a; }
+  .v-none { background: rgba(139,155,176,0.12); color: var(--muted); border: 1px solid #2a3442; }
+  .v-ins  { background: rgba(245,158,11,0.12); color: var(--amber); border: 1px solid #6b4e12; }
+  .dims-note { font-size: 0.74rem; color: var(--muted); margin: 6px 0 10px; line-height: 1.45; }
+  .dims-seg button { margin-right: 6px; background: transparent; color: var(--muted); border: 1px solid var(--border);
+    border-radius: 6px; padding: 4px 10px; cursor: pointer; font: inherit; font-size: 0.75rem; }
+  .dims-seg button.active { color: var(--text); border-color: var(--accent); }
+  #viewDims .entry-grid > .panel { min-width: 0; }
+
   /* ───── FOOTER ───── */
   footer { margin-top: 16px; color: var(--muted); font-size: 0.75rem; font-family: var(--mono); }
 
@@ -481,6 +500,7 @@
   <button type="button" data-view="entry">Entry</button>
   <button type="button" data-view="radar">Radar</button>
   <button type="button" data-view="narrative">Narrative</button>
+  <button type="button" data-view="dims">維度</button>
   <button type="button" data-view="desk">Desk</button>
 </nav>
 
@@ -725,6 +745,85 @@
   </div>
 </div>
 
+<!-- ═══════════════ 維度 (dimensions) ═══════════════ -->
+<div id="viewDims" class="hidden">
+  <section class="breadth-box">
+    <div class="breadth-stats">
+      <div class="stat">Snapshot <span class="pct" id="dimSnap">—</span></div>
+      <div class="stat">Whales <span class="g" id="dimWhales">—</span></div>
+      <div class="stat">BTC regime <span id="dimRegime">—</span></div>
+    </div>
+    <div class="dims-note">Shadow only — scores never place or block an order. Each dimension is scored −2…+2 for every candidate
+      (approved or vetoed) and checked later against the 7-day result (or the Hard SL if hit first).</div>
+  </section>
+
+  <div class="panel" style="margin-bottom:12px">
+    <div class="panel-head"><h2>Today's candidates · 維度 scores</h2></div>
+    <div class="table-wrap" style="border:none;border-radius:0">
+      <table>
+        <thead><tr>
+          <th>Coin</th><th>Type</th><th>Tier</th><th>Decision</th>
+          <th title="1D/4H/1H alignment + breakout %">Trend</th><th title="distance above 1D Upper">Ext</th>
+          <th title="7d vs BTC">RS</th><th title="funding / OI">Crowd</th><th title="24h volume">Liq</th>
+          <th title="Narrative list">Narr</th><th title="BTC 1D/4H vs Filter">BTC</th><th title="same-sector positions">Conc</th>
+          <th title="HL whale net positioning">Whale</th><th>Total</th>
+          <th title="Claude: macro / news / social / conviction">Claude m/n/s/c</th>
+        </tr></thead>
+        <tbody id="dimTodayBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="panel" style="margin-bottom:12px">
+    <div class="panel-head" style="flex-wrap:wrap;gap:8px">
+      <h2>Scoreboard · does each 維度 help?</h2>
+      <div class="dims-seg" id="dimSeg">
+        <button type="button" data-db="live" class="active">Live</button>
+        <button type="button" data-db="backfill">Backfill (history)</button>
+      </div>
+    </div>
+    <div class="dims-note" id="dimRepNote"></div>
+    <div class="table-wrap" style="border:none;border-radius:0">
+      <table>
+        <thead><tr>
+          <th>維度</th><th>n</th><th title="rank correlation score vs 7d result (>0.10 useful)">IC 7d</th><th>IC 3d</th>
+          <th title="mean result of score≥0 minus score<0">Veto lift</th>
+          <th>score&lt;0</th><th>score=0</th><th>score&gt;0</th><th>Verdict</th>
+        </tr></thead>
+        <tbody id="dimRepBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="entry-grid">
+    <div class="panel">
+      <div class="panel-head"><h2>Claude decisions vs all signals</h2></div>
+      <div class="table-wrap" style="border:none;border-radius:0">
+        <table><thead><tr><th>Group</th><th>n</th><th>Mean 7d</th><th>Win %</th><th>SL hit %</th></tr></thead>
+          <tbody id="dimClaudeBody"></tbody></table>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="panel-head"><h2>Veto rules · what each blocked</h2></div>
+      <div class="table-wrap" style="border:none;border-radius:0">
+        <table><thead><tr><th>Rule</th><th>Blocked</th><th>Their mean 7d</th><th>Avoided vs approved</th></tr></thead>
+          <tbody id="dimRulesBody"></tbody></table>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel" style="margin-top:12px">
+    <div class="panel-head"><h2>Signal history (newest first)</h2></div>
+    <div class="table-wrap" style="border:none;border-radius:0">
+      <table><thead><tr>
+        <th>Date</th><th>Coin</th><th>Type</th><th>Total</th><th>Decision</th><th>Rule</th>
+        <th>1d</th><th>3d</th><th>7d</th><th>7d w/ SL</th><th>SL hit</th>
+      </tr></thead>
+        <tbody id="dimHistBody"></tbody></table>
+    </div>
+  </div>
+</div>
+
 <!-- ═══════════════ DESK (legacy) ═══════════════ -->
 <div id="viewDesk" class="hidden">
   <section class="breadth-box">
@@ -884,7 +983,7 @@
   }
 
   // ── View switching ─────────────────────────────────────────────────────
-  const VIEWS = ["cockpit","entry","radar","narrative","desk"];
+  const VIEWS = ["cockpit","entry","radar","narrative","dims","desk"];
   function showView(v) {
     view = v;
     VIEWS.forEach(id => el("view"+id[0].toUpperCase()+id.slice(1)).classList.toggle("hidden", id !== v));
@@ -1080,6 +1179,7 @@
     else if (view === "entry")     renderEntry();
     else if (view === "radar")     renderRadar();
     else if (view === "narrative") renderNarrative();
+    else if (view === "dims")      renderDims();
     else if (view === "desk")      renderDesk();
   }
 
@@ -1380,6 +1480,110 @@
       if (a) a.textContent = th.dataset.k===radarSortK ? (radarSortA?"↑":"↓") : "↕";
     });
   }
+
+  // ══════════════════════════════════════════════════════════
+  // 維度 (dimensions) — /api/dims-ui
+  // ══════════════════════════════════════════════════════════
+  let dimsDb = "live";
+  const DIM_KEYS = ["trend","extension","rel_strength","crowding","liquidity","narrative","btc_regime","concentration","smart_money"];
+  const DIM_LABEL = {trend:"Trend", extension:"Extension", rel_strength:"Rel strength vs BTC", crowding:"Crowding (funding)",
+    liquidity:"Liquidity", narrative:"Narrative", btc_regime:"BTC regime", concentration:"Concentration",
+    smart_money:"Smart money (whales)", TOTAL:"Railway total", macro:"Claude · macro", news:"Claude · news",
+    social:"Claude · social", conviction:"Claude · conviction"};
+  function dimCell(v, title) {
+    if (v === null || v === undefined) return `<td class="dim-cell dim-na" title="${esc(title||"n/a")}">·</td>`;
+    const n = Number(v);
+    const cls = n >= 2 ? "dim-p2" : n >= 1 ? "dim-p1" : n <= -2 ? "dim-m2" : n <= -1 ? "dim-m1" : "dim-0";
+    return `<td class="dim-cell ${cls}" title="${esc(title||"")}">${n > 0 ? "+" + n : n}</td>`;
+  }
+  function totalCell(t) {
+    if (t === null || t === undefined) return `<td class="dim-cell dim-na">·</td>`;
+    const cls = t >= 4 ? "dim-p2" : t >= 1 ? "dim-p1" : t <= -4 ? "dim-m2" : t <= -1 ? "dim-m1" : "dim-0";
+    return `<td class="dim-cell ${cls}">${t > 0 ? "+" + t : t}</td>`;
+  }
+  const pct = (v) => (v === null || v === undefined) ? "—" : (Number(v) > 0 ? "+" : "") + Number(v).toFixed(2) + "%";
+  const rate = (v) => (v === null || v === undefined) ? "—" : Math.round(Number(v) * 100) + "%";
+  function verdictChip(v) {
+    const t = String(v || "");
+    const cls = t.startsWith("helpful") ? "v-help" : t.startsWith("harmful") ? "v-harm" : t.startsWith("insufficient") ? "v-ins" : "v-none";
+    return `<span class="verdict ${cls}">${esc(t || "—")}</span>`;
+  }
+  function bucketCell(b) {
+    if (!b || !b.n) return "<td>—</td>";
+    return `<td title="win ${rate(b.win_rate)} · SL hit ${rate(b.sl_hit_rate)}">${pct(b.mean)} <span style="color:var(--muted)">(${b.n})</span></td>`;
+  }
+  let dimsData = null;
+  async function renderDims() {
+    try {
+      const r = await fetch("/api/dims-ui?t=" + Date.now(), {cache: "no-store"});
+      if (!r.ok) throw new Error("dims-ui " + r.status);
+      dimsData = await r.json();
+    } catch (e) {
+      el("dimTodayBody").innerHTML = `<tr><td colspan="15" class="empty">load failed: ${esc(e.message)}</td></tr>`;
+      return;
+    }
+    const d = dimsData, lat = d.latest || {};
+    const today = new Date(Date.now() + 8 * 3600e3).toISOString().slice(0, 10);
+    el("dimSnap").textContent = lat.generated_at ? (lat.signal_date === today ? "today " : lat.signal_date + " ") +
+      new Date(lat.generated_at).toLocaleTimeString("en-GB", {timeZone: "Asia/Hong_Kong", hour: "2-digit", minute: "2-digit"}) + " HKT" : "not yet (08:08 HKT)";
+    el("dimWhales").textContent = d.whales ? `${d.whales.n_wallets} wallets (${d.whales.n_manual || 0} manual)` : "—";
+    const reg = (lat.btc_regime || {}).score;
+    el("dimRegime").innerHTML = reg === undefined || reg === null ? "—" : `<span class="${reg > 0 ? "trend-g" : reg < 0 ? "trend-r" : ""}">${reg > 0 ? "+" + reg : reg}</span>`;
+    const decs = d.decisions_today || {};
+    const cands = lat.signal_date === today ? (lat.candidates || []) : [];
+    el("dimTodayBody").innerHTML = cands.length ? cands.map(c => {
+      const dec = decs[c.symbol] || {};
+      const cd = dec.dims || {};
+      const decTxt = dec.decision ? `<span class="${dec.decision === "approve" ? "trend-g" : "trend-r"}">${esc(dec.decision.toUpperCase())}</span>` +
+        (dec.rule ? ` <span style="color:var(--muted)">${esc(dec.rule)}</span>` : "") + (dec.source === "fallback" ? " (fb)" : "") : "—";
+      const cells = DIM_KEYS.map(k => { const x = (c.dims || {})[k] || {}; return dimCell(x.score, JSON.stringify(x.raw || {})); }).join("");
+      const cl = ["macro","news","social","conviction"].map(k => cd[k] === undefined ? "·" : (cd[k] > 0 ? "+" + cd[k] : cd[k])).join(" / ");
+      return `<tr><td class="er-coin">${esc(c.symbol)}</td><td>${esc(c.type || "")}</td><td>${esc(c.tier || "")}</td><td>${decTxt}</td>${cells}` +
+        `${totalCell(c.total)}<td style="font-family:var(--mono)">${esc(cl)}</td></tr>`;
+    }).join("") : `<tr><td colspan="15" class="empty">No dimension snapshot for today yet — runs 08:08 HKT after the 1D scan.</td></tr>`;
+    renderDimsReport();
+  }
+  function renderDimsReport() {
+    const d = dimsData || {};
+    const block = d[dimsDb];
+    const rep = block && block.report;
+    if (!rep) {
+      el("dimRepNote").textContent = dimsDb === "backfill" ? "No backfill yet (run job dims_backfill)." : (block && block.error) || "No live signals yet.";
+      ["dimRepBody","dimClaudeBody","dimRulesBody","dimHistBody"].forEach(id => el(id).innerHTML = "");
+      return;
+    }
+    el("dimRepNote").textContent = `${rep.signals_total} signals · ${rep.signals_with_outcome} with a 7-day result · verdict needs n ≥ ${rep.min_n}. ` +
+      (rep.note ? rep.note : rep.how_to_read || "");
+    el("dimRepBody").innerHTML = (rep.dimensions || []).length ? rep.dimensions.map(x => {
+      const [src, name] = String(x.dim).split(":");
+      const b = x.buckets || {};
+      return `<tr><td>${esc(DIM_LABEL[name] || name)}${src === "claude" ? "" : ""}</td><td>${x.n}</td>` +
+        `<td>${x.ic === null ? "—" : x.ic.toFixed(2)}</td><td>${x.ic_ret3d === null || x.ic_ret3d === undefined ? "—" : x.ic_ret3d.toFixed(2)}</td>` +
+        `<td>${pct(x.veto_lift)}</td>${bucketCell(b.neg)}${bucketCell(b.zero)}${bucketCell(b.pos)}<td>${verdictChip(x.verdict)}</td></tr>`;
+    }).join("") : `<tr><td colspan="9" class="empty">No outcomes yet — each signal needs 7 closed daily bars.</td></tr>`;
+    const cl = rep.claude || {};
+    const row = (name, s) => `<tr><td>${name}</td><td>${(s || {}).n || 0}</td><td>${pct((s || {}).mean)}</td><td>${rate((s || {}).win_rate)}</td><td>${rate((s || {}).sl_hit_rate)}</td></tr>`;
+    el("dimClaudeBody").innerHTML = row("All signals", cl.all_signals) + row("Approved", cl.approved) + row("Vetoed", cl.vetoed) +
+      `<tr><td colspan="5">Edge (approved − all): <b>${pct(cl.approve_edge_vs_all)}</b> ${verdictChip(cl.verdict)}</td></tr>`;
+    const vr = rep.veto_rules || [];
+    el("dimRulesBody").innerHTML = vr.length ? vr.map(v => `<tr><td>${esc(v.rule)}</td><td>${v.blocked}</td><td>${pct((v.blocked_outcome || {}).mean)}</td>` +
+      `<td class="${v.avoided_vs_approved > 0 ? "trend-g" : v.avoided_vs_approved < 0 ? "trend-r" : ""}">${pct(v.avoided_vs_approved)}</td></tr>`).join("")
+      : `<tr><td colspan="4" class="empty">No vetoes with a result yet.</td></tr>`;
+    const hist = block.recent || [];
+    el("dimHistBody").innerHTML = hist.length ? hist.map(h => `<tr><td>${esc(h.signal_date)}</td><td class="er-coin">${esc(h.symbol)}</td><td>${esc(h.type || "")}</td>` +
+      `${totalCell(h.total)}` +
+      `<td>${h.decision ? esc(h.decision) + (h.decision_source === "fallback" ? " (fb)" : "") : "—"}</td><td>${esc(h.rule || "")}</td>` +
+      `<td>${pct(h.ret_1d)}</td><td>${pct(h.ret_3d)}</td><td>${pct(h.ret_7d)}</td><td>${pct(h.ret_7d_sl)}</td>` +
+      `<td>${h.sl_hit === 1 ? "day " + h.sl_hit_day : h.sl_hit === 0 ? "no" : "…"}</td></tr>`).join("")
+      : `<tr><td colspan="11" class="empty">No signals recorded yet.</td></tr>`;
+  }
+  el("dimSeg").addEventListener("click", ev => {
+    const b = ev.target.closest("button[data-db]");
+    if (!b) return;
+    dimsDb = b.dataset.db;
+    el("dimSeg").querySelectorAll("button").forEach(x => x.classList.toggle("active", x === b));
+    renderDimsReport();
+  });
 
   // ══════════════════════════════════════════════════════════
   // NARRATIVE
