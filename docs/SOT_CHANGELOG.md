@@ -12,6 +12,17 @@ header, the executor / pending run reports, the preflight JSON and `[DESK_DATA]`
 
 ---
 
+## Reporting-only update (2026-09-28, SoT id unchanged: no executor rule changed)
+- Veto rule ids (`rule`, e.g. V1_WEAK_4H_BREAKOUT) are stored with each decision and in the ledger;
+  `/api/dimensions/report` has `veto_rules`: signals blocked per rule and how they did vs approved ones.
+- `/api/exit/health`: leverage below 3x is `info` (LEVERAGE_LOW), not a problem; above 5x or non-isolated
+  is still LEVERAGE_OFF.
+- `POST /api/ai/jobs/run` (AI key): starts shadow jobs only (`dims`, `dims_outcomes`, `dims_backfill`).
+- `dims_backfill`: historical replay of Base/Chase signals from the candle caches into a separate
+  ledger (`giiq_ledger_backfill.db`); report with `/api/dimensions/report?db=backfill`.
+
+---
+
 ## GIIQ-SoT-3 (2026-09-28): portfolio caps, price-based ADD_ON, fallback + POST alert (approved by MMT)
 
 Entry and exit **triggers are unchanged**, and so is per-trade risk (isolated margin 2–4% NAV, 3–5x).

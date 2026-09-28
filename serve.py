@@ -1742,6 +1742,15 @@ def _scheduled_dims_outcomes(manual: bool = False) -> dict:
     return _scheduled_dims(manual=manual, mode="outcomes")
 
 
+def _scheduled_dims_backfill(manual: bool = False) -> dict:
+    """Historical replay into the separate backfill ledger (shadow; manual trigger only)."""
+    return _scheduled_dims(manual=manual, mode="backfill")
+
+
+# Shadow-only jobs Claude may trigger with the AI key (they never place, change or cancel orders).
+AI_SHADOW_JOBS = ("dims", "dims_outcomes", "dims_backfill")
+
+
 MANUAL_JOBS = {
     "1d": _scheduled_1d_scan,
     "1h": _scheduled_1h_scan_exits,
@@ -1751,6 +1760,7 @@ MANUAL_JOBS = {
     "pending": _scheduled_pending,
     "dims": _scheduled_dims,
     "dims_outcomes": _scheduled_dims_outcomes,
+    "dims_backfill": _scheduled_dims_backfill,
     "fallback": _scheduled_fallback,
 }
 _manual_running: set = set()
@@ -2076,6 +2086,9 @@ class Handler(SimpleHTTPRequestHandler):
         if path == "/api/whales/watchlist":
             self._whales_watchlist()
             return
+        if path == "/api/ai/jobs/run":
+            self._ai_shadow_job()
+            return
         if path == "/api/ai/narrative":
             self._ai_narrative()
             return
@@ -2355,13 +2368,34 @@ class Handler(SimpleHTTPRequestHandler):
             self._send_json(400, {"ok": False, "error": "bad metric"})
             return
         try:
-            conn = dim_ledger.connect()
+            backfill = (qs.get("db") or [""])[0] == "backfill"
+            conn = dim_ledger.connect(dim_ledger.backfill_db_path() if backfill else None)
             rep = dim_ledger.report(conn, metric=metric, since=(qs.get("since") or [None])[0],
                                     sig_type=(qs.get("type") or [None])[0])
             conn.close()
-            self._send_json(200, {"ok": True, **rep})
+            if backfill:
+                rep["note"] = (_read_out_json("dimensions_report_backfill.json") or {}).get("note")
+            self._send_json(200, {"ok": True, "db": "backfill" if backfill else "live", **rep})
         except Exception as e:
             self._send_json(500, {"ok": False, "error": str(e)})
+
+    def _ai_shadow_job(self) -> None:
+        """POST /api/ai/jobs/run (keyed) {"job": "dims"|"dims_outcomes"|"dims_backfill"} -> 202.
+        Shadow measurement jobs only; trading jobs stay password-gated."""
+        if not self._ai_key_ok():
+            return
+        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            job = str((json.loads((self.rfile.read(length) if length else b"{}").decode() or "{}") or {}).get("job") or "")
+        except Exception:
+            self._send_json(400, {"ok": False, "error": "invalid json"})
+            return
+        if job not in AI_SHADOW_JOBS:
+            self._send_json(400, {"ok": False, "error": f"job must be one of {list(AI_SHADOW_JOBS)}"})
+            return
+        ok, msg = _start_manual_job(job)
+        self._send_json(202 if ok else 409, {"ok": ok, "job": job, "message": msg,
+                                             "status_key": f"manual_{job}_*", "see": "/api/scheduler/status"})
 
     def _whales_watchlist(self) -> None:
         """POST /api/whales/watchlist (keyed) {"wallets": [{"address","label","source"}]} — replaces
