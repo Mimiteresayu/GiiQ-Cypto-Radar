@@ -13,7 +13,7 @@ Claude EXIT_DESK task only has to read one object and email when `ok` is false (
   MARGIN_HIGH      total margin used > 80% of NAV
   ORPHAN_SL        trigger/reduce-only order on a coin with no position
   PENDING_STALE    pending entry older than its 7-day TTL still active
-  LEVERAGE_OFF     position leverage outside 3-5x or not isolated
+  LEVERAGE_OFF     position leverage above 5x or not isolated (below 3x = `info` LEVERAGE_LOW, not a problem)
   RADAR_STALE      1H radar > 2h old or 4H radar > 5h old
   HL_FETCH         positions / open orders could not be fetched (nothing else can be trusted)
 """
@@ -67,13 +67,14 @@ def check(*, perp: Any, open_orders: Any, nav: Optional[float], radar_1h: dict, 
     now = now or datetime.now(timezone.utc)
     now_ms = int(now.timestamp() * 1000)
     problems: List[dict] = []
+    info: List[dict] = []
 
     def add(code: str, coin: Optional[str], msg: str) -> None:
         problems.append({"code": code, "coin": coin, "msg": msg})
 
     if not isinstance(perp, dict) or perp.get("error"):
         add("HL_FETCH", None, f"positions unavailable: {(perp or {}).get('error') if isinstance(perp, dict) else perp}")
-        return _result(problems, 0, now)
+        return _result(problems, 0, now, info)
     pos = _positions(perp)
     orders_ok = isinstance(open_orders, list)
     if not orders_ok:
@@ -88,8 +89,11 @@ def check(*, perp: Any, open_orders: Any, nav: Optional[float], radar_1h: dict, 
         c = p["coin"]
         if orders_ok and c not in sl_coins:
             add("NO_SL", c, "no reduce-only / trigger order (Hard SL) on HL")
-        if p["lev"] is not None and not (LEV_MIN <= p["lev"] <= LEV_MAX):
-            add("LEVERAGE_OFF", c, f"leverage {p['lev']:g}x outside {LEV_MIN}-{LEV_MAX}x")
+        if p["lev"] is not None and p["lev"] > LEV_MAX:
+            add("LEVERAGE_OFF", c, f"leverage {p['lev']:g}x above {LEV_MAX}x")
+        elif p["lev"] is not None and p["lev"] < LEV_MIN:
+            info.append({"code": "LEVERAGE_LOW", "coin": c,
+                         "msg": f"leverage {p['lev']:g}x below {LEV_MIN}x (safer; opened before SoT-2) - info only"})
         if p["lev_type"] and p["lev_type"] != "isolated":
             add("LEVERAGE_OFF", c, f"margin mode {p['lev_type']} (expected isolated)")
         if p["side"] != "LONG":
@@ -147,11 +151,12 @@ def check(*, perp: Any, open_orders: Any, nav: Optional[float], radar_1h: dict, 
         if t and now - t > timedelta(days=PENDING_TTL_DAYS, hours=6):
             add("PENDING_STALE", e.get("symbol"), f"{e.get('kind')} pending since {t.date()} (> {PENDING_TTL_DAYS}d)")
 
-    return _result(problems, len(pos), now)
+    return _result(problems, len(pos), now, info)
 
 
-def _result(problems: List[dict], n_pos: int, now: datetime) -> Dict[str, Any]:
+def _result(problems: List[dict], n_pos: int, now: datetime, info: Optional[List[dict]] = None) -> Dict[str, Any]:
     hkt = now.astimezone(HKT).strftime("%H:%M HKT %d-%b")
-    return {"ok": not problems, "n_positions": n_pos, "problems": problems, "checked_at": now.isoformat(),
+    return {"ok": not problems, "n_positions": n_pos, "problems": problems, "info": info or [],
+            "checked_at": now.isoformat(),
             "summary": f"OK · {n_pos} 倉 · {hkt}" if not problems
             else f"{len(problems)} problem(s) · {n_pos} 倉 · {hkt}"}

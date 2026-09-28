@@ -61,6 +61,7 @@ CREATE TABLE IF NOT EXISTS decisions (
     source TEXT NOT NULL,                 -- claude | fallback
     action TEXT,                          -- approve | veto
     kind TEXT,                            -- BASE | CONTINUATION | ADD_ON (as sent)
+    rule TEXT,                            -- veto rule id (V1_WEAK_4H_BREAKOUT ...) or NULL
     size_pct REAL,
     leverage REAL,
     reason TEXT,
@@ -97,7 +98,16 @@ def connect(path: Optional[str] = None) -> sqlite3.Connection:
     conn = sqlite3.connect(p, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(decisions)")}
+    if "rule" not in cols:  # ledgers created before the veto-rule column
+        conn.execute("ALTER TABLE decisions ADD COLUMN rule TEXT")
+        conn.commit()
     return conn
+
+
+def backfill_db_path() -> str:
+    """Separate DB for the historical replay so it never mixes with (or overwrites) live signals."""
+    return os.environ.get("DIM_BACKFILL_PATH") or str(Path(db_path()).with_name("giiq_ledger_backfill.db"))
 
 
 def _now() -> str:
@@ -161,9 +171,9 @@ def record_decisions(conn: sqlite3.Connection, signal_date: str, decisions: List
             continue
         sid = _signal_id(conn, signal_date, sym)
         conn.execute(
-            "INSERT OR REPLACE INTO decisions(signal_id, source, action, kind, size_pct, leverage, reason, decided_at)"
-            " VALUES (?,?,?,?,?,?,?,?)",
-            (sid, source, act, d.get("type"), _f(d.get("size_pct")), _f(d.get("leverage")),
+            "INSERT OR REPLACE INTO decisions(signal_id, source, action, kind, rule, size_pct, leverage, reason, decided_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?)",
+            (sid, source, act, d.get("type"), d.get("rule"), _f(d.get("size_pct")), _f(d.get("leverage")),
              str(d.get("reason") or "")[:500], d.get("timestamp") or _now()))
         for name, score in (d.get("dims") or {}).items():
             s = _f(score)
@@ -309,7 +319,7 @@ def _stats(rows: List[dict], metric: str) -> Dict[str, Any]:
 
 def _load_rows(conn: sqlite3.Connection, since: Optional[str], sig_type: Optional[str]) -> List[dict]:
     q = """SELECT s.id, s.signal_date, s.symbol, s.type, s.dim_version, o.ret_3d, o.ret_7d, o.ret_7d_sl, o.sl_hit,
-                  o.mfe_7d, o.complete, d.action AS claude_action
+                  o.mfe_7d, o.complete, d.action AS claude_action, d.rule AS veto_rule
            FROM signals s LEFT JOIN outcomes o ON o.signal_id=s.id
            LEFT JOIN decisions d ON d.signal_id=s.id AND d.source='claude' WHERE 1=1"""
     args: List[Any] = []
@@ -338,6 +348,24 @@ def _verdict(n: int, ic: Optional[float], lift: Optional[float], min_n: int) -> 
     if ic <= -0.10:
         return "harmful (inverse)"
     return "no edge yet"
+
+
+def _veto_rule_stats(done: List[dict], approved: Dict[str, Any], metric: str) -> List[dict]:
+    """Per veto rule: how many signals it blocked and how those blocked signals would have done.
+    A rule earns its place when its blocked signals did WORSE than the approved ones (avoided_loss > 0)."""
+    rules: Dict[str, List[dict]] = {}
+    for r in done:
+        if r.get("claude_action") == "veto":
+            rules.setdefault(r.get("veto_rule") or "(no rule id)", []).append(r)
+    out = []
+    for rule, rows in sorted(rules.items()):
+        st = _stats(rows, metric)
+        avoided = (round(approved["mean"] - st["mean"], 3)
+                   if st.get("n") and approved.get("n") else None)
+        out.append({"rule": rule, "blocked": len(rows), "blocked_outcome": st,
+                    "avoided_vs_approved": avoided,
+                    "symbols": sorted({f"{x['signal_date']} {x['symbol']}" for x in rows})[-10:]})
+    return out
 
 
 def report(conn: sqlite3.Connection, metric: str = "ret_7d_sl", since: Optional[str] = None,
@@ -382,6 +410,7 @@ def report(conn: sqlite3.Connection, metric: str = "ret_7d_sl", since: Optional[
         "claude": {"all_signals": all_s, "approved": appr_s, "vetoed": veto_s,
                    "approve_edge_vs_all": edge, "verdict": claude_verdict},
         "by_type": {t: _stats([r for r in done if r.get("type") == t], metric) for t in ("Base", "Chase")},
+        "veto_rules": _veto_rule_stats(done, appr_s, metric),
         "how_to_read": ("ic = rank correlation of score vs outcome (>0.10 useful, <-0.10 inverse). "
                         "veto_lift = mean outcome of score>=0 minus score<0 (positive = vetoing score<0 would "
                         "have avoided worse signals). Outcome = 7d return, or Hard-SL loss if hit first."),

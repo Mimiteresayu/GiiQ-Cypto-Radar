@@ -54,6 +54,7 @@ def normalize(dec: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "size_pct": dec.get("size_pct"),
         "leverage": dec.get("leverage"),
         "reason": dec.get("reason", ""),
+        "rule": (str(dec.get("rule")).strip()[:40] or None) if dec.get("rule") else None,
         "dims": dims,
     }
 

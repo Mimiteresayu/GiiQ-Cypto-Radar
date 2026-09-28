@@ -54,8 +54,16 @@ class TestExitHealth(unittest.TestCase):
     def test_no_sl_orphan_and_leverage(self):
         r = self.run_check(_perp(_pos("MON", lev=2, typ="cross")), [{"coin": "TIA", "isTrigger": True, "reduceOnly": True}])
         codes = sorted(p["code"] for p in r["problems"])
-        self.assertEqual(codes, ["LEVERAGE_OFF", "LEVERAGE_OFF", "NO_SL", "ORPHAN_SL"])
+        self.assertEqual(codes, ["LEVERAGE_OFF", "NO_SL", "ORPHAN_SL"])  # cross margin; 2x is info only
+        self.assertEqual([i["code"] for i in r["info"]], ["LEVERAGE_LOW"])
         self.assertFalse(r["ok"])
+
+    def test_low_leverage_alone_is_ok(self):
+        r = self.run_check(_perp(_pos("MON", lev=2)), [{"coin": "MON", "isTrigger": True, "reduceOnly": True}])
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(r["info"][0]["coin"], "MON")
+        r6 = self.run_check(_perp(_pos("MON", lev=6)), [{"coin": "MON", "isTrigger": True, "reduceOnly": True}])
+        self.assertEqual([p["code"] for p in r6["problems"]], ["LEVERAGE_OFF"])
 
     def test_exit_not_done_small_tier_after_grace(self):
         now_ms = int(NOW.timestamp() * 1000)

@@ -354,3 +354,116 @@ class TestDimsJobAndServe(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestVetoRulesAndBackfill(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.env = patch.dict(os.environ, {"DIM_LEDGER_PATH": os.path.join(self.tmp, "l.db"),
+                                           "DECISIONS_DIR": os.path.join(self.tmp, "dec")})
+        self.env.start()
+
+    def tearDown(self):
+        self.env.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_rule_is_normalized_stored_and_reported(self):
+        from decisions import normalize
+        self.assertEqual(normalize({"symbol": "TIA", "decision": "veto", "rule": "V1_WEAK_4H_BREAKOUT"})["rule"],
+                         "V1_WEAK_4H_BREAKOUT")
+        conn = L.connect()
+        ref = 1_700_000_000_000 - (1_700_000_000_000 % DAY)
+        bars = {}
+        for k in range(12):
+            sym, good = f"S{k}", k % 2 == 0
+            closes = [100 * (1 + (0.02 if good else -0.02) * i) for i in range(10)]
+            bars[sym] = [[ref + i * DAY, c, c, c, c, 1] for i, c in enumerate(closes)]
+            L.record_signals(conn, f"2026-09-{k + 1:02d}", [{"symbol": sym, "type": "Chase", "close_1d": 100.0}],
+                             {"candidates": []}, {sym: ref})
+            L.record_decisions(conn, f"2026-09-{k + 1:02d}", [{"symbol": sym, "decision": "approve" if good else "veto",
+                                                               "rule": None if good else "V1_WEAK_4H_BREAKOUT"}])
+        L.fill_outcomes(conn, bars, ref + 11 * DAY)
+        rep = L.report(conn, min_n=5)
+        conn.close()
+        vr = {r["rule"]: r for r in rep["veto_rules"]}
+        self.assertEqual(vr["V1_WEAK_4H_BREAKOUT"]["blocked"], 6)
+        self.assertGreater(vr["V1_WEAK_4H_BREAKOUT"]["avoided_vs_approved"], 0)
+
+    def test_old_ledger_gets_rule_column(self):
+        import sqlite3
+        p = os.path.join(self.tmp, "old.db")
+        c = sqlite3.connect(p)
+        c.executescript(L.SCHEMA.replace("    rule TEXT,                            -- veto rule id (V1_WEAK_4H_BREAKOUT ...) or NULL\n", ""))
+        c.close()
+        conn = L.connect(p)
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(decisions)")}
+        conn.close()
+        self.assertIn("rule", cols)
+
+    def test_backfill_replays_history_into_separate_db(self):
+        import dims_job
+        import math
+        now = datetime.now(timezone.utc)
+        now_ms = int(now.timestamp() * 1000)
+        day0 = now_ms - now_ms % DAY - 280 * DAY
+        H4 = 14_400_000
+
+        import random
+
+        def walk(n, seed, drift=0.004, vol=0.05):
+            r, c = random.Random(seed), [10.0]
+            for _ in range(n - 1):
+                c.append(c[-1] * (1 + r.gauss(drift, vol)))
+            return c
+
+        def mk(closes, step, start):
+            return [[start + i * step, c, c * 1.02, c * 0.98, c, 1000.0] for i, c in enumerate(closes)]
+        b1d = {"BTC": mk([100 + i * 0.1 for i in range(280)], DAY, day0),
+               "AAA": mk(walk(280, 2), DAY, day0), "BBB": mk(walk(280, 0), DAY, day0)}
+        start4 = now_ms - now_ms % H4 - 450 * H4
+        b4h = {"BTC": mk([100 + i * 0.02 for i in range(450)], H4, start4),
+               "AAA": mk(walk(450, 3, 0.001, 0.02), H4, start4)}
+        for tf, b in (("1d", b1d), ("4h", b4h)):
+            with gzip.open(os.path.join(self.tmp, f"candles_{tf}.json.gz"), "wt") as f:
+                json.dump({"bars": b}, f)
+        with patch.object(dims_job, "OUT_DIR", self.tmp):
+            res = dims_job.backfill(120)
+        self.assertEqual(res["status"], "success", res)
+        self.assertGreater(res["signals"], 0)
+        self.assertTrue(os.path.isfile(os.path.join(self.tmp, "giiq_ledger_backfill.db")))
+        self.assertTrue(os.path.isfile(os.path.join(self.tmp, "dimensions_report_backfill.json")))
+        conn = L.connect()  # live ledger untouched
+        self.assertEqual(conn.execute("SELECT COUNT(*) c FROM signals").fetchone()["c"], 0)
+        conn.close()
+        bconn = L.connect(L.backfill_db_path())
+        dims = {r["dim"] for r in bconn.execute("SELECT DISTINCT dim FROM dim_scores")}
+        bconn.close()
+        self.assertEqual(dims, {"trend", "extension", "rel_strength", "liquidity", "btc_regime"})
+
+
+class TestAiShadowJobEndpoint(unittest.TestCase):
+    def test_only_shadow_jobs(self):
+        import serve
+        from http.server import ThreadingHTTPServer
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), serve.Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        started = []
+        try:
+            with patch.object(serve, "AI_DECISION_KEY", "k"), \
+                    patch.object(serve, "_start_manual_job", lambda job: (started.append(job) or True, "started")):
+                def post(job, key="k"):
+                    req = urllib.request.Request(f"http://127.0.0.1:{srv.server_port}/api/ai/jobs/run",
+                                                 data=json.dumps({"job": job}).encode(), method="POST",
+                                                 headers={"X-AI-Key": key, "Content-Type": "application/json"})
+                    try:
+                        with urllib.request.urlopen(req, timeout=10) as r:
+                            return r.status
+                    except urllib.error.HTTPError as e:
+                        return e.code
+                self.assertEqual(post("dims_backfill"), 202)
+                self.assertEqual(post("executor"), 400)
+                self.assertEqual(post("dims", key="bad"), 403)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+        self.assertEqual(started, ["dims_backfill"])
