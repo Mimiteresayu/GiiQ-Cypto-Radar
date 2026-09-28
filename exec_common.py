@@ -21,7 +21,7 @@ from typing import Any, Dict, Optional, Tuple
 # ---------------------------------------------------------------- constants
 # SoT version id. Bump (GIIQ-SoT-2, ...) whenever an executor rule changes and add an entry to
 # docs/SOT_CHANGELOG.md. Shown in the cockpit header, executor/pending run reports and DESK_DATA.
-SOT_ID = "GIIQ-SoT-2"
+SOT_ID = "GIIQ-SoT-3"
 
 MIN_NOTIONAL_USD = 10.0  # Hyperliquid minimum order value (USD)
 MIN_LEVERAGE = 1.0
@@ -55,9 +55,16 @@ SOT2_MIN_LEV = 3
 SOT2_MAX_LEV = 5
 SOT2_MIN_MARGIN_PCT = 2.0
 SOT2_MAX_MARGIN_PCT = 4.0
-# ADD_ON (pending pullback add to an existing LONG) extra gates
-ADDON_MIN_ROE_PCT = 10.0        # existing position ROE >= +10% at fill time
-ADDON_MAX_COIN_MARGIN_PCT = 5.5  # coin margin (existing + add) <= 5.5% NAV
+# ---------------------------------------------------------------- GIIQ-SoT-3 (MMT 2026-09-28)
+# Portfolio caps on top of the per-trade 2-4% margin risk (alts move with BTC, so cap the total):
+MAX_TOTAL_MARGIN_NAV_PCT = 30.0   # all isolated margin (existing + new, cumulative) <= 30% NAV
+MAX_COIN_NOTIONAL_NAV_PCT = 20.0  # one coin's notional (existing + add) <= 20% NAV (also after ADD_ON)
+MAX_NEW_ENTRIES_PER_DAY = 3       # new fills per HKT day: Base + CONTINUATION + ADD_ON together
+# ADD_ON: the base position must be a real winner in PRICE terms (Signum 1x meaning), not leveraged ROE:
+# at 3-5x, +10% ROE is only a +2-3.3% move.
+ADDON_MIN_PRICE_GAIN_PCT = 10.0
+# Fallback decisions (Harbor 08:40, only when Claude's POST never arrived): Base only, 2% margin.
+FALLBACK_MARGIN_PCT = 2.0
 
 
 def is_live_mode() -> bool:
@@ -429,22 +436,57 @@ def size_by_margin(nav: float, entry_px: float, hard_sl: float, coin_max_leverag
     return {"ok": False, "reason": "SoT-2 leverage impossible: " + "; ".join(fails), "notes": notes}
 
 
-def addon_gates(pos: Optional[dict], nav: float) -> Tuple[bool, str, float]:
-    """ADD_ON: existing ROE >= +10% and room under the 5.5% NAV coin-margin cap.
-    Returns (ok, reason, max_add_margin_pct)."""
+def addon_gates(pos: Optional[dict], nav: float, mid: Optional[float] = None,
+                leverage: Optional[float] = None) -> Tuple[bool, str, float]:
+    """ADD_ON (GIIQ-SoT-3): base position PRICE gain >= +10% and the coin's notional after the add
+    stays <= 20% NAV. Returns (ok, reason, max_add_margin_pct) where the margin room is expressed at
+    the leverage the add will use (ADD_ON keeps the existing leverage)."""
     if not pos:
         return False, "ADD_ON base position not found", 0.0
-    roe = _f(pos.get("roe_pct"))
-    if roe is None:
-        return False, "ADD_ON: existing ROE unknown", 0.0
-    if roe < ADDON_MIN_ROE_PCT:
-        return False, f"ADD_ON: existing ROE {roe:.1f}% < +{ADDON_MIN_ROE_PCT:g}%", 0.0
-    used_pct = (_f(pos.get("margin_used")) or 0.0) / nav * 100.0 if nav else 100.0
-    room = ADDON_MAX_COIN_MARGIN_PCT - used_pct
-    if room < SOT2_MIN_MARGIN_PCT - 1e-9:
-        return False, (f"ADD_ON: coin margin {used_pct:.2f}% NAV + min add {SOT2_MIN_MARGIN_PCT:g}% > "
-                       f"{ADDON_MAX_COIN_MARGIN_PCT:g}% cap"), room
-    return True, f"ROE {roe:.1f}%, coin margin {used_pct:.2f}% NAV (room {room:.2f}%)", room
+    entry = _f(pos.get("entry_px"))
+    px = _f(mid)
+    size = _f(pos.get("size"))
+    if not entry or entry <= 0 or not px or px <= 0:
+        return False, "ADD_ON: entry price / live mid unknown", 0.0
+    gain = (px / entry - 1.0) * 100.0
+    if gain < ADDON_MIN_PRICE_GAIN_PCT - 1e-9:
+        return False, f"ADD_ON: price gain {gain:+.1f}% < +{ADDON_MIN_PRICE_GAIN_PCT:g}% (vs entry {entry:.6g})", 0.0
+    lev = _f(leverage) or _f(pos.get("leverage"))
+    if not lev or lev <= 0:
+        return False, "ADD_ON: existing position leverage unknown", 0.0
+    if not nav or nav <= 0:
+        return False, "ADD_ON: NAV unavailable", 0.0
+    coin_ntl_pct = (size or 0.0) * px / nav * 100.0
+    room_ntl_pct = MAX_COIN_NOTIONAL_NAV_PCT - coin_ntl_pct
+    room_margin_pct = min(SOT2_MAX_MARGIN_PCT, room_ntl_pct / lev)
+    if room_margin_pct < SOT2_MIN_MARGIN_PCT - 1e-9:
+        return False, (f"ADD_ON: coin notional {coin_ntl_pct:.1f}% NAV, room {max(room_ntl_pct, 0):.1f}% "
+                       f"< {SOT2_MIN_MARGIN_PCT:g}% margin x {lev:g}x (cap {MAX_COIN_NOTIONAL_NAV_PCT:g}% NAV)"), room_margin_pct
+    return True, (f"price gain {gain:+.1f}%, coin notional {coin_ntl_pct:.1f}% NAV "
+                  f"(room {room_ntl_pct:.1f}% = {room_margin_pct:.2f}% margin @ {lev:g}x)"), room_margin_pct
+
+
+def total_margin_nav_ok(margin_used: float, new_margin: float, nav: float) -> Tuple[bool, float]:
+    """GIIQ-SoT-3: total isolated margin (existing + new) <= 30% NAV. Returns (ok, pct)."""
+    if not nav or nav <= 0:
+        return False, 100.0
+    pct = (margin_used + new_margin) / nav * 100.0
+    return pct <= MAX_TOTAL_MARGIN_NAV_PCT + 1e-9, pct
+
+
+def coin_notional_ok(existing_notional: float, new_notional: float, nav: float) -> Tuple[bool, float]:
+    """GIIQ-SoT-3: one coin's notional (existing + new) <= 20% NAV. Returns (ok, pct)."""
+    if not nav or nav <= 0:
+        return False, 100.0
+    pct = (existing_notional + new_notional) / nav * 100.0
+    return pct <= MAX_COIN_NOTIONAL_NAV_PCT + 1e-9, pct
+
+
+def daily_entry_cap_ok(entries_today: int, entries_this_run: int) -> Tuple[bool, str]:
+    n = int(entries_today or 0) + int(entries_this_run or 0)
+    if n >= MAX_NEW_ENTRIES_PER_DAY:
+        return False, f"daily new-entry cap reached ({n}/{MAX_NEW_ENTRIES_PER_DAY} today)"
+    return True, f"{n}/{MAX_NEW_ENTRIES_PER_DAY} entries today"
 
 
 # ---------------------------------------------------------------- misc

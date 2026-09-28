@@ -66,6 +66,10 @@ DESK_DATA_CHUNK_BYTES = int(os.environ.get("DESK_DATA_CHUNK_BYTES") or "32000")
 # LIVE radar loop (APScheduler cron minutes, HKT). :03/:13/... sits after the :07 1H and
 # :10 4H closed-bar jobs so it never races them (it also takes the scan lock).
 LIVE_RADAR_MINUTES = (os.environ.get("OTR_LIVE_MINUTES") or "3-59/10").strip()
+# GIIQ-SoT-3: at 08:50 HKT, if Claude's ENTRY_DESK POST never arrived, Railway stores fallback decisions
+# itself (Base only, 2% margin; Chase vetoed) so the system does not depend on any desktop/agent.
+# AUTO_FALLBACK=0 disables it (then no Claude POST = no trade, fail-closed).
+AUTO_FALLBACK = (os.environ.get("AUTO_FALLBACK") or "1").strip().lower() not in ("0", "false", "no", "off")
 LIVE_LOCK_WAIT_S = int(os.environ.get("OTR_LIVE_LOCK_WAIT_S") or "240")
 # DESK_DATA volume: full set on every closed-bar job + at least every DESK_FULL_EVERY_S;
 # other 10-min live cycles log a compact set (focus rows only).
@@ -98,6 +102,13 @@ try:
     import live_radar  # 10-min LIVE radar (display only; 1 HL request per cycle)
 except ImportError:
     live_radar = None  # type: ignore
+
+try:  # GIIQ dimensions + measurement ledger (shadow only, never trades)
+    import dim_ledger
+    import dimensions as giiq_dims
+except ImportError:
+    dim_ledger = None  # type: ignore
+    giiq_dims = None  # type: ignore
 
 try:
     from decisions import store_decisions, get_decisions_for_today
@@ -1076,6 +1087,8 @@ def _build_desk_data_payload(event: str = "", now: datetime | None = None, kind:
         "exec_mode": _exec_mode(),
         "run_report": _today_run_report(now),
         "pending_entries": _pending_view(),
+        "dimensions": _dims_compact(now),
+        "exit_health": _exit_health(now, hl_data),
     }
     if kind == "full":
         payload["narrative"] = narrative
@@ -1085,6 +1098,50 @@ def _build_desk_data_payload(event: str = "", now: datetime | None = None, kind:
     for tf in ("1d", "4h", "1h"):
         payload[f"gc_radar_{tf}"] = _trim_radar(radars[tf], focus)
     return payload
+
+
+def _exit_health(now: datetime | None = None, hl_data: dict | None = None) -> dict:
+    """EXIT_DESK health (report only): NO_SL / EXIT_NOT_DONE / JOB_FAILED / MARGIN_HIGH / ... (exit_health.py)."""
+    try:
+        import exit_health
+        from mcap_tiers import tier_for as _tier_for
+        hl_data = hl_data if hl_data is not None else _get_hl_cached()
+        account = _compute_unified_equity(hl_data) if not hl_data.get("fetch_error") else {}
+        radars = {tf: _read_out_json(f"gc_radar_{tf}.json") for tf in ("1h", "4h")}
+        with _scheduler_lock:
+            jobs = dict(_scheduler_jobs_status)
+        try:
+            from pending_entries import load_pending
+            pend = load_pending()
+        except Exception:
+            pend = []
+        return exit_health.check(perp=hl_data.get("hl_perp"), open_orders=hl_data.get("hl_open_orders"),
+                                 nav=account.get("equity"), radar_1h=radars["1h"], radar_4h=radars["4h"],
+                                 tier_for=_tier_for, job_status=jobs, pending=pend, now=now)
+    except Exception as e:
+        return {"ok": False, "problems": [{"code": "HEALTH_ERROR", "coin": None, "msg": str(e)}],
+                "summary": f"health check error: {e}"}
+
+
+def _read_out_json(name: str) -> dict:
+    try:
+        with open(os.path.join(OUT_DIR, name)) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _dims_compact(now: datetime | None = None) -> dict:
+    """Today's dimension scores (shadow) for Claude's ENTRY_DESK. {} if not computed today."""
+    if not giiq_dims:
+        return {}
+    d = _read_out_json("dimensions_latest.json")
+    if not d or d.get("signal_date") != hkt_date(now or datetime.now(timezone.utc)):
+        return {"today": False, "note": "dimensions not computed yet today (08:08 HKT job)"}
+    try:
+        return {"today": True, **giiq_dims.compact(d)}
+    except Exception as e:
+        return {"error": str(e)}
 
 
 def _dumps(obj: dict) -> str:
@@ -1588,6 +1645,103 @@ def _pending_view() -> list:
         return [{"error": str(e)}]
 
 
+def _scheduled_dims(manual: bool = False, mode: str = "snapshot") -> dict:
+    """GIIQ dimensions (shadow): 08:08 snapshot (whales + HL ctx + scores + ledger rows);
+    08:30 outcomes + report. Never places orders; failures only affect the measurement."""
+    job_name = ("manual_" if manual else "") + ("dims_" + mode)
+    res: dict = {}
+    try:
+        steps = [mode] if mode != "outcomes" else ["outcomes", "report"]
+        for step in steps:
+            rc, out, err = _run_worker("dims_job.py", [step], timeout=900, force_dry_run=True)
+            try:
+                res = json.loads(out.strip().splitlines()[-1]) if out.strip() else {}
+            except Exception:
+                res = {"status": "error", "message": (err or out)[-300:]}
+            ok = rc == 0 and res.get("status") in ("success", "skipped")
+            _update_job_status(job_name, res.get("status", "error") if ok else "error",
+                               f"{step}: {json.dumps(res, default=str)[:600]}", "" if ok else (err or out)[-800:])
+            sys.stderr.write(f"[SCHEDULER] {job_name} {step}: {json.dumps(res, default=str)[:400]}\n")
+            if not ok:
+                break
+        if mode == "snapshot":
+            _log_desk_data(job_name)
+    except Exception as e:
+        _update_job_status(job_name, "error", "", str(e))
+        res = {"status": "error", "message": str(e)}
+    return res
+
+
+def build_fallback_decisions(cd: dict, now: datetime | None = None) -> tuple[list, str]:
+    """Fallback decisions from today's candidates: Base -> approve at 2% margin, Chase -> veto.
+    Returns (decisions, why_not) — decisions empty with a reason when candidates are unusable."""
+    now = now or datetime.now(timezone.utc)
+    gen = parse_ts((cd or {}).get("generated_at"))
+    if not gen or hkt_date(gen) != hkt_date(now):
+        return [], "candidates not generated today"
+    if cd.get("stale"):
+        return [], "candidates stale"
+    out = []
+    for c in cd.get("candidates") or []:
+        sym = str(c.get("symbol") or "").upper()
+        if not sym:
+            continue
+        base = bool(c.get("is_base")) or c.get("type") == "Base"
+        out.append({"symbol": sym, "decision": "approve" if base else "veto", "type": "BASE" if base else "CHASE",
+                    "size_pct": 2.0 if base else 0, "leverage": None if base else 0,
+                    "reason": ("RAILWAY_FALLBACK: no Claude POST by 08:50 - Base only, 2% margin" if base
+                               else "RAILWAY_FALLBACK: no Claude POST - Chase not allowed in fallback")})
+    return out, ""
+
+
+def _scheduled_fallback(manual: bool = False) -> dict:
+    """08:50 HKT: if no Claude decision is stored today, store fallback decisions (source=fallback).
+    Manual (password) runs only preview; they never store."""
+    job_name = "manual_decision_fallback" if manual else "decision_fallback"
+    res: dict = {}
+    try:
+        from decisions import _rec_source
+        decs = get_decisions_for_today() if get_decisions_for_today else {}
+        if any(_rec_source(r) == "claude" for r in (decs or {}).values()):
+            res = {"status": "skipped", "message": "Claude decisions present - no fallback"}
+        elif decs:
+            res = {"status": "skipped", "message": f"fallback already stored ({len(decs)} decisions)"}
+        else:
+            fb, why = build_fallback_decisions(_load_candidates_file())
+            if why:
+                res = {"status": "skipped", "message": f"no fallback: {why}"}
+            elif manual or not AUTO_FALLBACK:
+                res = {"status": "preview", "would_store": fb,
+                       "message": "preview only" if manual else "AUTO_FALLBACK=0 - not stored (no trade today)"}
+            else:
+                stored = store_decisions(fb, source="fallback")
+                if dim_ledger and stored.get("stored"):
+                    try:
+                        conn = dim_ledger.connect()
+                        dim_ledger.record_decisions(conn, hkt_date(datetime.now(timezone.utc)), stored["stored"],
+                                                    source="fallback")
+                        conn.close()
+                    except Exception as e:
+                        stored["ledger_error"] = str(e)
+                stored.pop("stored", None)
+                res = {"status": "success" if stored.get("ok") else "error",
+                       "message": f"RAILWAY_FALLBACK stored: {stored.get('stored_count')} decisions "
+                                  f"({sum(1 for d in fb if d['decision'] == 'approve')} Base approvals @2%)",
+                       "result": stored}
+        _update_job_status(job_name, res.get("status", "error") if res.get("status") != "preview" else "success",
+                           res.get("message", ""))
+        banner = "!!!!!!!! " if res.get("status") == "success" and not manual else ""
+        sys.stderr.write(f"[SCHEDULER] {banner}{job_name}: {res.get('message')}\n")
+    except Exception as e:
+        _update_job_status(job_name, "error", "", str(e))
+        res = {"status": "error", "message": str(e)}
+    return res
+
+
+def _scheduled_dims_outcomes(manual: bool = False) -> dict:
+    return _scheduled_dims(manual=manual, mode="outcomes")
+
+
 MANUAL_JOBS = {
     "1d": _scheduled_1d_scan,
     "1h": _scheduled_1h_scan_exits,
@@ -1595,6 +1749,9 @@ MANUAL_JOBS = {
     "executor": _scheduled_executor,
     "live": _scheduled_live_radar,
     "pending": _scheduled_pending,
+    "dims": _scheduled_dims,
+    "dims_outcomes": _scheduled_dims_outcomes,
+    "fallback": _scheduled_fallback,
 }
 _manual_running: set = set()
 _manual_lock = threading.Lock()
@@ -1659,6 +1816,12 @@ def _init_scheduler() -> BackgroundScheduler | None:
                           id="1h_scan_exits", name="1H Scan + Small/Tiny Exits", **common)
         scheduler.add_job(_scheduled_4h_scan_exits, CronTrigger(hour="0,4,8,12,16,20", minute=10, timezone=hkt),
                           id="4h_scan_exits", name="4H Scan + Mega/Large Exits", **common)
+        scheduler.add_job(_scheduled_dims, CronTrigger(hour=8, minute=8, timezone=hkt),
+                          id="dims_snapshot", name="GIIQ dimensions snapshot (shadow)", **common)
+        scheduler.add_job(_scheduled_dims_outcomes, CronTrigger(hour=8, minute=30, timezone=hkt),
+                          id="dims_outcomes", name="GIIQ dimension outcomes + report (shadow)", **common)
+        scheduler.add_job(_scheduled_fallback, CronTrigger(hour=8, minute=50, timezone=hkt),
+                          id="decision_fallback", name="Decision fallback if no Claude POST (Base only, 2%)", **common)
         scheduler.add_job(_scheduled_preflight, CronTrigger(hour=8, minute=45, timezone=hkt),
                           id="exec_preflight", name="LIVE executor preflight (agent/key/signing)",
                           **common)
@@ -1675,6 +1838,9 @@ def _init_scheduler() -> BackgroundScheduler | None:
         sys.stderr.write(
             "[SCHEDULER] APScheduler started (Asia/Hong_Kong)\n"
             "  - 08:05 HKT: 1D+4H scan + entry candidates\n"
+            "  - 08:08 HKT: GIIQ dimensions snapshot (shadow; whales + HL ctx)\n"
+            "  - 08:30 HKT: GIIQ dimension outcomes + report (shadow)\n"
+            f"  - 08:50 HKT: decision fallback if no Claude POST (AUTO_FALLBACK={'on' if AUTO_FALLBACK else 'off'})\n"
             "  - Hourly :07: 1H scan + Small/Tiny exits\n"
             "  - Every 4h :10: 4H scan + Mega/Large exits\n"
             "  - boot + 08:45 HKT: LIVE executor preflight\n"
@@ -1844,6 +2010,27 @@ class Handler(SimpleHTTPRequestHandler):
         if path == "/api/exec/preflight":
             self._exec_preflight()
             return
+        if path == "/api/exit/health":
+            if self._ai_key_ok():
+                self._send_json(200, _exit_health())
+            return
+        if path == "/api/ai/dimensions":
+            if self._ai_key_ok():
+                d = _read_out_json("dimensions_latest.json")
+                self._send_json(200 if d else 404, d or {"ok": False, "error": "dimensions not computed yet"})
+            return
+        if path == "/api/dimensions/report":
+            if self._ai_key_ok():
+                self._dims_report(parsed.query)
+            return
+        if path == "/api/whales":
+            if self._ai_key_ok():
+                snap = _read_out_json(os.path.join("whales", "latest.json"))
+                wl = _read_out_json("whales_watchlist.json")
+                self._send_json(200, {"ok": bool(snap), "snapshot": {k: snap.get(k) for k in
+                                      ("ts", "n_wallets", "n_manual", "errors", "wallets")} if snap else None,
+                                      "coins": snap.get("coins") if snap else None, "watchlist": wl})
+            return
         if path == "/api/exec/pending":
             if self._ai_key_ok():
                 try:
@@ -1885,6 +2072,9 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if path == "/api/ai/decision":
             self._ai_decision()
+            return
+        if path == "/api/whales/watchlist":
+            self._whales_watchlist()
             return
         if path == "/api/ai/narrative":
             self._ai_narrative()
@@ -2154,6 +2344,43 @@ class Handler(SimpleHTTPRequestHandler):
             return
         self._send_json(200, {"ok": True, **res})
 
+    def _dims_report(self, query_str: str) -> None:
+        """GET /api/dimensions/report?since=YYYY-MM-DD&type=Base|Chase&metric=ret_7d_sl (keyed)."""
+        if not dim_ledger:
+            self._send_json(500, {"ok": False, "error": "dim_ledger not available"})
+            return
+        qs = parse_qs(query_str)
+        metric = (qs.get("metric") or ["ret_7d_sl"])[0]
+        if metric not in ("ret_7d_sl", "ret_7d", "ret_3d", "ret_1d", "mfe_7d"):
+            self._send_json(400, {"ok": False, "error": "bad metric"})
+            return
+        try:
+            conn = dim_ledger.connect()
+            rep = dim_ledger.report(conn, metric=metric, since=(qs.get("since") or [None])[0],
+                                    sig_type=(qs.get("type") or [None])[0])
+            conn.close()
+            self._send_json(200, {"ok": True, **rep})
+        except Exception as e:
+            self._send_json(500, {"ok": False, "error": str(e)})
+
+    def _whales_watchlist(self) -> None:
+        """POST /api/whales/watchlist (keyed) {"wallets": [{"address","label","source"}]} — replaces
+        the manual smart-money list (e.g. traders found on fomo.family / HyperDash). Public addresses only."""
+        if not self._ai_key_ok():
+            return
+        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            body = json.loads((self.rfile.read(length) if length else b"{}").decode() or "{}")
+        except Exception:
+            self._send_json(400, {"ok": False, "error": "invalid json"})
+            return
+        try:
+            import whales
+            res = whales.save_manual_watchlist(OUT_DIR, body.get("wallets") or [])
+            self._send_json(200 if res.get("ok") else 400, res)
+        except Exception as e:
+            self._send_json(500, {"ok": False, "error": str(e)})
+
     def _ai_key_ok(self) -> bool:
         provided = self.headers.get("X-AI-Key") or (parse_qs(urlparse(self.path).query).get("key") or [""])[0]
         if not AI_DECISION_KEY:
@@ -2243,11 +2470,26 @@ class Handler(SimpleHTTPRequestHandler):
             self._send_json(500, {"ok": False, "error": "decisions module not available"})
             return
         
+        src = "fallback" if str(body.get("source") or "").lower() == "fallback" else "claude"
         try:
-            result = store_decisions(decisions)
-            self._send_json(200, result)
+            result = store_decisions(decisions, source=src)
         except Exception as e:
             self._send_json(500, {"ok": False, "error": str(e)})
+            return
+        # Measurement ledger (Claude dims + decision per signal). Never blocks the decision itself.
+        if dim_ledger and result.get("stored"):
+            try:
+                conn = dim_ledger.connect()
+                today = hkt_date(datetime.now(timezone.utc))
+                result["ledger_recorded"] = dim_ledger.record_decisions(conn, today, result["stored"], source=src)
+                conn.close()
+            except Exception as e:
+                result["ledger_error"] = str(e)
+        result.pop("stored", None)
+        if not result.get("ok"):
+            sys.stderr.write(f"[AI_DECISION] !!!!!!!! nothing stored: {json.dumps(result)[:500]}\n")
+        code = 200 if result.get("ok") else (409 if "fallback ignored" in str(result.get("error")) else 422)
+        self._send_json(code, result)
 
     def _public_radar(self) -> None:
         """GET /api/public/radar: public trimmed radar feed (no auth, no positions).

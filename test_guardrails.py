@@ -33,7 +33,7 @@ def _radar(n, requested=None):
 
 class TestSotId(unittest.TestCase):
     def test_sot_id(self):
-        self.assertEqual(ec.SOT_ID, "GIIQ-SoT-2")
+        self.assertEqual(ec.SOT_ID, "GIIQ-SoT-3")
         doc = (ROOT / "docs" / "SOT_CHANGELOG.md").read_text(encoding="utf-8")
         self.assertIn("GIIQ-SoT-1", doc)
         self.assertIn("GIIQ-SoT-2", doc)
@@ -181,12 +181,25 @@ class TestSot2Sizing(unittest.TestCase):
             self.assertFalse(hasattr(ec, name), name)
 
     def test_addon_gates(self):
-        self.assertFalse(ec.addon_gates({"roe_pct": 9.9, "margin_used": 10}, 1000)[0])
-        self.assertFalse(ec.addon_gates({"roe_pct": 20, "margin_used": 36}, 1000)[0])  # 3.6% + 2% > 5.5%
-        ok, _why, room = ec.addon_gates({"roe_pct": 20, "margin_used": 30}, 1000)
+        # GIIQ-SoT-3: PRICE gain >= +10% (not leveraged ROE) and coin notional <= 20% NAV after the add
+        pos = {"entry_px": 100.0, "size": 1.0, "leverage": 4}
+        self.assertFalse(ec.addon_gates(pos, 1000, 109.0)[0])            # +9% price
+        ok, _why, room = ec.addon_gates(pos, 1000, 110.0)                # 11% NAV notional -> room 9% / 4x
         self.assertTrue(ok)
-        self.assertAlmostEqual(room, 2.5)
-        self.assertFalse(ec.addon_gates(None, 1000)[0])
+        self.assertAlmostEqual(room, 2.25)
+        self.assertFalse(ec.addon_gates({**pos, "size": 1.5}, 1000, 110.0)[0])  # 16.5% -> room 3.5%/4x < 2%
+        self.assertFalse(ec.addon_gates({**pos, "leverage": None}, 1000, 120.0)[0])
+        self.assertFalse(ec.addon_gates(None, 1000, 110.0)[0])
+        self.assertFalse(ec.addon_gates(pos, 1000, None)[0])
+
+    def test_sot3_portfolio_caps(self):
+        self.assertTrue(ec.total_margin_nav_ok(250, 50, 1000)[0])
+        self.assertFalse(ec.total_margin_nav_ok(260, 50, 1000)[0])
+        self.assertTrue(ec.coin_notional_ok(100, 100, 1000)[0])
+        self.assertFalse(ec.coin_notional_ok(150, 60, 1000)[0])
+        self.assertTrue(ec.daily_entry_cap_ok(1, 1)[0])
+        self.assertFalse(ec.daily_entry_cap_ok(2, 1)[0])
+        self.assertEqual(ec.SOT_ID, "GIIQ-SoT-3")
 
 
 class TestExecutorGuardrails(EnvMixin, unittest.TestCase):

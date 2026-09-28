@@ -273,30 +273,31 @@ class TestWorker(unittest.TestCase):
         self.assertIn("SL distance", res["checked"][0]["reason"])
         self.assertEqual(ents[0]["status"], "pending")
 
-    def _add_on_run(self, roe, margin_used):
-        pos = {"coin": "AAA", "szi": "50", "entryPx": "0.9", "liquidationPx": "0.4",
-               "returnOnEquity": str(roe), "marginUsed": str(margin_used)}
+    def _add_on_run(self, entry_px, szi):
+        pos = {"coin": "AAA", "szi": str(szi), "entryPx": str(entry_px), "liquidationPx": "0.4",
+               "returnOnEquity": "0.30", "marginUsed": "15"}
         hl = FakeHL(mids={"AAA": 1.01}, positions=[pos], lev=3)
         ents = self.entry(kind=pe.ADD_ON, lev=2, tier="large")
         res = self.run_w(hl, ents, bar(0.99, 1.02), h4=_row(0.95, 1.00, 1.03), d1=_row(0.5, 0.6, 1.0))
         return hl, ents, res
 
-    def test_add_on_requires_roe_10pct(self):
-        hl, ents, res = self._add_on_run(0.08, 15)  # ROE +8%
+    def test_add_on_requires_price_gain_10pct(self):
+        # GIIQ-SoT-3: +10% PRICE gain vs entry (1x meaning), not leveraged ROE (ROE here is +30%)
+        hl, ents, res = self._add_on_run(0.93, 50)  # 1.01 / 0.93 = +8.6%
         self.assertEqual(hl.calls, [])
         self.assertEqual(ents[0]["status"], "pending")
-        self.assertIn("ROE 8.0% < +10%", res["checked"][0]["reason"])
-        self.assertTrue(any("ROE 8.0%" in x["reason"] for x in res["run_report"]["skipped"]))
+        self.assertIn("price gain +8.6% < +10%", res["checked"][0]["reason"])
+        self.assertTrue(any("price gain" in x["reason"] for x in res["run_report"]["skipped"]))
 
-    def test_add_on_coin_exposure_cap_5_5pct(self):
-        hl, ents, res = self._add_on_run(0.30, 40)  # 4.0% NAV used + 2% min add > 5.5%
+    def test_add_on_coin_notional_cap_20pct(self):
+        hl, ents, res = self._add_on_run(0.9, 150)  # 15.15% NAV notional -> room 4.85%/3x = 1.6% < 2%
         self.assertEqual(hl.calls, [])
-        self.assertIn("5.5% cap", res["checked"][0]["reason"])
+        self.assertIn("cap 20% NAV", res["checked"][0]["reason"])
 
-    def test_add_on_margin_limited_by_exposure_room(self):
-        hl, ents, res = self._add_on_run(0.30, 30)  # 3.0% used -> room 2.5% (< 4% cap)
+    def test_add_on_margin_limited_by_notional_room(self):
+        hl, ents, res = self._add_on_run(0.9, 110)  # 11.11% NAV notional -> room 8.89% / 3x = 2.963% margin
         self.assertEqual(ents[0]["status"], "filled", res["checked"])
-        self.assertAlmostEqual(res["filled"][0]["size_pct"], 2.5, 3)
+        self.assertAlmostEqual(res["filled"][0]["size_pct"], (20 - 110 * 1.01 / 1000 * 100) / 3, 3)
         self.assertEqual(hl.calls[0], ("set_leverage", "AAA", 3))
 
     def test_live_state_persisted_bar_n_then_n1_fill(self):

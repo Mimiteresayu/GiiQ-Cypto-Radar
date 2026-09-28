@@ -18,8 +18,9 @@ after the exit worker finished OK (exits -> re-fetch positions here -> entries);
 --after-exits <ts>.
 Sizing (GIIQ-SoT-2): exec_common.size_by_margin (risk = isolated margin 2-4% NAV, 3-5x isolated,
 liq strictly below the Hard SL - step leverage down toward 3x, skip if impossible; 80% margin cap).
-ADD_ON keeps the existing position's leverage and additionally needs existing ROE >= +10% and
-coin margin after the add <= 5.5% NAV (exec_common.addon_gates); otherwise it stays pending with
+ADD_ON keeps the existing position's leverage and additionally needs
+base position PRICE gain >= +10% and coin notional after the add <= 20% NAV (GIIQ-SoT-3,
+exec_common.addon_gates); total margin <= 30% NAV; max 3 new fills per HKT day; otherwise it stays pending with
 the reason in the run report.
 DRY_RUN unless EXEC_DRY_RUN=0 AND HL_API_PRIVATE_KEY (exec_common.is_live_mode). In DRY_RUN the
 store is not modified. Prints one JSON object; exit 0 ok, 1 error.
@@ -54,6 +55,11 @@ from exec_common import (  # noqa: E402
     isolated_liq_price_long,
     liq_beyond_sl_long,
     margin_cap_ok,
+    coin_notional_ok,
+    daily_entry_cap_ok,
+    total_margin_nav_ok,
+    MAX_COIN_NOTIONAL_NAV_PCT,
+    MAX_TOTAL_MARGIN_NAV_PCT,
     order_qty,
     parse_ts,
     round_price,
@@ -180,6 +186,12 @@ def _run_pending(hl: Any = None, radar_1d: Optional[dict] = None, radar_4h: Opti
     except ValueError:
         pass
     dirty = False
+    try:  # GIIQ-SoT-3 daily cap: real fills already made today (08:55 executor + earlier pending fills)
+        from trade_log import count_entries_today
+        entries_today = count_entries_today(now, dry_run=False)
+    except Exception:  # noqa: BLE001
+        entries_today = 0
+    entries_run = 0
 
     for rec in act:
         sym, kind = rec["symbol"], rec["kind"]
@@ -244,15 +256,19 @@ def _run_pending(hl: Any = None, radar_1d: Optional[dict] = None, radar_4h: Opti
         if not hard_sl or hard_sl <= 0:
             note(f"no Hard SL level ({sl_label})")
             continue
+        ok_day, why_day = daily_entry_cap_ok(entries_today, entries_run)
+        if not ok_day:
+            note(f"in zone but {why_day}")
+            continue
         fixed_lev, room, lev_note = None, None, ""
         if kind == ADD_ON:
-            ok_add, why_add, room = addon_gates(pos_by_coin.get(sym), equity)
-            if not ok_add:
-                note(f"in zone but {why_add}")
-                continue
             fixed_lev = lev_by_coin.get(sym) or (pos_by_coin.get(sym) or {}).get("leverage")
             if not fixed_lev:
                 note("ADD_ON: existing position leverage unknown")
+                continue
+            ok_add, why_add, room = addon_gates(pos_by_coin.get(sym), equity, mid, fixed_lev)
+            if not ok_add:
+                note(f"in zone but {why_add}")
                 continue
             lev_note = f" (ADD_ON keeps existing isolated {fixed_lev}x; {why_add})"
         ok_px, _diff, why_px = price_sane(mid, radar_ref_price(rows_4h.get(sym), rows_1d.get(sym)))
@@ -282,6 +298,15 @@ def _run_pending(hl: Any = None, radar_1d: Optional[dict] = None, radar_4h: Opti
         if not ok_cap:
             note(f"margin utilization {util:.1f}% > {MAX_MARGIN_UTILIZATION_PCT}% (cumulative)")
             continue
+        ok_tot, tot_pct = total_margin_nav_ok(cum_margin, margin_usd, equity)
+        if not ok_tot:
+            note(f"total margin {tot_pct:.1f}% NAV > {MAX_TOTAL_MARGIN_NAV_PCT:g}% cap (cumulative)")
+            continue
+        existing_ntl = ((pos_by_coin.get(sym) or {}).get("size") or 0.0) * mid if kind == ADD_ON else 0.0
+        ok_coin, coin_pct = coin_notional_ok(existing_ntl, notional, equity)
+        if not ok_coin:
+            note(f"coin notional {coin_pct:.1f}% NAV > {MAX_COIN_NOTIONAL_NAV_PCT:g}% cap")
+            continue
         est_liq = sz["liq"]
         intent = {"id": rec["id"], "symbol": sym, "kind": kind, "mid": mid, "limit_px": limit_px, "qty": qty,
                   "size_pct": size_pct, "leverage": leverage, "notional_usd": round(notional, 2),
@@ -293,6 +318,7 @@ def _run_pending(hl: Any = None, radar_1d: Optional[dict] = None, radar_4h: Opti
         trade_id = f"{sym}_{kind}_{now.strftime('%Y%m%d_%H%M%S')}"
         if not live:
             cum_margin += margin_usd
+            entries_run += 1
             check["result"] = "would_fill"
             res["filled"].append({**intent, "dry_run": True})
             _log(f"DRY_RUN would fill {kind} {sym} qty={qty} limit={limit_px} {leverage}x | SL {hard_sl}{lev_note}")
@@ -304,6 +330,7 @@ def _run_pending(hl: Any = None, radar_1d: Optional[dict] = None, radar_4h: Opti
         st = r.get("status")
         if st == "executed":
             cum_margin += (r.get("filled_sz") or qty) * (r.get("avg_px") or limit_px) / leverage
+            entries_run += 1
             mark("filled", f"filled {r.get('filled_sz')} @ {r.get('avg_px')}")
             rec["fill"] = {"qty": r.get("filled_sz"), "avg_px": r.get("avg_px"), "sl_oid": r.get("sl_oid"),
                            "hard_sl": hard_sl, "leverage": leverage, "at": now.isoformat()}

@@ -1,0 +1,4 @@
+{
+  "note": "Manual smart-money wallets (public HL addresses only, never keys). Add traders you follow on fomo.family / HyperDash / CoinGlass. Runtime copy on the volume (out/whales_watchlist.json, via POST /api/whales/watchlist) overrides this file.",
+  "wallets": []
+}

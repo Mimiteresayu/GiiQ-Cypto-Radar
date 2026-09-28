@@ -12,7 +12,10 @@ SoT enforcement (see exec_common.py):
   ADD_ON (coin already held LONG, zone [4H Lower, 4H Filter]) or CONTINUATION (no position,
   zone [1D Lower, 1D Filter]); pending_worker.py checks them hourly with the same SoT checks.
   Pending records are only written in LIVE mode (DRY_RUN reports "would_create").
-- Total margin (existing + all new entries, cumulative) <= 80% equity
+- Total margin (existing + all new entries, cumulative) <= 80% equity AND <= 30% NAV (GIIQ-SoT-3)
+- GIIQ-SoT-3: coin notional <= 20% NAV; max 3 new fills per HKT day (Base + pending together);
+  fallback decisions (Harbor, only when Claude's POST never arrived) = Base only at 2% margin;
+  loud alert when Claude's POST is missing (RED after 2 consecutive days)
 - All open positions must already have liq beyond their tier Hard SL
 - BTC 4H close < 4H Filter -> fixed 4% per coin
 - size_pct = margin % of equity; notional = margin x leverage; qty = notional / price
@@ -75,6 +78,12 @@ from exec_common import (  # noqa: E402
     margin_cap_ok,
     order_qty,
     round_price,
+    coin_notional_ok,
+    daily_entry_cap_ok,
+    total_margin_nav_ok,
+    FALLBACK_MARGIN_PCT,
+    MAX_COIN_NOTIONAL_NAV_PCT,
+    MAX_TOTAL_MARGIN_NAV_PCT,
 )
 
 from pending_entries import band as pending_band  # noqa: E402
@@ -83,7 +92,7 @@ from pending_entries import summary as pending_summary  # noqa: E402
 
 try:
     from decisions import get_decisions_for_today
-    from trade_log import log_entry
+    from trade_log import log_entry, count_entries_today
     from mcap_tiers import tier_for
 except ImportError as e:  # pragma: no cover
     print(f"ERROR: {e}", file=sys.stderr)
@@ -256,7 +265,21 @@ def _execute(
     }
 
     candidates_data = _load_candidates() if candidates_data is None else candidates_data
-    decisions = get_decisions_for_today() if decisions is None else decisions
+    if decisions is None:
+        decisions = get_decisions_for_today()
+        # GIIQ-SoT-3: loud when Claude's ENTRY_DESK POST never arrived (fallback-only day)
+        try:
+            from decisions import days_without_claude
+            miss = days_without_claude(now)
+            result["claude_post"] = {"missing_days": miss}
+            if miss >= 2:
+                result["alerts"].append(f"RED: no Claude ENTRY_DESK POST for {miss} days in a row "
+                                        f"(POST_BLOCKED?) - fallback only (Base, {FALLBACK_MARGIN_PCT:g}%)")
+            elif miss == 1:
+                result["alerts"].append(f"Claude ENTRY_DESK POST missing today - fallback only "
+                                        f"(Base, {FALLBACK_MARGIN_PCT:g}%)")
+        except Exception as e:  # noqa: BLE001
+            result["alerts"].append(f"claude POST check failed: {e}")
     approved = [s for s, rec in decisions.items() if rec.get("decision") == "approve"]
     result["approved_decisions"] = {s: {"size_pct": decisions[s].get("size_pct"),
                                         "leverage": decisions[s].get("leverage")} for s in approved}
@@ -336,6 +359,12 @@ def _execute(
             return result
 
     slip = _entry_slippage_pct()
+    try:  # GIIQ-SoT-3 daily cap counts real fills already made today (08:55 + pending fills)
+        entries_today = count_entries_today(now, dry_run=False)
+    except Exception:  # noqa: BLE001
+        entries_today = 0
+    entries_run = 0
+    result["entries_today_before"] = entries_today
     for cand in candidates:
         symbol = cand.get("symbol", "")
         if symbol not in approved:
@@ -349,6 +378,10 @@ def _execute(
             _log(f"{mode} SKIP {symbol}: {reason}")
 
         is_base = bool(cand.get("is_base")) or entry_type == "Base"
+        fallback = str(decision.get("source") or "") == "fallback"
+        if fallback and not is_base:
+            skip("fallback decision: Base only (no Chase / pending add-on)")
+            continue
         if not is_base and entry_type == "Chase":
             # Chase -> pending pullback entry (ADD_ON / CONTINUATION), never an 08:55 order
             if symbol in held and symbol not in held_long:
@@ -416,7 +449,12 @@ def _execute(
             continue
 
         limit_px = round_price(mid * (1 + slip / 100.0), sz_dec)
-        sz = size_by_margin(equity, limit_px, hard_sl, coin_max, decision.get("size_pct"), decision.get("leverage"))
+        ok_day, why_day = daily_entry_cap_ok(entries_today, entries_run)
+        if not ok_day:
+            skip(why_day)
+            continue
+        ai_size = FALLBACK_MARGIN_PCT if fallback else decision.get("size_pct")
+        sz = size_by_margin(equity, limit_px, hard_sl, coin_max, ai_size, decision.get("leverage"))
         if not sz["ok"]:
             skip(sz["reason"], mid=mid)
             continue
@@ -434,6 +472,15 @@ def _execute(
         ok_cap, util = margin_cap_ok(cum_margin, margin_usd, equity)
         if not ok_cap:
             skip(f"Margin utilization {util:.1f}% > {MAX_MARGIN_UTILIZATION_PCT}% (cumulative)", size_pct=size_pct, leverage=leverage)
+            continue
+        ok_tot, tot_pct = total_margin_nav_ok(cum_margin, margin_usd, equity)
+        if not ok_tot:
+            skip(f"total margin {tot_pct:.1f}% NAV > {MAX_TOTAL_MARGIN_NAV_PCT:g}% cap (cumulative)",
+                 size_pct=size_pct, leverage=leverage)
+            continue
+        ok_coin, coin_pct = coin_notional_ok(0.0, notional, equity)
+        if not ok_coin:
+            skip(f"coin notional {coin_pct:.1f}% NAV > {MAX_COIN_NOTIONAL_NAV_PCT:g}% cap", size_pct=size_pct, leverage=leverage)
             continue
         est_liq = sz["liq"]  # worst-case (highest) entry; strictly below the Hard SL
 
@@ -457,10 +504,12 @@ def _execute(
             "entry_upper_ref": upper_ref, "entry_upper_label": upper_label,
             "risk_margin_pct": round(margin_usd / equity * 100.0, 3), "sizing_notes": sz.get("notes"),
             "ai_size_pct": decision.get("size_pct"), "ai_leverage": decision.get("leverage"),
+            "decision_source": decision.get("source") or "claude", "total_margin_nav_pct": round(tot_pct, 2),
         }
 
         if not live:
             cum_margin += margin_usd
+            entries_run += 1
             result["actions"].append(intent)
             _log(
                 f"DRY_RUN would place: BUY {symbol} qty={qty} IOC limit={limit_px} (mid {mid}) {leverage}x isolated "
@@ -481,6 +530,7 @@ def _execute(
         st = r.get("status")
         if st == "executed":
             cum_margin += (r.get("filled_sz") or qty) * (r.get("avg_px") or limit_px) / leverage
+            entries_run += 1
             result["executed"].append(intent)
             log_entry(trade_id=trade_id, symbol=symbol, entry_type=entry_type, tier=tier,
                       trend_1d=cand.get("trend_1d", ""), trend_4h=cand.get("trend_4h", ""),
