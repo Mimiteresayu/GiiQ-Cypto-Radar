@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Pending pullback worker, run on closed 4H bars (Railway 4H :10 job, right after the 4H scan).
-See pending_entries.py for the rules.
+"""Pending pullback worker, run in the Railway 4H :10 job (right after the 4H scan + exits).
+N / N+1 confirmation on the band TF (ADD_ON 4H, CONTINUATION 1D) — see pending_entries.py.
 
 For each ACTIVE pending entry (created by the executor from AI-approved Chase decisions):
   expire (7d) / cancel (band TF closed below Lower, CONTINUATION already held, ADD_ON base gone)
-  / wait / trigger when the just-closed 4H bar's low touched the zone (<= Filter) with its close
-  above the zone Lower, and the live HL mid is within [Lower, Filter*1.01] (band TF trend Green).
+  / wait (bar N detection) / trigger when bar N+1 confirms (close > Lower and > bar N close);
+  the entry is then placed at the live HL mid.
 On trigger the SAME fail-closed SoT checks as the executor run again at fill time:
   radar freshness, all open positions liq beyond tier Hard SL, Hard SL per tier (4H radar),
   SL distance >= 1.5% from live mid, SoT size band + 1-5x/coin maxLeverage, min notional,
@@ -65,15 +65,15 @@ def _radar_age_h(radar: dict, now: datetime) -> Optional[float]:
     return (now - ts).total_seconds() / 3600.0 if ts else None
 
 
-def closed_4h_bar(hl: Any, coin: str, now: datetime) -> Optional[dict]:
-    """Just-closed 4H candle from HL candleSnapshot -> {"t","l","c"} or None (fail-closed)."""
-    bar_ms = 4 * 3600 * 1000
+def closed_bar(hl: Any, coin: str, tf: str, now: datetime) -> Optional[dict]:
+    """Latest CLOSED candle of tf (4h / 1d) from HL candleSnapshot -> {"t","l","c"} or None."""
+    bar_ms = {"4h": 4 * 3600 * 1000, "1d": 86400 * 1000}[tf]
     now_ms = int(now.timestamp() * 1000)
     try:
         bars = hl.info({"type": "candleSnapshot",
-                        "req": {"coin": coin, "interval": "4h", "startTime": now_ms - 3 * bar_ms, "endTime": now_ms}})
+                        "req": {"coin": coin, "interval": tf, "startTime": now_ms - 3 * bar_ms, "endTime": now_ms}})
     except Exception as e:  # noqa: BLE001
-        _log(f"{coin}: 4H candle fetch failed: {e}")
+        _log(f"{coin}: {tf} candle fetch failed: {e}")
         return None
     closed = [b for b in (bars or []) if int(b.get("t", 0)) + bar_ms <= now_ms]
     if not closed:
@@ -140,14 +140,18 @@ def run_pending(hl: Any = None, radar_1d: Optional[dict] = None, radar_4h: Optio
     for rec in act:
         sym, kind = rec["symbol"], rec["kind"]
         bnd = band(kind, rows_1d.get(sym), rows_4h.get(sym))
-        bar4h = (bar_fn or closed_4h_bar)(hl, sym, now)
+        bar = (bar_fn or closed_bar)(hl, sym, bnd["tf"], now)
         try:  # fresh live mid right before deciding
             mid = (hl.all_mids() or mids).get(sym)
         except Exception:  # noqa: BLE001
             mid = None
-        action, why = evaluate(rec, bnd, mid, now, held_long, bar4h)
+        action, why, upd = evaluate(rec, bnd, mid, now, held_long, bar)
+        if live and upd:
+            rec.update(upd)
+            dirty = True
         check = {"id": rec["id"], "symbol": sym, "kind": kind, "action": action, "reason": why,
-                 "zone": [bnd["lower"], bnd["filter"]], "band_tf": bnd["tf"], "mid": mid, "bar4h": bar4h}
+                 "zone": [bnd["lower"], bnd["filter"]], "band_tf": bnd["tf"], "mid": mid, "bar": bar,
+                 "setup": upd.get("setup", rec.get("setup"))}
         res["checked"].append(check)
 
         def mark(status: str, reason: str) -> None:

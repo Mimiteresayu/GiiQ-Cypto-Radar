@@ -7,11 +7,15 @@ Rules (MMT, 2026-09-28):
   [4H Lower, 4H Filter] (latest closed 4H bar), 4H trend must be Green.
 - CONTINUATION: approved Chase with no position. No 08:55 entry; zone = [1D Lower, 1D Filter]
   (latest closed 1D bar), 1D trend must be Green.
-- Checked every 4H on closed 4H bars (Railway 4H :10 job). Trigger when the JUST-CLOSED 4H bar's
-  low touched the zone (low <= zone Filter) AND that bar's close is still above the zone Lower;
-  then enter at live mid only if mid is within [Lower, Filter * 1.01].
+- Checked in the Railway 4H :10 job (both kinds), with N / N+1 confirmation on the band TF:
+  bar N   = a closed band-TF bar with low <= Filter AND close > Lower  -> stored as `setup`
+  bar N+1 = the NEXT closed band-TF bar: close > Lower AND close > bar N close -> trigger; the entry
+            is placed at the live mid right after N+1 closed (same fail-closed checks as the executor).
+  If N+1 does not confirm, it is itself re-evaluated as a new bar N. ADD_ON uses 4H bars; for
+  CONTINUATION the 4H job only acts when a new 1D bar has closed (first 4H run after 08:00 HKT).
+  Only bars that close after the pending was created count; each bar is processed once.
 - Created only from AI-approved decisions (approved size_pct / leverage kept, re-clamped to
-  SoT bands at fill time). Cancelled when the relevant TF (ADD_ON 4H / CONTINUATION 1D) CLOSES
+  SoT bands at fill time). Cancelled when any band-TF close (ADD_ON 4H / CONTINUATION 1D) is
   below its Lower, or after PENDING_TTL_DAYS (7).
 - Idempotent: one record per (symbol, kind, HKT decision date); filled/cancelled records are
   never re-armed; a CONTINUATION whose coin is already held is cancelled; an ADD_ON whose base
@@ -32,7 +36,7 @@ from exec_common import HKT, parse_ts
 
 ROOT = Path(__file__).resolve().parent
 PENDING_TTL_DAYS = 7
-ENTRY_FILTER_SLACK = 1.01  # enter only if live mid <= zone Filter * 1.01
+BAR_MS = {"4h": 4 * 3600 * 1000, "1d": 86400 * 1000}
 ADD_ON = "ADD_ON"
 CONTINUATION = "CONTINUATION"
 BAND_TF = {ADD_ON: "4h", CONTINUATION: "1d"}
@@ -112,41 +116,65 @@ def create_pending(entries: List[dict], symbol: str, kind: str, decision: dict, 
 
 
 def evaluate(rec: dict, bnd: Dict[str, Any], mid: Optional[float], now: datetime,
-             held_long: set, bar4h: Optional[dict] = None) -> Tuple[str, str]:
-    """-> (action, reason); action in expire|cancel|wait|trigger. Fail-closed: missing data -> wait.
+             held_long: set, bar: Optional[dict] = None) -> Tuple[str, str, Dict[str, Any]]:
+    """N / N+1 pullback state machine for one pending record.
 
-    bar4h = the just-closed 4H candle {"t", "l", "c"} (floats) for this coin."""
+    bnd = band-TF radar values of the latest CLOSED bar (lower/filter/close/trend/bar_time).
+    bar = latest CLOSED band-TF candle from HL {"t","l","c"}.
+    -> (action, reason, updates); action in expire|cancel|wait|trigger; `updates` are record
+    fields (setup / last_bar_t) the caller persists in LIVE mode. Missing/misaligned data -> wait
+    without consuming the bar (fail-closed, retried next 4H run)."""
     exp = parse_ts(rec.get("expires_at"))
     if exp and now >= exp:
-        return "expire", f"expired after {PENDING_TTL_DAYS} days"
+        return "expire", f"expired after {PENDING_TTL_DAYS} days", {}
     sym, kind = rec.get("symbol"), rec.get("kind")
     if kind == CONTINUATION and sym in held_long:
-        return "cancel", "coin already held (idempotent: not adding a CONTINUATION)"
+        return "cancel", "coin already held (idempotent: not adding a CONTINUATION)", {}
     if kind == ADD_ON and sym not in held_long:
-        return "cancel", "base position no longer held"
-    lo, fi, cl, tr = bnd.get("lower"), bnd.get("filter"), bnd.get("close"), bnd.get("trend")
-    tf = (bnd.get("tf") or "").upper()
-    if not lo or not fi or not cl:
-        return "wait", f"missing {tf} band values"
-    if cl < lo:
-        return "cancel", f"{tf} closed {cl:.6g} below {tf} Lower {lo:.6g}"
-    if tr != "Green":
-        return "wait", f"{tf} trend {tr} (need Green)"
-    b_low, b_close = _f((bar4h or {}).get("l")), _f((bar4h or {}).get("c"))
-    if not b_low or not b_close:
-        return "wait", "no just-closed 4H bar"
-    if b_low > fi:
-        return "wait", f"4H bar low {b_low:.6g} did not touch zone (Filter {fi:.6g})"
-    if b_close <= lo:
-        return "wait", f"4H bar touched zone but closed {b_close:.6g} <= {tf} Lower {lo:.6g}"
-    if not mid or mid <= 0:
-        return "wait", "no live mid"
-    hi = fi * ENTRY_FILTER_SLACK
-    if lo <= mid <= hi:
-        return "trigger", (f"4H low {b_low:.6g} touched zone, close {b_close:.6g} > Lower; live mid {mid:.6g} "
-                           f"in [{tf} Lower {lo:.6g}, Filter*1.01 {hi:.6g}]")
-    where = "above Filter*1.01" if mid > hi else "below Lower"
-    return "wait", f"4H touched zone but live mid {mid:.6g} {where} ({lo:.6g}-{hi:.6g})"
+        return "cancel", "base position no longer held", {}
+    tfk = bnd.get("tf") or BAND_TF.get(kind, "4h")
+    tf = tfk.upper()
+    lo, fi, tr = bnd.get("lower"), bnd.get("filter"), bnd.get("trend")
+    b_t, b_low, b_close = (bar or {}).get("t"), _f((bar or {}).get("l")), _f((bar or {}).get("c"))
+    if not b_t or not b_low or not b_close:
+        return "wait", f"no closed {tf} bar", {}
+    b_t = int(b_t)
+    if rec.get("last_bar_t") and int(rec["last_bar_t"]) >= b_t:
+        return "wait", f"no new closed {tf} bar yet", {}
+    created = parse_ts(rec.get("created_at"))
+    if created and b_t + BAR_MS[tfk] <= int(created.timestamp() * 1000):
+        return "wait", f"latest {tf} bar closed before the pending was created", {}
+    if not lo or not fi:
+        return "wait", f"missing {tf} band values", {}
+    if bnd.get("bar_time") is not None and int(bnd["bar_time"]) != b_t:
+        return "wait", f"{tf} radar band not yet for the latest closed bar", {}
+    upd: Dict[str, Any] = {"last_bar_t": b_t}
+    if b_close < lo:
+        return "cancel", f"{tf} closed {b_close:.6g} below {tf} Lower {lo:.6g}", upd
+    setup = rec.get("setup") or None
+    if setup and int(setup.get("t", 0)) + BAR_MS[tfk] == b_t:
+        # this bar is N+1
+        n_close = float(setup.get("c"))
+        if b_close > lo and b_close > n_close and tr == "Green":
+            if not mid or mid <= lo:
+                upd["setup"] = None
+                return "wait", f"N+1 confirmed but live mid {mid} not above {tf} Lower {lo:.6g}", upd
+            upd["setup"] = None
+            return "trigger", (f"N+1 confirmed: {tf} close {b_close:.6g} > Lower {lo:.6g} and > N close "
+                               f"{n_close:.6g}; enter at live mid {mid:.6g}"), upd
+        why_n1 = (f"N+1 not confirmed ({tf} close {b_close:.6g} vs N close {n_close:.6g}, Lower {lo:.6g}, "
+                  f"trend {tr})")
+    else:
+        why_n1 = ""
+    # evaluate this bar as a (new) bar N
+    if b_low <= fi and b_close > lo:
+        upd["setup"] = {"t": b_t, "l": b_low, "c": b_close, "filter": fi, "lower": lo}
+        return "wait", ((why_n1 + "; ") if why_n1 else "") + (
+            f"bar N set: {tf} low {b_low:.6g} <= Filter {fi:.6g}, close {b_close:.6g} > Lower {lo:.6g}; "
+            f"awaiting N+1 close > {max(lo, b_close):.6g}"), upd
+    upd["setup"] = None
+    return "wait", ((why_n1 + "; ") if why_n1 else "") + (
+        f"no pullback: {tf} low {b_low:.6g} > Filter {fi:.6g}"), upd
 
 
 def summary(entries: List[dict], rows_1d: Dict[str, dict], rows_4h: Dict[str, dict],
@@ -156,12 +184,16 @@ def summary(entries: List[dict], rows_1d: Dict[str, dict], rows_4h: Dict[str, di
     for e in active(entries):
         b = band(e["kind"], rows_1d.get(e["symbol"]), rows_4h.get(e["symbol"]))
         mid = mids.get(e["symbol"]) if mids else None
-        in_zone = bool(mid and b["lower"] and b["filter"] and b["lower"] <= mid <= b["filter"] * ENTRY_FILTER_SLACK)
+        in_zone = bool(mid and b["lower"] and b["filter"] and b["lower"] <= mid <= b["filter"])
+        st = e.get("setup")
+        tf = (b["tf"] or "").upper()
+        if st:
+            trig = f"bar N set ({tf} low {st.get('l')}, close {st.get('c')}): enter if next {tf} close > {max(float(st.get('c') or 0), float(b['lower'] or 0)):.6g}"
+        else:
+            trig = f"waiting for {tf} bar N: low <= Filter {b['filter']} and close > Lower {b['lower']}; then N+1 close > Lower and > N close"
         out.append({"id": e["id"], "symbol": e["symbol"], "kind": e["kind"], "band_tf": b["tf"],
                     "zone_lower": b["lower"], "zone_filter": b["filter"], "trend": b["trend"],
-                    "entry_max": round(b["filter"] * ENTRY_FILTER_SLACK, 10) if b["filter"] else None,
-                    "trigger": "just-closed 4H low <= zone Filter AND 4H close > zone Lower; "
-                               "then live mid in [Lower, Filter*1.01]",
+                    "setup": st, "trigger": trig,
                     "mid": mid, "in_zone": in_zone, "size_pct": e.get("size_pct"), "leverage": e.get("leverage"),
                     "created_at": e.get("created_at"), "expires_at": e.get("expires_at"),
                     "last_check": e.get("last_check")})

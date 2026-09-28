@@ -952,9 +952,9 @@
     if (pb) {
       pb.style.display = pend.length ? "block" : "none";
       const f = v => (v == null ? "—" : fmtNum(v));
-      pb.innerHTML = pend.length ? "<b>Pending pullback entries</b> (Railway checks each closed 4H bar, :10 HKT: 4H low touches zone &amp; close &gt; Lower, then enter if mid in [Lower, Filter×1.01]): " + pend.map(p =>
+      pb.innerHTML = pend.length ? "<b>Pending pullback entries</b> (Railway 4H :10 job · bar N: low ≤ Filter &amp; close &gt; Lower · enter after N+1 closes &gt; Lower and &gt; N close · ADD_ON=4H bars, CONTINUATION=1D bars): " + pend.map(p =>
         `<span style="margin-right:14px"><b>${p.symbol}</b> ${p.kind} · zone ${String(p.band_tf||"").toUpperCase()} ` +
-        `[${f(p.zone_lower)} – ${f(p.zone_filter)}] (entry ≤ ${f(p.entry_max)}) · mid ${f(p.mid)}${p.in_zone ? " <b style='color:#22c55e'>IN ZONE</b>" : ""}` +
+        `[${f(p.zone_lower)} – ${f(p.zone_filter)}] · ${p.setup ? "<b style='color:#f59e0b'>bar N set</b> (close " + f(p.setup.c) + ") · " : ""}mid ${f(p.mid)}${p.in_zone ? " <b style='color:#22c55e'>IN ZONE</b>" : ""}` +
         ` · ${p.size_pct ?? "?"}% ${p.leverage ?? "?"}x · exp ${p.expires_at ? new Date(p.expires_at).toLocaleDateString("en-GB",{timeZone:"Asia/Hong_Kong"}) : "—"}` +
         `${p.last_check && p.last_check.reason ? " · " + p.last_check.reason : ""}</span>`).join("") : "";
     }

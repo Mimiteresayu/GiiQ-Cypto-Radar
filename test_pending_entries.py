@@ -66,55 +66,94 @@ class FakeHL:
         return {"status": "filled", "filled_sz": qty}
 
 
-def bar(low, close):
-    return lambda hl, coin, now: {"t": 0, "l": low, "c": close}
+H4 = 4 * 3600 * 1000
+T0 = int(NOW.timestamp() * 1000) - H4 - 600_000  # a 4H bar that closed 10 min before NOW
+
+
+def bar(low, close, t=T0):
+    return lambda hl, coin, tf, now: {"t": t, "l": low, "c": close}
 
 
 class TestEvaluate(unittest.TestCase):
-    def rec(self, kind=pe.CONTINUATION, created=NOW - timedelta(days=1)):
-        return {"id": "x", "symbol": "AAA", "kind": kind, "status": "pending",
-                "expires_at": (created + timedelta(days=7)).isoformat()}
+    def rec(self, kind=pe.ADD_ON, created=NOW - timedelta(days=1), setup=None, last=None):
+        r = {"id": "x", "symbol": "AAA", "kind": kind, "status": "pending", "created_at": created.isoformat(),
+             "expires_at": (created + timedelta(days=7)).isoformat()}
+        if setup:
+            r["setup"] = setup
+        if last:
+            r["last_bar_t"] = last
+        return r
 
-    def b(self, lower=0.8, filt=0.9, close=1.0, trend="Green", tf="1d"):
-        return {"tf": tf, "lower": lower, "filter": filt, "close": close, "trend": trend}
+    def b(self, lower=0.8, filt=0.9, close=1.0, trend="Green", tf="4h", bar_time=None):
+        return {"tf": tf, "lower": lower, "filter": filt, "close": close, "trend": trend, "bar_time": bar_time}
 
-    def test_trigger_touch_and_mid_window(self):
-        a, _ = pe.evaluate(self.rec(), self.b(), 0.905, NOW, set(), {"l": 0.89, "c": 0.95})
-        self.assertEqual(a, "trigger")  # 0.905 <= 0.9*1.01
+    HELD = {"AAA"}
 
-    def test_no_touch_waits(self):
-        a, why = pe.evaluate(self.rec(), self.b(), 0.85, NOW, set(), {"l": 0.91, "c": 0.95})
+    def test_bar_n_detected_then_n1_confirms(self):
+        a, why, upd = pe.evaluate(self.rec(), self.b(), 0.9, NOW, self.HELD, {"t": T0 - H4, "l": 0.88, "c": 0.93})
         self.assertEqual(a, "wait")
-        self.assertIn("did not touch", why)
+        self.assertIn("bar N set", why)
+        self.assertEqual(upd["setup"]["c"], 0.93)
+        r = self.rec(setup=upd["setup"], last=upd["last_bar_t"])
+        a, why, upd2 = pe.evaluate(r, self.b(), 0.95, NOW, self.HELD, {"t": T0, "l": 0.91, "c": 0.95})
+        self.assertEqual(a, "trigger", why)
+        self.assertIsNone(upd2["setup"])
 
-    def test_touch_but_close_below_lower_waits(self):
-        a, why = pe.evaluate(self.rec(), self.b(), 0.85, NOW, set(), {"l": 0.75, "c": 0.79})
+    def test_n1_not_higher_than_n_close_no_trigger_and_becomes_new_n(self):
+        r = self.rec(setup={"t": T0 - H4, "l": 0.88, "c": 0.93})
+        a, why, upd = pe.evaluate(r, self.b(), 0.9, NOW, self.HELD, {"t": T0, "l": 0.87, "c": 0.92})
         self.assertEqual(a, "wait")
-        self.assertIn("<=", why)
+        self.assertIn("N+1 not confirmed", why)
+        self.assertEqual(upd["setup"]["t"], T0)          # re-armed as new bar N
 
-    def test_mid_above_slack_waits(self):
-        a, why = pe.evaluate(self.rec(), self.b(), 0.92, NOW, set(), {"l": 0.89, "c": 0.95})
+    def test_n1_must_be_the_next_bar(self):
+        r = self.rec(setup={"t": T0 - 3 * H4, "l": 0.88, "c": 0.93})  # stale setup (gap)
+        a, why, upd = pe.evaluate(r, self.b(), 0.95, NOW, self.HELD, {"t": T0, "l": 0.95, "c": 0.97})
         self.assertEqual(a, "wait")
-        self.assertIn("above Filter*1.01", why)
+        self.assertIsNone(upd["setup"])
 
-    def test_band_tf_close_below_lower_cancels(self):
-        a, _ = pe.evaluate(self.rec(), self.b(close=0.79), 0.85, NOW, set(), {"l": 0.7, "c": 0.8})
+    def test_same_bar_processed_once(self):
+        a, why, upd = pe.evaluate(self.rec(last=T0), self.b(), 0.9, NOW, self.HELD, {"t": T0, "l": 0.88, "c": 0.93})
+        self.assertEqual((a, upd), ("wait", {}))
+        self.assertIn("no new closed", why)
+
+    def test_close_below_lower_cancels(self):
+        a, _, _ = pe.evaluate(self.rec(), self.b(), 0.75, NOW, self.HELD, {"t": T0, "l": 0.7, "c": 0.79})
         self.assertEqual(a, "cancel")
 
-    def test_expiry(self):
-        a, _ = pe.evaluate(self.rec(created=NOW - timedelta(days=8)), self.b(), 0.85, NOW, set(), {"l": 0.8, "c": 0.9})
-        self.assertEqual(a, "expire")
-
-    def test_red_trend_waits(self):
-        a, _ = pe.evaluate(self.rec(), self.b(trend="Red"), 0.85, NOW, set(), {"l": 0.8, "c": 0.9})
+    def test_n1_red_trend_no_trigger(self):
+        r = self.rec(setup={"t": T0 - H4, "l": 0.88, "c": 0.93})
+        a, _, _ = pe.evaluate(r, self.b(trend="Red"), 0.95, NOW, self.HELD, {"t": T0, "l": 0.91, "c": 0.95})
         self.assertEqual(a, "wait")
 
+    def test_bars_before_creation_ignored(self):
+        r = self.rec(created=NOW)
+        a, why, upd = pe.evaluate(r, self.b(), 0.9, NOW, self.HELD, {"t": T0, "l": 0.88, "c": 0.93})
+        self.assertEqual((a, upd), ("wait", {}))
+        self.assertIn("before the pending was created", why)
+
+    def test_radar_misaligned_waits_without_consuming_bar(self):
+        a, why, upd = pe.evaluate(self.rec(), self.b(bar_time=T0 - H4), 0.9, NOW, self.HELD, {"t": T0, "l": 0.88, "c": 0.93})
+        self.assertEqual((a, upd), ("wait", {}))
+
+    def test_continuation_uses_1d_bars(self):
+        D = 86400 * 1000
+        d0 = int(NOW.timestamp() * 1000) - D - 3600_000
+        r = self.rec(kind=pe.CONTINUATION, created=NOW - timedelta(days=3), setup={"t": d0 - D, "l": 0.88, "c": 0.93})
+        a, why, _ = pe.evaluate(r, self.b(tf="1d"), 0.95, NOW, set(), {"t": d0, "l": 0.9, "c": 0.96})
+        self.assertEqual(a, "trigger", why)
+        self.assertIn("1D", why)
+
+    def test_expiry(self):
+        a, _, _ = pe.evaluate(self.rec(created=NOW - timedelta(days=8)), self.b(), 0.85, NOW, self.HELD, None)
+        self.assertEqual(a, "expire")
+
     def test_idempotency_rules(self):
-        self.assertEqual(pe.evaluate(self.rec(pe.CONTINUATION), self.b(), 0.85, NOW, {"AAA"}, None)[0], "cancel")
-        self.assertEqual(pe.evaluate(self.rec(pe.ADD_ON), self.b(tf="4h"), 0.85, NOW, set(), None)[0], "cancel")
+        self.assertEqual(pe.evaluate(self.rec(pe.CONTINUATION), self.b(tf="1d"), 0.85, NOW, {"AAA"}, None)[0], "cancel")
+        self.assertEqual(pe.evaluate(self.rec(pe.ADD_ON), self.b(), 0.85, NOW, set(), None)[0], "cancel")
 
     def test_missing_bar_fails_closed(self):
-        self.assertEqual(pe.evaluate(self.rec(), self.b(), 0.85, NOW, set(), None)[0], "wait")
+        self.assertEqual(pe.evaluate(self.rec(), self.b(), 0.85, NOW, self.HELD, None)[0], "wait")
 
     def test_create_idempotent(self):
         entries = []
@@ -144,10 +183,13 @@ class TestWorker(unittest.TestCase):
         r4h = {"ts": ts, "rows": [dict(symbol="AAA", **(h4 or _row(0.70, 0.75, 0.95)))]}
         return r1d, r4h
 
-    def entry(self, kind=pe.CONTINUATION, size=3, lev=2, tier="tiny"):
+    def entry(self, kind=pe.CONTINUATION, size=3, lev=2, tier="tiny", setup_close=0.89):
+        D = 86400 * 1000 if kind == pe.CONTINUATION else H4
+        created = NOW - timedelta(days=2)
         return [{"id": f"AAA_{kind}_20260928", "symbol": "AAA", "kind": kind, "status": "pending", "tier": tier,
-                 "size_pct": size, "leverage": lev, "created_at": NOW.isoformat(),
-                 "expires_at": (NOW + timedelta(days=7)).isoformat()}]
+                 "size_pct": size, "leverage": lev, "created_at": created.isoformat(),
+                 "expires_at": (created + timedelta(days=7)).isoformat(),
+                 "setup": {"t": T0 - D, "l": 0.85, "c": setup_close}}]
 
     def run_w(self, hl, entries, bar_fn, d1=None, h4=None):
         r1d, r4h = self.radars(d1, h4)
@@ -226,6 +268,20 @@ class TestWorker(unittest.TestCase):
         self.assertIn("SL distance", res["checked"][0]["reason"])
         self.assertEqual(ents[0]["status"], "pending")
 
+    def test_live_state_persisted_bar_n_then_n1_fill(self):
+        # no setup yet: first run sets bar N (no order); next run (N+1) fills
+        hl = FakeHL(mids={"AAA": 0.93})
+        ents = self.entry()
+        ents[0].pop("setup")
+        D = 86400 * 1000
+        self.run_w(hl, ents, bar(0.88, 0.91, t=T0 - D))
+        self.assertEqual(hl.calls, [])
+        self.assertEqual(ents[0]["setup"]["c"], 0.91)
+        self.assertEqual(ents[0]["last_bar_t"], T0 - D)
+        res = self.run_w(hl, ents, bar(0.9, 0.93, t=T0))
+        self.assertEqual(ents[0]["status"], "filled", res["checked"])
+        self.assertEqual([c[0] for c in hl.calls], ["set_leverage", "open_long_ioc", "place_stop_loss"])
+
     def test_add_on_cancelled_when_base_closed(self):
         hl = FakeHL(mids={"AAA": 0.98})
         ents = self.entry(kind=pe.ADD_ON)
@@ -234,13 +290,13 @@ class TestWorker(unittest.TestCase):
         self.assertEqual(hl.calls, [])
         self.assertEqual(res["cancelled"][0]["symbol"], "AAA")
 
-    def test_closed_4h_bar_picks_last_closed(self):
+    def test_closed_bar_picks_last_closed(self):
         class H:
             def info(self, payload):
                 t0 = int(NOW.timestamp() * 1000) - 4 * 3600 * 1000 - 600_000  # closed 10 min ago
                 return [{"t": t0 - 4 * 3600 * 1000, "l": "1", "c": "2"}, {"t": t0, "l": "3", "c": "4"},
                         {"t": t0 + 4 * 3600 * 1000, "l": "5", "c": "6"}]  # forming
-        b = pw.closed_4h_bar(H(), "AAA", NOW)
+        b = pw.closed_bar(H(), "AAA", "4h", NOW)
         self.assertEqual((b["l"], b["c"]), (3.0, 4.0))
 
 
