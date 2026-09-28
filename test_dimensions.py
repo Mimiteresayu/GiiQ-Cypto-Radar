@@ -352,9 +352,6 @@ class TestDimsJobAndServe(unittest.TestCase):
         self.assertEqual(n, 2)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class TestVetoRulesAndBackfill(unittest.TestCase):
     def setUp(self):
@@ -369,8 +366,10 @@ class TestVetoRulesAndBackfill(unittest.TestCase):
 
     def test_rule_is_normalized_stored_and_reported(self):
         from decisions import normalize
-        self.assertEqual(normalize({"symbol": "TIA", "decision": "veto", "rule": "V1_WEAK_4H_BREAKOUT"})["rule"],
-                         "V1_WEAK_4H_BREAKOUT")
+        self.assertEqual(normalize({"symbol": "TIA", "decision": "veto", "rule": "V1_WEAK_4H_BREAKOUT"})["rule"], "V1")
+        from decisions import normalize_rule
+        self.assertEqual([normalize_rule(x) for x in ("v5", "V8_DATA", "V9", "weak", "", None, "V10")],
+                         ["V5", "V8", "OTHER", "OTHER", None, None, "OTHER"])
         conn = L.connect()
         ref = 1_700_000_000_000 - (1_700_000_000_000 % DAY)
         bars = {}
@@ -386,8 +385,8 @@ class TestVetoRulesAndBackfill(unittest.TestCase):
         rep = L.report(conn, min_n=5)
         conn.close()
         vr = {r["rule"]: r for r in rep["veto_rules"]}
-        self.assertEqual(vr["V1_WEAK_4H_BREAKOUT"]["blocked"], 6)
-        self.assertGreater(vr["V1_WEAK_4H_BREAKOUT"]["avoided_vs_approved"], 0)
+        self.assertEqual(vr["V1"]["blocked"], 6)
+        self.assertGreater(vr["V1"]["avoided_vs_approved"], 0)
 
     def test_old_ledger_gets_rule_column(self):
         import sqlite3
@@ -441,6 +440,62 @@ class TestVetoRulesAndBackfill(unittest.TestCase):
         self.assertEqual(dims, {"trend", "extension", "rel_strength", "liquidity", "btc_regime"})
 
 
+class TestHarborFixes(unittest.TestCase):
+    def test_heavy_job_windows(self):
+        import serve
+        hkt = timezone(timedelta(hours=8))
+        self.assertIn("07:55-09:05", serve.heavy_job_blocked(datetime(2026, 9, 29, 8, 30, tzinfo=hkt)))
+        self.assertIn(":05-:12", serve.heavy_job_blocked(datetime(2026, 9, 29, 14, 7, tzinfo=hkt)))
+        self.assertEqual(serve.heavy_job_blocked(datetime(2026, 9, 29, 14, 30, tzinfo=hkt)), "")
+        self.assertEqual(serve.heavy_job_blocked(datetime(2026, 9, 29, 9, 20, tzinfo=hkt)), "")
+
+    def test_consistency_check(self):
+        import dims_job
+        tmp = tempfile.mkdtemp()
+        try:
+            with patch.dict(os.environ, {"DIM_BACKFILL_PATH": os.path.join(tmp, "b.db"),
+                                         "DECISIONS_DIR": os.path.join(tmp, "dec")}), \
+                    patch.object(dims_job, "OUT_DIR", tmp):
+                conn = L.connect(os.path.join(tmp, "b.db"))
+                for sym in ("MON", "APE"):
+                    L.record_signals(conn, "2026-09-28", [{"symbol": sym}], {"candidates": []}, {})
+                L.record_signals(conn, "2026-09-27", [{"symbol": "TIA"}], {"candidates": []}, {})
+                conn.close()
+                os.makedirs(os.path.join(tmp, "dec"))
+                with open(os.path.join(tmp, "dec", "decisions_20260927.json"), "w") as f:
+                    json.dump({"decisions": {"TIA": {}, "CAKE": {}}}, f)
+                with open(os.path.join(tmp, "entry_candidates_latest.json"), "w") as f:
+                    json.dump({"generated_at": "2026-09-28T01:00:00+00:00",
+                               "candidates": [{"symbol": "MON"}, {"symbol": "APE"}]}, f)
+                c = dims_job._consistency_check(os.path.join(tmp, "b.db"))
+            by = {x["date"]: x for x in c["dates"]}
+            self.assertTrue(by["2026-09-28"]["match"])
+            self.assertEqual(by["2026-09-27"]["only_live"], ["CAKE"])
+            self.assertEqual((c["checked"], c["matching"]), (2, 1))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_dims_ui_endpoint(self):
+        import serve
+        from http.server import ThreadingHTTPServer
+        tmp = tempfile.mkdtemp()
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), serve.Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            with patch.dict(os.environ, {"DIM_LEDGER_PATH": os.path.join(tmp, "l.db"),
+                                         "DECISIONS_DIR": os.path.join(tmp, "dec")}), \
+                    patch.object(serve, "PASSWORD", ""):
+                with urllib.request.urlopen(f"http://127.0.0.1:{srv.server_port}/api/dims-ui", timeout=10) as r:
+                    d = json.loads(r.read())
+            self.assertTrue(d["ok"])
+            self.assertIn("report", d["live"])
+            self.assertIsNone(d["backfill"])
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 class TestAiShadowJobEndpoint(unittest.TestCase):
     def test_only_shadow_jobs(self):
         import serve
@@ -449,7 +504,7 @@ class TestAiShadowJobEndpoint(unittest.TestCase):
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         started = []
         try:
-            with patch.object(serve, "AI_DECISION_KEY", "k"), \
+            with patch.object(serve, "AI_DECISION_KEY", "k"), patch.object(serve, "heavy_job_blocked", lambda now=None: ""), \
                     patch.object(serve, "_start_manual_job", lambda job: (started.append(job) or True, "started")):
                 def post(job, key="k"):
                     req = urllib.request.Request(f"http://127.0.0.1:{srv.server_port}/api/ai/jobs/run",
@@ -467,3 +522,7 @@ class TestAiShadowJobEndpoint(unittest.TestCase):
             srv.shutdown()
             srv.server_close()
         self.assertEqual(started, ["dims_backfill"])
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1123,6 +1123,105 @@ def _exit_health(now: datetime | None = None, hl_data: dict | None = None) -> di
                 "summary": f"health check error: {e}"}
 
 
+# ---------------------------------------------------------------- cockpit views (display only)
+_view_cache: dict = {}
+_view_lock = threading.Lock()
+
+
+def _hl_info(body: dict, timeout: int = 15):
+    req = _url_req.Request(HL_API_URL, data=json.dumps(body).encode(),
+                           headers={"Content-Type": "application/json"}, method="POST")
+    with _url_req.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read())
+
+
+def _account_view() -> dict:
+    """Cockpit: PnL windows, equity curve, fills, funding, orders split, open risk, pipeline inputs (60s cache)."""
+    import account_view as AV
+    with _view_lock:
+        c = _view_cache.get("account")
+        if c and time.time() - c[0] < 60:
+            return c[1]
+    now_ms = int(time.time() * 1000)
+    out: dict = {"ts": datetime.now(timezone.utc).isoformat(), "errors": []}
+    hl = _get_hl_cached()
+    perp = hl.get("hl_perp") or {}
+    pos = AV.positions(perp)
+    orders = AV.classify_orders(hl.get("hl_open_orders"), pos)
+    out.update(positions=pos, orders=orders, risk=AV.risk_to_sl(pos, orders["sl"]),
+               account=_compute_unified_equity(hl) if not hl.get("fetch_error") else {})
+    for key, body, fn in (
+        ("portfolio", {"type": "portfolio", "user": HL_ADDRESS}, None),
+        ("fills", {"type": "userFillsByTime", "user": HL_ADDRESS, "startTime": now_ms - 30 * 86_400_000}, None),
+        ("funding", {"type": "userFunding", "user": HL_ADDRESS, "startTime": now_ms - 7 * 86_400_000}, None),
+    ):
+        try:
+            raw = _hl_info(body)
+            if key == "portfolio":
+                pf = AV.parse_portfolio(raw)
+                out["pnl"] = AV.pnl_windows(pf)
+                out["equity_curve"] = {w: (pf.get(w) or {}).get("av") for w in ("week", "month", "allTime")}
+            elif key == "fills":
+                out["fills"] = AV.summarize_fills(raw, now_ms)
+            else:
+                out["funding_7d"] = AV.summarize_funding(raw)
+        except Exception as e:
+            out["errors"].append(f"{key}: {e}")
+    with _scheduler_lock:
+        out["jobs"] = dict(_scheduler_jobs_status)
+    out["next_runs"] = _next_runs()
+    now = datetime.now(timezone.utc)
+    out["run_report"] = _today_run_report(now)
+    out["pending"] = _pending_view()
+    out["exit_health"] = _exit_health(now, hl)
+    try:
+        out["decisions_today"] = get_decisions_for_today() if get_decisions_for_today else {}
+    except Exception:
+        out["decisions_today"] = {}
+    cd = _load_candidates_file()
+    gen = parse_ts(cd.get("generated_at")) if cd else None
+    out["candidates"] = {"today": bool(gen and hkt_date(gen) == hkt_date(now)), "generated_at": cd.get("generated_at"),
+                         "list": cd.get("candidates") or [], "entry_tab": _entry_tab(cd) if cd else {}}
+    out["dimensions"] = _dims_compact(now)
+    out["exec_mode"] = _exec_mode()
+    out["sot"] = SOT_ID
+    with _view_lock:
+        _view_cache["account"] = (time.time(), out)
+    return out
+
+
+def _market_view() -> dict:
+    """Market tab: sentiment, regime, breadth history, heatmap tiles, fresh crosses, sectors (5-min cache)."""
+    import gzip
+    import market_view as MV
+    radars = {tf: _read_out_json(f"gc_radar_{tf}.json") for tf in ("1h", "4h", "1d")}
+    key = tuple((radars[tf] or {}).get("live_ts") or (radars[tf] or {}).get("ts") for tf in ("1h", "4h", "1d"))
+    with _view_lock:
+        c = _view_cache.get("market")
+        if c and c[2] == key and time.time() - c[0] < 300:
+            return c[1]
+    import scan_gc_radar as sgr
+    bars = {}
+    for tf in ("1h", "4h", "1d"):
+        try:
+            with gzip.open(os.path.join(OUT_DIR, f"candles_{tf}.json.gz"), "rt", encoding="utf-8") as f:
+                bars[tf] = (json.load(f) or {}).get("bars") or {}
+        except Exception:
+            bars[tf] = {}
+    sectors = {}
+    if giiq_dims:
+        try:
+            sectors = giiq_dims.narrative_index(_read_out_json("narrative_watchlist.json"), radars.get("1d"))
+        except Exception:
+            sectors = {}
+    out = MV.build(radars, bars, sectors, {tf: sgr.gc_period_for_tf(tf) for tf in ("1h", "4h", "1d")},
+                   int(time.time() * 1000), sgr.compute_gc)
+    out["ts"] = datetime.now(timezone.utc).isoformat()
+    with _view_lock:
+        _view_cache["market"] = (time.time(), out, key)
+    return out
+
+
 def _read_out_json(name: str) -> dict:
     try:
         with open(os.path.join(OUT_DIR, name)) as f:
@@ -1743,12 +1842,29 @@ def _scheduled_dims_outcomes(manual: bool = False) -> dict:
 
 
 def _scheduled_dims_backfill(manual: bool = False) -> dict:
-    """Historical replay into the separate backfill ledger (shadow; manual trigger only)."""
+    """Historical replay into the separate backfill ledger (shadow; manual trigger only).
+    Refused inside trading windows (heavy_job_blocked)."""
+    why = heavy_job_blocked()
+    if why:
+        _update_job_status("manual_dims_backfill" if manual else "dims_backfill", "skipped", why)
+        return {"status": "skipped", "message": why}
     return _scheduled_dims(manual=manual, mode="backfill")
 
 
 # Shadow-only jobs Claude may trigger with the AI key (they never place, change or cancel orders).
 AI_SHADOW_JOBS = ("dims", "dims_outcomes", "dims_backfill")
+
+
+def heavy_job_blocked(now: datetime | None = None) -> str:
+    """The CPU-heavy backfill must not share the box with trading jobs: blocked 07:55-09:05 HKT
+    (scan / decisions / preflight / executor) and every hour :05-:12 (1H/4H scans + exits)."""
+    h = (now or datetime.now(timezone.utc)).astimezone(timezone(timedelta(hours=8)))
+    mins = h.hour * 60 + h.minute
+    if 7 * 60 + 55 <= mins <= 9 * 60 + 5:
+        return "blocked 07:55-09:05 HKT (entry window)"
+    if 5 <= h.minute <= 12:
+        return "blocked :05-:12 every hour (1H/4H scans + exits)"
+    return ""
 
 
 MANUAL_JOBS = {
@@ -2054,6 +2170,15 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if path == "/api/desk-data":
             self._desk_data()
+            return
+        if path == "/api/dims-ui":
+            self._dims_ui()
+            return
+        if path in ("/api/account-ui", "/api/market-ui"):
+            try:
+                self._send_json(200, _account_view() if path == "/api/account-ui" else _market_view())
+            except Exception as e:
+                self._send_json(500, {"ok": False, "error": f"{type(e).__name__}: {e}"})
             return
         if path == "/api/trades":
             self._get_trades()
@@ -2379,6 +2504,33 @@ class Handler(SimpleHTTPRequestHandler):
         except Exception as e:
             self._send_json(500, {"ok": False, "error": str(e)})
 
+    def _dims_ui(self) -> None:
+        """GET /api/dims-ui (cockpit password): everything the 維度 tab shows in one call."""
+        out: dict = {"ok": True, "now": datetime.now(timezone.utc).isoformat()}
+        out["latest"] = _read_out_json("dimensions_latest.json") or None
+        try:
+            decs = get_decisions_for_today() if get_decisions_for_today else {}
+        except Exception:
+            decs = {}
+        out["decisions_today"] = decs
+        snap = _read_out_json(os.path.join("whales", "latest.json"))
+        out["whales"] = ({k: snap.get(k) for k in ("ts", "n_wallets", "n_manual", "errors")} if snap else None)
+        if dim_ledger:
+            for key, path_ in (("live", None), ("backfill", dim_ledger.backfill_db_path())):
+                try:
+                    if path_ and not os.path.isfile(path_):
+                        out[key] = None
+                        continue
+                    conn = dim_ledger.connect(path_)
+                    out[key] = {"report": dim_ledger.report(conn),
+                                "recent": dim_ledger.recent_signals(conn, 60 if key == "live" else 40)}
+                    conn.close()
+                except Exception as e:
+                    out[key] = {"error": str(e)}
+            if out.get("backfill") and isinstance(out["backfill"], dict) and out["backfill"].get("report"):
+                out["backfill"]["report"]["note"] = (_read_out_json("dimensions_report_backfill.json") or {}).get("note")
+        self._send_json(200, out)
+
     def _ai_shadow_job(self) -> None:
         """POST /api/ai/jobs/run (keyed) {"job": "dims"|"dims_outcomes"|"dims_backfill"} -> 202.
         Shadow measurement jobs only; trading jobs stay password-gated."""
@@ -2392,6 +2544,9 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if job not in AI_SHADOW_JOBS:
             self._send_json(400, {"ok": False, "error": f"job must be one of {list(AI_SHADOW_JOBS)}"})
+            return
+        if job == "dims_backfill" and heavy_job_blocked():
+            self._send_json(409, {"ok": False, "job": job, "error": heavy_job_blocked()})
             return
         ok, msg = _start_manual_job(job)
         self._send_json(202 if ok else 409, {"ok": ok, "job": job, "message": msg,

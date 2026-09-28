@@ -125,6 +125,14 @@ def _f(v: Any) -> Optional[float]:
 # ---------------------------------------------------------------------------
 # Writes
 # ---------------------------------------------------------------------------
+def _rule(rule: Any) -> Optional[str]:
+    try:
+        from decisions import normalize_rule
+    except Exception:  # pragma: no cover
+        return str(rule)[:40] if rule else None
+    return normalize_rule(rule)
+
+
 def _signal_id(conn: sqlite3.Connection, signal_date: str, symbol: str, create: bool = True) -> Optional[int]:
     row = conn.execute("SELECT id FROM signals WHERE signal_date=? AND symbol=?", (signal_date, symbol)).fetchone()
     if row:
@@ -173,7 +181,7 @@ def record_decisions(conn: sqlite3.Connection, signal_date: str, decisions: List
         conn.execute(
             "INSERT OR REPLACE INTO decisions(signal_id, source, action, kind, rule, size_pct, leverage, reason, decided_at)"
             " VALUES (?,?,?,?,?,?,?,?,?)",
-            (sid, source, act, d.get("type"), d.get("rule"), _f(d.get("size_pct")), _f(d.get("leverage")),
+            (sid, source, act, d.get("type"), _rule(d.get("rule")), _f(d.get("size_pct")), _f(d.get("leverage")),
              str(d.get("reason") or "")[:500], d.get("timestamp") or _now()))
         for name, score in (d.get("dims") or {}).items():
             s = _f(score)
@@ -423,3 +431,31 @@ def signal_rows(conn: sqlite3.Connection, signal_date: str) -> List[dict]:
            LEFT JOIN outcomes o ON o.signal_id=s.id
            LEFT JOIN decisions d ON d.signal_id=s.id AND d.source='claude'
            WHERE s.signal_date=? ORDER BY s.symbol""", (signal_date,))]
+
+
+def recent_signals(conn: sqlite3.Connection, limit: int = 60) -> List[dict]:
+    """Newest signals with their Railway total, Claude decision / rule and outcome (cockpit 維度 tab)."""
+    rows = [dict(r) for r in conn.execute(
+        """SELECT s.id, s.signal_date, s.symbol, s.type, s.tier, s.ref_close, s.hard_sl,
+                  d.action AS decision, d.source AS decision_source, d.rule,
+                  o.ret_1d, o.ret_3d, o.ret_7d, o.ret_7d_sl, o.sl_hit, o.sl_hit_day, o.bars_after, o.complete
+           FROM signals s
+           LEFT JOIN decisions d ON d.signal_id = s.id
+                AND d.source = (SELECT source FROM decisions WHERE signal_id = s.id
+                                ORDER BY CASE source WHEN 'claude' THEN 0 ELSE 1 END LIMIT 1)
+           LEFT JOIN outcomes o ON o.signal_id = s.id
+           ORDER BY s.signal_date DESC, s.symbol LIMIT ?""", (int(limit),))]
+    ids = [r["id"] for r in rows]
+    if ids:
+        q = "SELECT signal_id, source, dim, score FROM dim_scores WHERE signal_id IN (%s)" % ",".join("?" * len(ids))
+        scores: Dict[int, Dict[str, Any]] = {}
+        for r in conn.execute(q, ids):
+            scores.setdefault(r["signal_id"], {}).setdefault(r["source"], {})[r["dim"]] = r["score"]
+        for r in rows:
+            sc = scores.get(r["id"], {})
+            r["railway"] = sc.get("railway", {})
+            r["claude"] = sc.get("claude", {})
+            vals = [v for v in r["railway"].values() if v is not None]
+            r["total"] = sum(vals) if vals else None
+    return rows
+

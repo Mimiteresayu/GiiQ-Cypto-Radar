@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -37,6 +38,18 @@ def _decision_file(now: Optional[datetime] = None) -> Path:
 _ACTION_MAP = {"approve": "approve", "approved": "approve", "veto": "veto", "vetoed": "veto", "reject": "veto"}
 
 
+_RULE_RE = re.compile(r"^\s*(V[1-8])(?![0-9])", re.IGNORECASE)
+
+
+def normalize_rule(rule: Any) -> Optional[str]:
+    """Veto rule id -> fixed "V1".."V8" (so "V1_WEAK_4H_BREAKOUT" and "v1" count as one rule).
+    Anything else -> "OTHER"; empty -> None."""
+    if rule is None or not str(rule).strip():
+        return None
+    m = _RULE_RE.match(str(rule))
+    return m.group(1).upper() if m else "OTHER"
+
+
 def normalize(dec: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Accept both POST shapes: {symbol, decision: approve|veto} (original) and the ENTRY_DESK
     SoT-2 prompt shape {coin, action: APPROVE|VETO, type}. Returns None if unusable."""
@@ -54,7 +67,7 @@ def normalize(dec: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "size_pct": dec.get("size_pct"),
         "leverage": dec.get("leverage"),
         "reason": dec.get("reason", ""),
-        "rule": (str(dec.get("rule")).strip()[:40] or None) if dec.get("rule") else None,
+        "rule": normalize_rule(dec.get("rule")),
         "dims": dims,
     }
 
