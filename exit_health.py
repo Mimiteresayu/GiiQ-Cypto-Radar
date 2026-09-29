@@ -16,6 +16,9 @@ Claude EXIT_DESK task only has to read one object and email when `ok` is false (
   LEVERAGE_OFF     position leverage above 5x or not isolated (below 3x = `info` LEVERAGE_LOW, not a problem)
   RADAR_STALE      1H radar > 2h old or 4H radar > 5h old
   HL_FETCH         positions / open orders could not be fetched (nothing else can be trusted)
+
+Info (not a problem, shown in the daily line): PENDING_SKIPPED - the 4h pending-entry check was skipped
+because that run's exit step failed (Harbor 2026-09-29: accepted 4h delay, must be reported).
 """
 from __future__ import annotations
 
@@ -63,7 +66,8 @@ def _positions(perp: Any) -> List[dict]:
 
 
 def check(*, perp: Any, open_orders: Any, nav: Optional[float], radar_1h: dict, radar_4h: dict,
-          tier_for, job_status: Dict[str, dict], pending: List[dict], now: Optional[datetime] = None) -> Dict[str, Any]:
+          tier_for, job_status: Dict[str, dict], pending: List[dict], now: Optional[datetime] = None,
+          pending_skips: Optional[List[dict]] = None) -> Dict[str, Any]:
     now = now or datetime.now(timezone.utc)
     now_ms = int(now.timestamp() * 1000)
     problems: List[dict] = []
@@ -151,7 +155,15 @@ def check(*, perp: Any, open_orders: Any, nav: Optional[float], radar_1h: dict, 
         if t and now - t > timedelta(days=PENDING_TTL_DAYS, hours=6):
             add("PENDING_STALE", e.get("symbol"), f"{e.get('kind')} pending since {t.date()} (> {PENDING_TTL_DAYS}d)")
 
-    return _result(problems, len(pos), now, info)
+    skips = [x for x in pending_skips or [] if (_ts(x.get("ts")) and now - _ts(x.get("ts")) < timedelta(hours=24))]
+    for x in skips:
+        info.append({"code": "PENDING_SKIPPED", "coin": None,
+                     "msg": f"pending check skipped at {_ts(x['ts']).astimezone(HKT).strftime('%m-%d %H:%M')} HKT "
+                            f"(exits failed; fills delayed to the next 4h run): {str(x.get('why') or '')[:160]}"})
+    res = _result(problems, len(pos), now, info)
+    if skips:
+        res["summary"] += f" · pending skipped {len(skips)}x (exits failed)"
+    return res
 
 
 def _result(problems: List[dict], n_pos: int, now: datetime, info: Optional[List[dict]] = None) -> Dict[str, Any]:

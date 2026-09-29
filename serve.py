@@ -1117,7 +1117,8 @@ def _exit_health(now: datetime | None = None, hl_data: dict | None = None) -> di
             pend = []
         return exit_health.check(perp=hl_data.get("hl_perp"), open_orders=hl_data.get("hl_open_orders"),
                                  nav=account.get("equity"), radar_1h=radars["1h"], radar_4h=radars["4h"],
-                                 tier_for=_tier_for, job_status=jobs, pending=pend, now=now)
+                                 tier_for=_tier_for, job_status=jobs, pending=pend, now=now,
+                                 pending_skips=(_read_out_json("pending_skips.json").get("skips") or []))
     except Exception as e:
         return {"ok": False, "problems": [{"code": "HEALTH_ERROR", "coin": None, "msg": str(e)}],
                 "summary": f"health check error: {e}"}
@@ -1461,6 +1462,28 @@ def _scheduled_1h_scan_exits(manual: bool = False) -> None:
     _scan_and_exits("manual_1h_scan_exits" if manual else "1h_scan_exits", "1h", SCAN_MAX_1H, "hourly", manual)
 
 
+PENDING_SKIPS_PATH = os.path.join(OUT_DIR, "pending_skips.json")
+
+
+def _note_pending_skip(why: str, now: datetime | None = None) -> None:
+    """Keep the last 7 days of 'pending check skipped because exits failed' events for EXIT_DESK's daily line."""
+    now = now or datetime.now(timezone.utc)
+    try:
+        try:
+            with open(PENDING_SKIPS_PATH) as f:
+                items = json.load(f).get("skips") or []
+        except Exception:
+            items = []
+        cutoff = (now - timedelta(days=7)).isoformat()
+        items = [x for x in items if str(x.get("ts")) >= cutoff] + [{"ts": now.isoformat(), "why": why[:300]}]
+        tmp = PENDING_SKIPS_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"skips": items}, f, indent=1)
+        os.replace(tmp, PENDING_SKIPS_PATH)
+    except Exception as e:
+        sys.stderr.write(f"[PENDING] skip log failed: {e}\n")
+
+
 def _scheduled_4h_scan_exits(manual: bool = False) -> None:
     """Every 4h :10 HKT: 4H scan + Mega/Large exits + SL align, then pending pullback entries
     on the just-closed 4H bar (manual runs: pending forced DRY_RUN).
@@ -1470,6 +1493,9 @@ def _scheduled_4h_scan_exits(manual: bool = False) -> None:
     if not done.get("exits_ok"):
         why = f"exits step did not complete ({done.get('why')}) -> pending entries skipped (exits -> re-fetch -> entries)"
         _update_job_status("manual_pending_entries" if manual else "pending_entries", "skipped", why)
+        if not manual:  # Harbor: accepted 4h delay, but it must show in the daily summary
+            _note_pending_skip(why)
+            _record_run_report("pending_entries", {"status": "skipped_exits_failed", "message": why})
         sys.stderr.write(f"[PENDING] skipped: {why}\n")
         return
     try:
@@ -1867,6 +1893,151 @@ def heavy_job_blocked(now: datetime | None = None) -> str:
     return ""
 
 
+# ---------------------------------------------------------------- Bitunix shadow radar (display/shadow only)
+# Harbor-approved 2026-09-29. Own lock (never _scan_lock / _exec_lock), subprocess with a hard timeout and
+# force_dry_run=True, so the BX worker never even sees HL_API_PRIVATE_KEY. No Bitunix key, no orders.
+# Nothing on the HL order path reads bx_* files (test_bx_isolation.py). BX status goes to its own
+# [BX_DATA] log line, never into [DESK_DATA] / ENTRY_DESK candidates.
+BX_ENABLED = (os.environ.get("BX_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off"))
+BX_TIMEOUT_S = int(os.environ.get("BX_TIMEOUT_S", "480"))
+BX_PROBE_LOG_DAYS = 60
+_bx_lock = threading.Lock()
+
+
+def _bx_nav_usd() -> float | None:
+    """HL NAV for shadow sizing (read only, cached HL data; None if unavailable)."""
+    try:
+        hl = _get_hl_cached()
+        if hl.get("fetch_error"):
+            return None
+        eq = _compute_unified_equity(hl).get("equity")
+        return float(eq) if eq else None
+    except Exception:
+        return None
+
+
+def _bx_probe_log(job: str, res: dict) -> None:
+    """Daily Bitunix API health for the 30-day go-live bar: calls, errors, 429s, mean latency per run."""
+    try:
+        api = (res or {}).get("api") or {}
+        path = os.path.join(OUT_DIR, "bx_probe_log.json")
+        try:
+            with open(path) as f:
+                log = json.load(f)
+        except Exception:
+            log = {"runs": []}
+        calls = int(api.get("calls") or 0)
+        log["runs"] = (log.get("runs") or [])[-(BX_PROBE_LOG_DAYS * 8):] + [{
+            "ts": datetime.now(timezone.utc).isoformat(), "job": job, "status": (res or {}).get("status"),
+            "calls": calls, "errors": int(api.get("errors") or 0), "n429": int(api.get("n429") or 0),
+            "mean_ms": round(float(api.get("ms_total") or 0) / calls, 1) if calls else None}]
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(log, f, indent=1)
+        os.replace(tmp, path)
+    except Exception as e:
+        sys.stderr.write(f"[BX] probe log failed: {e}\n")
+
+
+def _scheduled_bx(manual: bool = False, job: str = "daily") -> dict:
+    """BX shadow radar: daily 08:20 (catalog + 1D/4H) · every 4h :25 (4H) · hourly :27 (1H, new tokens + open
+    shadow positions). Then the shadow book for the same job. Skips if another BX run holds the lock."""
+    job_name = ("manual_" if manual else "") + f"bx_{job}"
+    if not BX_ENABLED:
+        _update_job_status(job_name, "skipped", "BX_ENABLED=0")
+        return {"status": "skipped"}
+    if not _bx_lock.acquire(blocking=False):
+        _update_job_status(job_name, "skipped", "another BX run in progress")
+        return {"status": "busy"}
+    res: dict = {}
+    try:
+        rc, out, err = _run_worker("bx_radar.py", [job], timeout=BX_TIMEOUT_S, force_dry_run=True)
+        try:
+            res = json.loads(out.strip().splitlines()[-1]) if out.strip() else {}
+        except Exception:
+            res = {"status": "error", "message": (err or out)[-300:]}
+        _bx_probe_log(job, res)
+        radar_ok = rc == 0 and res.get("status") in ("success", "partial", "skipped")
+        shadow: dict = {}
+        if radar_ok and res.get("status") != "skipped":
+            nav = _bx_nav_usd()
+            rc2, out2, err2 = _run_worker("bx_shadow.py", [job] + (["--nav", str(nav)] if nav else []),
+                                          timeout=BX_TIMEOUT_S, force_dry_run=True)
+            try:
+                shadow = json.loads(out2.strip().splitlines()[-1]) if out2.strip() else {}
+            except Exception:
+                shadow = {"error": (err2 or out2)[-300:]}
+            if rc2 != 0:
+                radar_ok = False
+                res["message"] = f"shadow rc={rc2}: {(err2 or out2)[-200:]}"
+        msg = (f"{res.get('status')}: " + json.dumps({k: res.get(k) for k in
+               ("n_contracts", "n_scanned", "n_1d", "n_4h", "n_tradfi", "n", "review", "elapsed_s", "message")
+               if res.get(k) is not None}, default=str)
+               + (f" | shadow signals={len(shadow.get('signals') or [])} opened={len(shadow.get('opened') or [])} "
+                  f"closed={len(shadow.get('closed') or [])} open={shadow.get('open')}" if shadow else ""))
+        _update_job_status(job_name, "success" if radar_ok else "error", msg[:900], "" if radar_ok else (err or out)[-800:])
+        sys.stderr.write(f"[BX_DATA] {job_name} {msg[:700]}\n")
+        res["shadow"] = shadow
+    except subprocess.TimeoutExpired:
+        _update_job_status(job_name, "error", "", f"BX worker timed out (> {BX_TIMEOUT_S}s)")
+        res = {"status": "error", "message": "timeout"}
+    except Exception as e:
+        _update_job_status(job_name, "error", "", str(e))
+        res = {"status": "error", "message": str(e)}
+    finally:
+        _bx_lock.release()
+    return res
+
+
+def _scheduled_bx_daily(manual: bool = False) -> dict:
+    return _scheduled_bx(manual=manual, job="daily")
+
+
+def _scheduled_bx_4h(manual: bool = False) -> dict:
+    return _scheduled_bx(manual=manual, job="4h")
+
+
+def _scheduled_bx_1h(manual: bool = False) -> dict:
+    return _scheduled_bx(manual=manual, job="1h")
+
+
+def _bx_view() -> dict:
+    """Cockpit Market tab (BX filter) + TradFi tab + BX shadow panel. Display only."""
+    meta = _read_out_json("bx_meta.json")
+    keep = ("symbol", "bx_symbol", "ex", "asset_class", "close", "price", "trend", "filter", "upper", "lower",
+            "dual_cross_up", "above_upper", "bar_time", "vol24h_usd", "ign_x", "ign", "spread_bp", "liq_tier",
+            "contract_age_days", "new_contract", "asset_age", "cat_tags", "drop_from_ath_pct", "tier", "gc_tf",
+            "session_gap", "narrative")
+    out: dict = {"ok": bool(meta), "ts": meta.get("ts"), "counts": meta.get("counts"),
+                 "n_contracts": meta.get("n_contracts"), "n_scanned": meta.get("n_scanned"),
+                 "review": (meta.get("review") or [])[:200],
+                 # HL names also listed on Bitunix -> the Bitunix tab labels those HL rows HL+BX
+                 "overlap": sorted({r.get("hl_name") for r in meta.get("catalog") or []
+                                    if r.get("ex") == "HL+BX" and r.get("hl_name")})}
+    for tf in ("1d", "4h", "1h"):
+        r = _read_out_json(f"bx_radar_{tf}.json")
+        out[f"radar_{tf}"] = {"ts": r.get("ts"), "breadth": r.get("breadth"),
+                              "rows": [{k: x.get(k) for k in keep} for x in r.get("rows") or []]}
+    tf_r = _read_out_json("bx_tradfi_radar.json")
+    out["tradfi"] = {"ts": tf_r.get("ts"), "rows": [{k: x.get(k) for k in keep + ("tf",)} for x in tf_r.get("rows") or []]}
+    try:
+        import bx_shadow
+        conn = bx_shadow.connect()
+        try:
+            out["shadow"] = {"compare": bx_shadow.compare(conn),
+                             "open": [dict(r) for r in conn.execute(
+                                 "SELECT symbol, kind, gc_tf, counted, entry_time, entry_px, size_pct_nav, hard_sl, exit_rule "
+                                 "FROM shadow_trades WHERE status='open' ORDER BY entry_time DESC")],
+                             "closed": [dict(r) for r in conn.execute(
+                                 "SELECT symbol, kind, gc_tf, counted, entry_time, exit_time, exit_reason, ret_pct, pnl_nav_pct "
+                                 "FROM shadow_trades WHERE status='closed' ORDER BY exit_time DESC LIMIT 20")]}
+        finally:
+            conn.close()
+    except Exception as e:
+        out["shadow"] = {"error": str(e)[:200]}
+    return out
+
+
 MANUAL_JOBS = {
     "1d": _scheduled_1d_scan,
     "1h": _scheduled_1h_scan_exits,
@@ -1878,6 +2049,9 @@ MANUAL_JOBS = {
     "dims_outcomes": _scheduled_dims_outcomes,
     "dims_backfill": _scheduled_dims_backfill,
     "fallback": _scheduled_fallback,
+    "bx": _scheduled_bx_daily,
+    "bx_4h": _scheduled_bx_4h,
+    "bx_1h": _scheduled_bx_1h,
 }
 _manual_running: set = set()
 _manual_lock = threading.Lock()
@@ -1959,6 +2133,13 @@ def _init_scheduler() -> BackgroundScheduler | None:
         scheduler.add_job(_scheduled_live_radar, CronTrigger(minute=LIVE_RADAR_MINUTES, timezone=hkt),
                           id="live_radar", name="LIVE radar 1D/4H/1H + candidates sync",
                           next_run_time=datetime.now(hkt) + timedelta(seconds=30), **common)
+        if BX_ENABLED:  # Bitunix shadow radar: own lock, never blocks an HL job
+            scheduler.add_job(_scheduled_bx_daily, CronTrigger(hour=8, minute=20, timezone=hkt),
+                              id="bx_daily", name="Bitunix shadow radar daily (display/shadow only)", **common)
+            scheduler.add_job(_scheduled_bx_4h, CronTrigger(hour="0,4,12,16,20", minute=25, timezone=hkt),
+                              id="bx_4h", name="Bitunix shadow 4H (display/shadow only)", **common)
+            scheduler.add_job(_scheduled_bx_1h, CronTrigger(minute=27, timezone=hkt),
+                              id="bx_1h", name="Bitunix shadow 1H (new tokens + open shadow)", **common)
         scheduler.start()
         _SCHED_REF["s"] = scheduler
         sys.stderr.write(
@@ -1973,6 +2154,7 @@ def _init_scheduler() -> BackgroundScheduler | None:
             "  - 08:55 HKT: Auto-executor (Base now; Chase -> pending pullback)\n"
             "  - Every 4h :10 (after 4H scan): pending pullback entries\n"
             f"  - cron minute {LIVE_RADAR_MINUTES}: LIVE radar 1D/4H/1H + candidates sync + DESK_DATA\n"
+            + ("  - BX shadow (no orders): 08:20 daily, 4h :25 (08:20 run covers 08), hourly :27\n" if BX_ENABLED else "")
         )
         return scheduler
     except Exception as e:
@@ -2157,6 +2339,28 @@ class Handler(SimpleHTTPRequestHandler):
                                       ("ts", "n_wallets", "n_manual", "errors", "wallets")} if snap else None,
                                       "coins": snap.get("coins") if snap else None, "watchlist": wl})
             return
+        if path in ("/api/bx/radar", "/api/bx/shadow", "/api/bx/review"):
+            # keyed, read-only BX shadow data (Claude weekly review of unknown-class contracts, reports)
+            if self._ai_key_ok():
+                try:
+                    if path == "/api/bx/radar":
+                        tf = (parse_qs(parsed.query).get("tf") or ["1d"])[0]
+                        name = "bx_tradfi_radar.json" if tf == "tradfi" else f"bx_radar_{tf if tf in ('1d', '4h', '1h') else '1d'}.json"
+                        d = _read_out_json(name)
+                        self._send_json(200 if d else 404, d or {"ok": False, "error": "BX radar not built yet"})
+                    elif path == "/api/bx/review":
+                        m = _read_out_json("bx_meta.json")
+                        self._send_json(200, {"ok": bool(m), "ts": m.get("ts"), "review": m.get("review") or [],
+                                              "how_to_fix": "classify in data/bx_asset_class.json or map in "
+                                                            "data/bx_symbol_map.json (Harbor reviews Sundays)"})
+                    else:
+                        import bx_shadow
+                        probe = _read_out_json("bx_probe_log.json")
+                        self._send_json(200, {"ok": True, "compare": bx_shadow.compare(),
+                                              "probe_runs": (probe.get("runs") or [])[-40:]})
+                except Exception as e:
+                    self._send_json(500, {"ok": False, "error": f"{type(e).__name__}: {e}"})
+            return
         if path == "/api/exec/pending":
             if self._ai_key_ok():
                 try:
@@ -2177,6 +2381,12 @@ class Handler(SimpleHTTPRequestHandler):
         if path in ("/api/account-ui", "/api/market-ui"):
             try:
                 self._send_json(200, _account_view() if path == "/api/account-ui" else _market_view())
+            except Exception as e:
+                self._send_json(500, {"ok": False, "error": f"{type(e).__name__}: {e}"})
+            return
+        if path == "/api/bx-ui":  # password-gated like the other views; BX shadow data, display only
+            try:
+                self._send_json(200, _bx_view())
             except Exception as e:
                 self._send_json(500, {"ok": False, "error": f"{type(e).__name__}: {e}"})
             return

@@ -1,0 +1,10 @@
+{
+  "_note": "Bitunix TradFi contracts: base -> stock | commodity | index_etf. Seed from the 2026-09-29 check (XAU, XAG, CL, BZ, SNDK, MSTR, INTC). Anything not listed and not matched to HL or CoinGecko is 'unknown' and excluded until reviewed (Claude compiles weekly, Harbor reviews Sundays; GET /api/bx/review). Add Korean / HK stock tickers here as they are identified.",
+  "XAU": "commodity",
+  "XAG": "commodity",
+  "CL": "commodity",
+  "BZ": "commodity",
+  "SNDK": "stock",
+  "MSTR": "stock",
+  "INTC": "stock"
+}

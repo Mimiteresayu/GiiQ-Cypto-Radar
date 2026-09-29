@@ -12,6 +12,17 @@ header, the executor / pending run reports, the preflight JSON and `[DESK_DATA]`
 
 ---
 
+## Bitunix shadow radar + reporting (2026-09-29, SoT id unchanged: no executor rule changed)
+Approved by Harbor 2026-09-29 (design doc: Bitunix Universe Expansion). Display and shadow only.
+- New jobs (own lock, subprocess without `HL_API_PRIVATE_KEY`): BX daily 08:20 HKT, 4H at :25, 1H at :27.
+  No Bitunix key and no Bitunix orders. Files: `out/bx_*`, `out/cg_*`, ledger `out/bx_shadow_ledger.db`.
+- The HL order path never reads BX data (`test_bx_isolation.py`); `[DESK_DATA]` and ENTRY_DESK candidates are unchanged.
+- `/api/exit/health`: `info` PENDING_SKIPPED plus a note in the daily summary when a 4h pending check was skipped
+  because that run's exits failed (accepted 4h delay, now reported). Also written to the daily run report.
+- Docstrings fixed: pending entries are checked every 4h (not hourly); total margin cap is 30% NAV (not 80%).
+
+---
+
 ## Reporting-only update (2026-09-28, SoT id unchanged: no executor rule changed)
 - Veto rule ids (`rule`, e.g. V1_WEAK_4H_BREAKOUT) are stored with each decision and in the ledger;
   `/api/dimensions/report` has `veto_rules`: signals blocked per rule and how they did vs approved ones.

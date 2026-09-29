@@ -10,7 +10,8 @@ SoT enforcement (see exec_common.py):
   order must be ABOVE the 1D Upper from the latest closed-bar scan, else skip
 - Chase signals never enter at 08:55: they become pending pullback entries (pending_entries.py)
   ADD_ON (coin already held LONG, zone [4H Lower, 4H Filter]) or CONTINUATION (no position,
-  zone [1D Lower, 1D Filter]); pending_worker.py checks them hourly with the same SoT checks.
+  zone [1D Lower, 1D Filter]); pending_worker.py checks them every 4h at :10 HKT, right after the 4H exits,
+  with the same SoT checks (skipped for that run if the exit step failed).
   Pending records are only written in LIVE mode (DRY_RUN reports "would_create").
 - Total margin (existing + all new entries, cumulative) <= 80% equity AND <= 30% NAV (GIIQ-SoT-3)
 - GIIQ-SoT-3: coin notional <= 20% NAV; max 3 new fills per HKT day (Base + pending together);

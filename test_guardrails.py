@@ -3,6 +3,7 @@
 exits -> re-fetch -> entries order, run report, SoT id. HL fully mocked; no network, no orders."""
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -272,9 +273,12 @@ class TestServeOrderAndReport(unittest.TestCase):
         self.tmp = tempfile.mkdtemp()
         self._p = patch.object(serve, "RUN_REPORT_DIR", self.tmp)
         self._p.start()
+        self._p2 = patch.object(serve, "PENDING_SKIPS_PATH", os.path.join(self.tmp, "pending_skips.json"))
+        self._p2.start()
 
     def tearDown(self):
         self._p.stop()
+        self._p2.stop()
 
     def test_4h_job_skips_entries_when_exits_fail(self):
         s = self.serve
@@ -283,6 +287,9 @@ class TestServeOrderAndReport(unittest.TestCase):
             s._scheduled_4h_scan_exits()
         pend.assert_not_called()
         self.assertEqual(st.call_args.args[:2], ("pending_entries", "skipped"))
+        # Harbor 2026-09-29: the skip is kept for EXIT_DESK's daily line and the daily run report
+        with open(os.path.join(self.tmp, "pending_skips.json")) as f:
+            self.assertIn("exit_worker rc=1", json.load(f)["skips"][0]["why"])
 
     def test_4h_job_runs_entries_after_exits(self):
         s = self.serve
