@@ -139,6 +139,11 @@ def check(*, perp: Any, open_orders: Any, nav: Optional[float], radar_1h: dict, 
             continue  # password-triggered DRY_RUN runs are not production jobs
         t = _ts((st or {}).get("last_run"))
         if st and st.get("status") == "error" and t and now - t < timedelta(hours=24):
+            if name.startswith("bx_"):  # Bitunix shadow jobs never hold an HL position: info, not an HL problem
+                info.append({"code": "BX_JOB_FAILED", "coin": None,
+                             "msg": f"{name} error at {t.astimezone(HKT).strftime('%m-%d %H:%M')} HKT: "
+                                    f"{(st.get('error') or st.get('message') or '')[:160]}"})
+                continue
             add("JOB_FAILED", None, f"{name} error at {t.astimezone(HKT).strftime('%m-%d %H:%M')} HKT: "
                 f"{(st.get('error') or st.get('message') or '')[:160]}")
     for name, max_min in JOB_MAX_AGE_MIN.items():

@@ -30,6 +30,17 @@ class TestPendingSkipReport(unittest.TestCase):
         self.assertNotIn("pending skipped", res["summary"])
         self.assertEqual(_check(None)["summary"], res["summary"])
 
+    def test_bx_job_failure_is_info_not_problem(self):
+        res = exit_health.check(perp={"assetPositions": []}, open_orders=[], nav=1000.0,
+                                radar_1h={"ts": NOW.isoformat()}, radar_4h={"ts": NOW.isoformat()},
+                                tier_for=lambda s: "small",
+                                job_status={"1h_scan_exits": {"last_run": NOW.isoformat(), "status": "success"},
+                                            "4h_scan_exits": {"last_run": NOW.isoformat(), "status": "success"},
+                                            "bx_daily": {"last_run": NOW.isoformat(), "status": "error", "error": "x"}},
+                                pending=[], now=NOW)
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["info"][0]["code"], "BX_JOB_FAILED")
+
     def test_serve_notes_skip(self):
         import serve
         tmp = tempfile.mkdtemp()
