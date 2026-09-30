@@ -509,6 +509,33 @@ class TestDryRun(unittest.TestCase):
         self.assertTrue(all(x["headers"]["api-key"] == "***" for x in reqs))
 
 
+class TestDayReport(Tmp):
+    def test_day_report_has_egress_decisions_orders_sl_and_breaker(self):
+        import bx_service
+        self.seed([cand(), cand("BARUSDT")], [meta(), meta("BARUSDT")],
+                  [{"symbol": "FOOUSDT", "decision": "approve", "reason": "clean 1D cross"},
+                   {"symbol": "BARUSDT", "decision": "veto", "rule": "V1_WEAK_4H_BREAKOUT"}])
+        rep = self.entries(FakeAPI())
+        orig = (bx_service.OUT_DIR, bx_egress.check)
+        bx_service.OUT_DIR = self.tmp
+        bx_egress.check = lambda force=False, opener=None: SG
+        try:
+            with patch.object(L, "hkt_date", return_value=L.hkt_date(T0)):
+                day = bx_service.day_report(rep, T0)
+        finally:
+            bx_service.OUT_DIR, bx_egress.check = orig
+        self.assertTrue(day["live"])
+        self.assertEqual(day["egress"]["ip"], "136.110.48.50")
+        self.assertEqual({d["symbol"]: d["decision"] for d in day["decisions"]}, {"FOOUSDT": "approve", "BARUSDT": "veto"})
+        self.assertEqual(day["decisions"][1]["rule"], "V1")
+        o = day["orders"][0]
+        self.assertEqual((o["symbol"], o["status"], o["hard_sl"], o["sl_order_id"], o["sl_confirmed"]),
+                         ("FOOUSDT", "filled", "1.8600", "SL1", True))
+        self.assertFalse(day["breaker"]["tripped"])
+        self.assertNotIn("KEY_abcdef123", json.dumps(day))
+        self.assertNotIn("SECRET_zyx987", json.dumps(day))
+
+
 class TestCockpitRoutesBxDecisionsAway(unittest.TestCase):
     def test_bx_decisions_never_reach_hl_store(self):
         import serve
