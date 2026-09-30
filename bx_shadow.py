@@ -76,10 +76,20 @@ def db_path() -> str:
     return os.environ.get("BX_LEDGER_PATH") or str(OUT_DIR / "bx_shadow_ledger.db")
 
 
+LIVE_COLS = {"mode": "TEXT DEFAULT 'shadow'", "order_id": "TEXT", "client_id": "TEXT", "position_id": "TEXT",
+             "qty": "REAL", "pnl_usd": "REAL", "fees_usd": "REAL", "funding_usd": "REAL", "sl_order_id": "TEXT"}
+SHADOW = "COALESCE(mode,'shadow')='shadow'"
+
+
 def connect(path: Optional[str] = None) -> sqlite3.Connection:
     import dim_ledger
     conn = dim_ledger.connect(path or db_path())   # signals / outcomes / ... in the BX file only
     conn.executescript(SCHEMA)
+    have = {r[1] for r in conn.execute("PRAGMA table_info(shadow_trades)")}
+    for col, typ in LIVE_COLS.items():             # live pilot rows share this table, marked mode='live'
+        if col not in have:
+            conn.execute(f"ALTER TABLE shadow_trades ADD COLUMN {col} {typ}")
+    conn.commit()
     return conn
 
 
@@ -258,9 +268,9 @@ def run(job: str, now: Optional[datetime] = None, nav_usd: Optional[float] = Non
                            "pending": [], "skipped": []}
     meta_all = {m["bx_symbol"]: m for m in (bx_radar.load_meta().get("scanned") or [])}
     r1d, r4h, r1h = (_rows_by_symbol(bx_radar.load_radar(tf)) for tf in ("1d", "4h", "1h"))
-    open_trades = [dict(r) for r in conn.execute("SELECT * FROM shadow_trades WHERE status='open'")]
+    open_trades = [dict(r) for r in conn.execute(f"SELECT * FROM shadow_trades WHERE status='open' AND {SHADOW}")]
     today = hkt_date(now)
-    fills_today = conn.execute("SELECT COUNT(*) FROM shadow_trades WHERE substr(entry_time,1,10)>=? AND note LIKE ?",
+    fills_today = conn.execute(f"SELECT COUNT(*) FROM shadow_trades WHERE {SHADOW} AND substr(entry_time,1,10)>=? AND note LIKE ?",
                                ((now - timedelta(days=1)).strftime("%Y-%m-%d"), f"%hkt={today}%")).fetchone()[0]
 
     # 1) exits first (same order as HL: exits -> re-read book -> entries)
@@ -279,7 +289,7 @@ def run(job: str, now: Optional[datetime] = None, nav_usd: Optional[float] = Non
                       t["id"]))
         rep["closed"].append({"symbol": t["symbol"], "reason": reason, "ret_pct": ret})
     conn.commit()
-    open_trades = [dict(r) for r in conn.execute("SELECT * FROM shadow_trades WHERE status='open'")]
+    open_trades = [dict(r) for r in conn.execute(f"SELECT * FROM shadow_trades WHERE status='open' AND {SHADOW}")]
     held = {t["bx_symbol"] for t in open_trades}
 
     def open_trade(meta: dict, kind: str, gc_tf: str, sid: Optional[int], counted: bool, note: str = "") -> None:
@@ -383,7 +393,7 @@ def run(job: str, now: Optional[datetime] = None, nav_usd: Optional[float] = Non
     conn.commit()
     if job == "daily":
         rep["outcomes"] = dim_ledger.fill_outcomes(conn, bx_radar.load_candles("1d"), int(now.timestamp() * 1000))
-    rep["open"] = conn.execute("SELECT COUNT(*) FROM shadow_trades WHERE status='open'").fetchone()[0]
+    rep["open"] = conn.execute(f"SELECT COUNT(*) FROM shadow_trades WHERE status='open' AND {SHADOW}").fetchone()[0]
     if own:
         conn.close()
     return rep
@@ -417,7 +427,8 @@ def compare(conn: Optional[sqlite3.Connection] = None, hl_path: Optional[str] = 
         r[metric] = r.pop("v")
     counted = [r for r in rows if r["counted"]]
     watch = [r for r in rows if not r["counted"]]
-    trades = [dict(r) for r in conn.execute("SELECT counted, ret_pct, pnl_nav_pct, exit_reason FROM shadow_trades "
+    trades = [dict(r) for r in conn.execute("SELECT counted, ret_pct, pnl_nav_pct, exit_reason, "
+                                            "COALESCE(mode,'shadow') AS mode, pnl_usd FROM shadow_trades "
                                             "WHERE status='closed'")]
     if own:
         conn.close()
@@ -449,8 +460,10 @@ def compare(conn: Optional[sqlite3.Connection] = None, hl_path: Optional[str] = 
         "bx_watch_1h": dim_ledger._stats([r for r in watch if r["gc_tf"] == "1h" and r.get(metric) is not None], metric),
         "hl_rule_only": hl_rule, "hl_claude_approved": hl_appr,
         "hl_ledger": "missing" if hl is None else "read-only",
-        "shadow_trades": {"counted": tstats([t for t in trades if t["counted"]]),
-                          "watch": tstats([t for t in trades if not t["counted"]])},
+        "shadow_trades": {"counted": tstats([t for t in trades if t["counted"] and t["mode"] == "shadow"]),
+                          "watch": tstats([t for t in trades if not t["counted"] and t["mode"] == "shadow"])},
+        "live_trades": dict(tstats([t for t in trades if t["mode"] == "live"]),
+                            pnl_usd=round(sum(t["pnl_usd"] or 0 for t in trades if t["mode"] == "live"), 4)),
         "signals": {"total": len(rows), "counted": len(counted), "watch": len(watch)},
         "how_to_read": ("Primary: bx_counted vs hl_rule_only on the 7-day return (Hard-SL loss if hit first). "
                         "hl_claude_approved is a reference column. Watch-tier and 1H-GC signals are shown apart "

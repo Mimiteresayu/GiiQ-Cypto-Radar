@@ -97,8 +97,8 @@ def trading_pairs(opener=None) -> List[dict]:
     return list(_get("/trading_pairs", opener=opener) or [])
 
 
-def tickers(opener=None) -> List[dict]:
-    return list(_get("/tickers", opener=opener) or [])
+def tickers(opener=None, symbols: Optional[str] = None) -> List[dict]:
+    return list(_get("/tickers", {"symbols": symbols} if symbols else None, opener=opener) or [])
 
 
 def depth(symbol: str, limit: int = 5, opener=None) -> dict:

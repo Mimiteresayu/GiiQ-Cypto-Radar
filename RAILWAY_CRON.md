@@ -154,3 +154,6 @@ subprocess with a hard timeout (`BX_TIMEOUT_S`, default 480 s) and without `HL_A
 Env: `BX_ENABLED` (default 1), `BX_TIMEOUT_S`, `BX_REQ_PER_S` (default 5), `COINGECKO_API_KEY` (Demo key; optional).
 Endpoints: `GET /api/bx-ui` (password), `GET /api/bx/radar?tf=1d|4h|1h|tradfi`, `/api/bx/shadow`, `/api/bx/review` (AI key).
 Manual run: `POST /api/jobs/run` with `bx`, `bx_4h` or `bx_1h`.
+
+**Live pilot (2026-09-30):** when `BX_SERVICE_URL` is set on the cockpit, the jobs above do not run here; they run
+in the Singapore `bx-exec` service (`python bx_service.py`) with the live pilot. See `docs/BX_LIVE_PILOT.md`.

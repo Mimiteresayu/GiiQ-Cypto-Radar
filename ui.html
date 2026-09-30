@@ -959,9 +959,10 @@
       <div class="stat">Contracts <span class="pct" id="bxN">—</span></div>
       <div class="stat">Scanned <span class="g" id="bxScan">—</span></div>
       <div class="stat">Review <span id="bxReviewN">—</span></div>
+      <div class="stat">Live <span id="bxLive">—</span></div>
       <div class="stat" style="color:var(--muted)" id="bxTs">—</div>
     </div>
-    <div class="dims-note">Shadow only — no Bitunix orders, no keys. HL rows come from the HL radar; BX rows from the
+    <div class="dims-note">Shadow book for every signal; live pilot trades are marked LIVE (Singapore service, 1% NAV, 3x, ENTRY_DESK approval required). HL rows come from the HL radar; BX rows from the
       Bitunix scan. TradFi is kept apart and never counts in crypto breadth or candidates.</div>
   </section>
 
@@ -1923,7 +1924,11 @@
     el("bxN").textContent = B.n_contracts ?? "—";
     el("bxScan").textContent = (B.n_scanned ?? "—") + " · T " + (c.tier_tradeable || 0) + " · W " + (c.tier_watch || 0);
     el("bxReviewN").textContent = (B.review || []).length;
-    el("bxTs").textContent = B.ts ? "scan " + ageStr(B.ts) : "—";
+    el("bxTs").textContent = B.ts ? "scan " + ageStr(B.ts) + (B.served_from ? " · " + B.served_from : "") : "—";
+    const LV = B.live || {};
+    el("bxLive").textContent = LV.breaker && LV.breaker.tripped ? "BREAKER TRIPPED" :
+      (LV.bx_live ? "ON" : "off") + (LV.open ? " · " + LV.open.length + " open" : "") +
+      (LV.realized_pnl_usd ? " · " + money(LV.realized_pnl_usd) : "");
     // merged rows: HL radar (display) + BX-only rows; HL+BX flagged from the BX catalog view is not needed here
     const hlRows = ((radar["1d"] || {}).rows || []).map(r => ({symbol: r.symbol, ex: "HL", trend: r.trend, close: r.close, upper: r.upper,
       dual_cross_up: r.dual_cross_up, vol24h_usd: r.day_ntl_vlm, cat_tags: r.cat_tags}));
@@ -1955,12 +1960,14 @@
       <td class="num">${x && x.sl_hit_rate != null ? Math.round(x.sl_hit_rate * 100) + "%" : "—"}</td></tr>`;
     el("bxCmpBody").innerHTML = st("<b>BX-only · counted</b>", C.bx_counted) + st("HL · rule-only", C.hl_rule_only) +
       st('HL · Claude-approved <span class="kpi-sub">(ref)</span>', C.hl_claude_approved) + st("BX · watch", C.bx_watch) +
-      st("BX · 1H GC (watch)", C.bx_watch_1h);
+      st("BX · 1H GC (watch)", C.bx_watch_1h) +
+      st("<b>BX · LIVE pilot</b> (closed trades)", C.live_trades ? {n: C.live_trades.n, mean: C.live_trades.mean_ret_pct,
+         win_rate: C.live_trades.win_rate} : null);
     const SB = B.shadow || {}, open = SB.open || [], closed = SB.closed || [];
     el("bxOpenN").textContent = open.length + " open";
-    el("bxBookBody").innerHTML = open.map(t => `<tr><td>${esc(t.symbol)}</td><td>${esc(t.kind)}${t.counted ? "" : ' <span class="kpi-sub">watch</span>'}</td>
+    el("bxBookBody").innerHTML = open.map(t => `<tr><td>${esc(t.symbol)}${t.mode === "live" ? ' <span class="chip">LIVE</span>' : ""}</td><td>${esc(t.kind)}${t.counted ? "" : ' <span class="kpi-sub">watch</span>'}</td>
         <td>open</td><td>${fmtNum(t.entry_px)}</td><td class="kpi-sub">SL ${fmtNum(t.hard_sl)}</td></tr>`).join("") +
-      closed.map(t => `<tr><td>${esc(t.symbol)}</td><td>${esc(t.kind)}</td><td class="kpi-sub">${esc(t.exit_reason || "")}</td>
+      closed.map(t => `<tr><td>${esc(t.symbol)}${t.mode === "live" ? ' <span class="chip">LIVE</span>' : ""}</td><td>${esc(t.kind)}</td><td class="kpi-sub">${esc(t.exit_reason || "")}</td>
         <td class="kpi-sub">${t.entry_time ? ageStr(t.entry_time) : "—"}</td>
         <td class="num ${signedCls(t.ret_pct)}">${fmtPct(t.ret_pct, 2)}</td></tr>`).join("") ||
       '<tr><td colspan="5" class="empty">No shadow trades yet</td></tr>';

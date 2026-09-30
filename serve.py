@@ -17,6 +17,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error as _url_err
 import urllib.request as _url_req
 from datetime import datetime, timedelta, timezone
 from http.cookies import SimpleCookie
@@ -1118,7 +1119,8 @@ def _exit_health(now: datetime | None = None, hl_data: dict | None = None) -> di
         return exit_health.check(perp=hl_data.get("hl_perp"), open_orders=hl_data.get("hl_open_orders"),
                                  nav=account.get("equity"), radar_1h=radars["1h"], radar_4h=radars["4h"],
                                  tier_for=_tier_for, job_status=jobs, pending=pend, now=now,
-                                 pending_skips=(_read_out_json("pending_skips.json").get("skips") or []))
+                                 pending_skips=(_read_out_json("pending_skips.json").get("skips") or []),
+                                 bx_status=(_bx_service("/api/bx/status", timeout=8.0)[1] if BX_SERVICE_URL else None))
     except Exception as e:
         return {"ok": False, "problems": [{"code": "HEALTH_ERROR", "coin": None, "msg": str(e)}],
                 "summary": f"health check error: {e}"}
@@ -1899,6 +1901,30 @@ def heavy_job_blocked(now: datetime | None = None) -> str:
 # Nothing on the HL order path reads bx_* files (test_bx_isolation.py). BX status goes to its own
 # [BX_DATA] log line, never into [DESK_DATA] / ENTRY_DESK candidates.
 BX_ENABLED = (os.environ.get("BX_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off"))
+# Live pilot (2026-09-30): Bitunix runs in the Singapore bx-exec service. When BX_SERVICE_URL is set the cockpit
+# (US region) runs NO Bitunix job and never calls Bitunix; it only proxies read views, forwards ENTRY_DESK BX
+# decisions and shows the BX breaker / SL problems on the exit health. It never holds a Bitunix key.
+BX_SERVICE_URL = (os.environ.get("BX_SERVICE_URL") or "").strip().rstrip("/")
+BX_SERVICE_KEY = (os.environ.get("BX_SERVICE_KEY") or "").strip()
+
+
+def _bx_service(path: str, body: dict | None = None, timeout: float = 15.0) -> tuple[int, dict]:
+    """GET (or POST with body) the bx-exec service. -> (http status, json). Never raises."""
+    if not BX_SERVICE_URL or not BX_SERVICE_KEY:
+        return 503, {"ok": False, "error": "BX_SERVICE_URL / BX_SERVICE_KEY not set"}
+    data = json.dumps(body).encode() if body is not None else None
+    req = _url_req.Request(BX_SERVICE_URL + path, data=data, method="POST" if data is not None else "GET",
+                           headers={"X-BX-Key": BX_SERVICE_KEY, "Content-Type": "application/json"})
+    try:
+        with _url_req.urlopen(req, timeout=timeout) as r:
+            return r.status, json.loads(r.read().decode() or "{}")
+    except _url_err.HTTPError as e:
+        try:
+            return e.code, json.loads(e.read().decode() or "{}")
+        except Exception:
+            return e.code, {"ok": False, "error": f"http {e.code}"}
+    except Exception as e:
+        return 502, {"ok": False, "error": f"bx-exec unreachable: {type(e).__name__}: {str(e)[:120]}"}
 BX_TIMEOUT_S = int(os.environ.get("BX_TIMEOUT_S", "480"))
 BX_PROBE_LOG_DAYS = 60
 _bx_lock = threading.Lock()
@@ -2002,40 +2028,13 @@ def _scheduled_bx_1h(manual: bool = False) -> dict:
 
 
 def _bx_view() -> dict:
-    """Cockpit Market tab (BX filter) + TradFi tab + BX shadow panel. Display only."""
-    meta = _read_out_json("bx_meta.json")
-    keep = ("symbol", "bx_symbol", "ex", "asset_class", "close", "price", "trend", "filter", "upper", "lower",
-            "dual_cross_up", "above_upper", "bar_time", "vol24h_usd", "ign_x", "ign", "spread_bp", "liq_tier",
-            "contract_age_days", "new_contract", "asset_age", "cat_tags", "drop_from_ath_pct", "tier", "gc_tf",
-            "session_gap", "narrative")
-    out: dict = {"ok": bool(meta), "ts": meta.get("ts"), "counts": meta.get("counts"),
-                 "n_contracts": meta.get("n_contracts"), "n_scanned": meta.get("n_scanned"),
-                 "review": (meta.get("review") or [])[:200],
-                 # HL names also listed on Bitunix -> the Bitunix tab labels those HL rows HL+BX
-                 "overlap": sorted({r.get("hl_name") for r in meta.get("catalog") or []
-                                    if r.get("ex") == "HL+BX" and r.get("hl_name")})}
-    for tf in ("1d", "4h", "1h"):
-        r = _read_out_json(f"bx_radar_{tf}.json")
-        out[f"radar_{tf}"] = {"ts": r.get("ts"), "breadth": r.get("breadth"),
-                              "rows": [{k: x.get(k) for k in keep} for x in r.get("rows") or []]}
-    tf_r = _read_out_json("bx_tradfi_radar.json")
-    out["tradfi"] = {"ts": tf_r.get("ts"), "rows": [{k: x.get(k) for k in keep + ("tf",)} for x in tf_r.get("rows") or []]}
-    try:
-        import bx_shadow
-        conn = bx_shadow.connect()
-        try:
-            out["shadow"] = {"compare": bx_shadow.compare(conn),
-                             "open": [dict(r) for r in conn.execute(
-                                 "SELECT symbol, kind, gc_tf, counted, entry_time, entry_px, size_pct_nav, hard_sl, exit_rule "
-                                 "FROM shadow_trades WHERE status='open' ORDER BY entry_time DESC")],
-                             "closed": [dict(r) for r in conn.execute(
-                                 "SELECT symbol, kind, gc_tf, counted, entry_time, exit_time, exit_reason, ret_pct, pnl_nav_pct "
-                                 "FROM shadow_trades WHERE status='closed' ORDER BY exit_time DESC LIMIT 20")]}
-        finally:
-            conn.close()
-    except Exception as e:
-        out["shadow"] = {"error": str(e)[:200]}
-    return out
+    """Bitunix tab (display only): from the Singapore bx-exec service when configured, else local files."""
+    if BX_SERVICE_URL:
+        code, d = _bx_service("/api/bx-ui")
+        return d if code == 200 else {"ok": False, "error": d.get("error") or f"bx-exec http {code}"}
+    from pathlib import Path as _P
+    import bx_view
+    return bx_view.build(_P(OUT_DIR))
 
 
 MANUAL_JOBS = {
@@ -2133,7 +2132,7 @@ def _init_scheduler() -> BackgroundScheduler | None:
         scheduler.add_job(_scheduled_live_radar, CronTrigger(minute=LIVE_RADAR_MINUTES, timezone=hkt),
                           id="live_radar", name="LIVE radar 1D/4H/1H + candidates sync",
                           next_run_time=datetime.now(hkt) + timedelta(seconds=30), **common)
-        if BX_ENABLED:  # Bitunix shadow radar: own lock, never blocks an HL job
+        if BX_ENABLED and not BX_SERVICE_URL:  # Bitunix shadow radar: own lock, never blocks an HL job
             scheduler.add_job(_scheduled_bx_daily, CronTrigger(hour=8, minute=20, timezone=hkt),
                               id="bx_daily", name="Bitunix shadow radar daily (display/shadow only)", **common)
             scheduler.add_job(_scheduled_bx_4h, CronTrigger(hour="0,4,12,16,20", minute=25, timezone=hkt),
@@ -2154,7 +2153,9 @@ def _init_scheduler() -> BackgroundScheduler | None:
             "  - 08:55 HKT: Auto-executor (Base now; Chase -> pending pullback)\n"
             "  - Every 4h :10 (after 4H scan): pending pullback entries\n"
             f"  - cron minute {LIVE_RADAR_MINUTES}: LIVE radar 1D/4H/1H + candidates sync + DESK_DATA\n"
-            + ("  - BX shadow (no orders): 08:20 daily, 4h :25 (08:20 run covers 08), hourly :27\n" if BX_ENABLED else "")
+            + ("  - BX shadow (no orders): 08:20 daily, 4h :25 (08:20 run covers 08), hourly :27\n"
+               if BX_ENABLED and not BX_SERVICE_URL else
+               (f"  - BX: runs in bx-exec ({BX_SERVICE_URL}); no Bitunix job here\n" if BX_SERVICE_URL else ""))
         )
         return scheduler
     except Exception as e:
@@ -2339,9 +2340,13 @@ class Handler(SimpleHTTPRequestHandler):
                                       ("ts", "n_wallets", "n_manual", "errors", "wallets")} if snap else None,
                                       "coins": snap.get("coins") if snap else None, "watchlist": wl})
             return
-        if path in ("/api/bx/radar", "/api/bx/shadow", "/api/bx/review"):
+        if path in ("/api/bx/radar", "/api/bx/shadow", "/api/bx/review", "/api/bx/status"):
             # keyed, read-only BX shadow data (Claude weekly review of unknown-class contracts, reports)
             if self._ai_key_ok():
+                if BX_SERVICE_URL:
+                    code, d = _bx_service(path + (("?" + parsed.query) if parsed.query and path == "/api/bx/radar" else ""))
+                    self._send_json(code, d)
+                    return
                 try:
                     if path == "/api/bx/radar":
                         tf = (parse_qs(parsed.query).get("tf") or ["1d"])[0]
@@ -2660,7 +2665,11 @@ class Handler(SimpleHTTPRequestHandler):
             "candidates": enhanced,
             "account": account,
         }
-        
+        if BX_SERVICE_URL:
+            # Separate BX section (Bitunix live pilot). The HL executor never reads this response.
+            code, bxd = _bx_service("/api/bx/candidates")
+            response["bx"] = bxd if code == 200 else {"error": bxd.get("error") or f"bx-exec http {code}",
+                                                      "candidates": []}
         self._send_json(200, response)
 
     def _ai_narrative(self) -> None:
@@ -2860,6 +2869,15 @@ class Handler(SimpleHTTPRequestHandler):
             return
         
         decisions = body.get("decisions")
+        bx_res = None
+        if isinstance(body.get("bx_decisions"), list):
+            # Bitunix pilot decisions go ONLY to the bx-exec service, never into the HL decisions store.
+            code, bx_res = _bx_service("/api/bx/decision", {"decisions": body["bx_decisions"],
+                                                            "source": body.get("source") or "claude"})
+            bx_res = dict(bx_res, http=code)
+            if decisions is None:
+                self._send_json(200 if bx_res.get("ok") else 422, {"ok": bool(bx_res.get("ok")), "bx": bx_res})
+                return
         if not isinstance(decisions, list):
             self._send_json(400, {"ok": False, "error": "need {decisions: [...]}"})
             return
@@ -2885,6 +2903,8 @@ class Handler(SimpleHTTPRequestHandler):
             except Exception as e:
                 result["ledger_error"] = str(e)
         result.pop("stored", None)
+        if bx_res is not None:
+            result["bx"] = bx_res
         if not result.get("ok"):
             sys.stderr.write(f"[AI_DECISION] !!!!!!!! nothing stored: {json.dumps(result)[:500]}\n")
         code = 200 if result.get("ok") else (409 if "fallback ignored" in str(result.get("error")) else 422)
