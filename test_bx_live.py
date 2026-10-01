@@ -165,6 +165,24 @@ class TestEgressGate(unittest.TestCase):
                                expected_ip="136.110.48.50")
         self.assertTrue(r["ok"])
 
+    def test_ha_static_ip_list(self):
+        ha = "208.77.246.240, 208.77.246.241,208.77.246.242"
+        sg = "asia-southeast1-eqsg3a"
+        # one IP of the set, or two different IPs both in the set -> ok
+        self.assertTrue(bx_egress.evaluate(self.ans("SG", "SG", "208.77.246.241", "208.77.246.241"), sg, ha)["ok"])
+        self.assertTrue(bx_egress.evaluate(self.ans("SG", "SG", "208.77.246.240", "208.77.246.242"), sg, ha)["ok"])
+        # an IP outside the set (e.g. the old shared egress) -> refused
+        r = bx_egress.evaluate(self.ans("SG", "SG", "208.77.246.134", "208.77.246.134"), sg, ha)
+        self.assertFalse(r["ok"])
+        self.assertIn("whitelisted", r["reason"])
+        self.assertFalse(bx_egress.evaluate(self.ans("SG", "SG", "208.77.246.240", "9.9.9.9"), sg, ha)["ok"])
+        # in the set but a US country or US region -> still refused
+        self.assertFalse(bx_egress.evaluate(self.ans("US", "US", "208.77.246.240", "208.77.246.240"), sg, ha)["ok"])
+        self.assertFalse(bx_egress.evaluate(self.ans("SG", "SG", "208.77.246.240", "208.77.246.240"),
+                                            "us-west2", ha)["ok"])
+        # no IP reported while pinned -> refused
+        self.assertFalse(bx_egress.evaluate({"ipinfo": {"country": "SG"}, "country_is": {"country": "SG"}}, sg, ha)["ok"])
+
     def test_check_fails_closed_when_a_source_is_down(self):
         def opener(req, timeout=None):
             if "ipinfo" in req.full_url:

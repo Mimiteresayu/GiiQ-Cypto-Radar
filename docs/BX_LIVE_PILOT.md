@@ -41,7 +41,7 @@ Bitunix once `BX_SERVICE_URL` is set; it only proxies read views and forwards EN
    - **Enable Static Outbound IPs** (Pro plan) and note the IP. The Bitunix whitelist needs a fixed IP; Railway egress is not fixed otherwise.
    - Generate a public domain (the cockpit calls it).
 3. Variables on **bx-exec** (never on the cockpit): `BX_ENABLED=1`, `BX_LIVE=0`, `BX_SERVICE_KEY=<random>`,
-   `BX_ADMIN_KEY=<random, MMT only>`, `HL_ADDRESS=<HL wallet address>`, `BX_EXPECTED_EGRESS_IP=<static IP>`,
+   `BX_ADMIN_KEY=<random, MMT only>`, `HL_ADDRESS=<HL wallet address>`, `BX_EXPECTED_EGRESS_IP=<static IP(s), comma-separated for HA>`,
    optional `COINGECKO_API_KEY`, `RAILWAY_API_TOKEN` (lets the breaker set BX_LIVE=0), `BX_ALERT_WEBHOOK`.
    Do **not** set `HL_API_PRIVATE_KEY` here.
 4. Variables on **cockpit**: `BX_SERVICE_URL=https://<bx-exec domain>`, `BX_SERVICE_KEY=<same>`. The cockpit then

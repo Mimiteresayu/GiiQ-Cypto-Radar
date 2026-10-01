@@ -8,7 +8,9 @@ at the Railway region. The result is fail-closed:
   ok=True only when BOTH geo sources answer, BOTH say a non-US country, they agree on the IP when both
   report one, and the Railway region (if set) is not a us-* region. Anything else (US, unknown, a source
   down, a disagreement) -> ok=False with the reason. If BX_EXPECTED_EGRESS_IP is set (the static outbound
-  IP that the Bitunix key is whitelisted to), the IP must match it exactly.
+  IP(s) that the Bitunix key is whitelisted to; comma-separated for Railway HA static IPs), every IP the geo
+  sources report must be one of them. With HA static IPs the two sources may see two different IPs of the
+  set; that is allowed only when both are in the whitelisted set.
 
 The service logs one [BX_EGRESS] line at startup and re-checks before every live run (cached CACHE_S).
 """
@@ -37,16 +39,26 @@ def _fetch(url: str, opener=None) -> dict:
         return json.loads(r.read().decode("utf-8"))
 
 
+def parse_expected(expected_ip: Optional[str]) -> set:
+    """'1.2.3.4, 1.2.3.5' -> {'1.2.3.4', '1.2.3.5'}; empty/None -> empty set (no IP pinning)."""
+    return {p.strip() for p in str(expected_ip or "").split(",") if p.strip()}
+
+
 def evaluate(answers: Dict[str, dict], region: Optional[str], expected_ip: Optional[str] = None) -> Dict[str, Any]:
     """Pure decision from the two geo answers + Railway region. -> {ok, ip, countries, region, reason}."""
     countries = {k: str((v or {}).get("country") or "").upper() or None for k, v in answers.items()}
     ips = {k: (v or {}).get("ip") for k, v in answers.items()}
     ip_vals = {i for i in ips.values() if i}
-    ip = next(iter(ip_vals)) if len(ip_vals) == 1 else None
+    expected = parse_expected(expected_ip)
+    ip = next(iter(ip_vals)) if len(ip_vals) == 1 else (",".join(sorted(ip_vals)) or None)
     out = {"ok": False, "ip": ip, "countries": countries, "region": region, "reason": ""}
     if len(answers) < len(SOURCES) or any(c is None for c in countries.values()):
         out["reason"] = "egress country unknown (a geo source failed)"
-    elif len(ip_vals) > 1:
+    elif expected and not ip_vals:
+        out["reason"] = "egress IP unknown (no geo source reported it)"
+    elif expected and not ip_vals <= expected:
+        out["reason"] = f"egress IP {sorted(ip_vals - expected)} is not in the whitelisted static IPs {sorted(expected)}"
+    elif len(ip_vals) > 1 and not expected:
         out["reason"] = f"geo sources disagree on the egress IP {sorted(ip_vals)}"
     elif any(c in BLOCKED_COUNTRIES for c in countries.values()):
         out["reason"] = f"egress IP is in the US ({countries})"
@@ -54,8 +66,6 @@ def evaluate(answers: Dict[str, dict], region: Optional[str], expected_ip: Optio
         out["reason"] = f"geo sources disagree on the country {countries}"
     elif region and str(region).lower().startswith("us-"):
         out["reason"] = f"Railway region {region} is in the US"
-    elif expected_ip and ip != expected_ip.strip():
-        out["reason"] = f"egress IP {ip} is not the whitelisted static IP {expected_ip.strip()}"
     else:
         out["ok"] = True
         out["reason"] = "non-US egress verified"
