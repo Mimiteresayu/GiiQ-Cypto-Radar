@@ -11,3 +11,9 @@ out/*.log
 railway_function.ts
 out/pending_entries.json
 out/run_reports/
+# runtime state written by the scheduler / tests
+out/scheduler_status.json
+out/pending_skips.json
+# Bitunix shadow runtime files (Railway volume only)
+out/bx_*
+out/cg_*

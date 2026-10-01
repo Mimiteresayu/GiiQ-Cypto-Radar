@@ -9,6 +9,8 @@ COPY serve.py ui.html scan_gc_radar.py mcap_tiers.py failsafe_exit_worker.py ent
 COPY executor.py exit_worker.py trade_log.py decisions.py exec_common.py hl_exec.py live_radar.py exec_preflight.py pending_entries.py pending_worker.py ./
 # GIIQ dimensions + measurement ledger (shadow only; added 2026-09-28)
 COPY dimensions.py whales.py dim_ledger.py dims_job.py exit_health.py market_view.py account_view.py ./
+# Bitunix shadow radar (display/shadow only; added 2026-09-29)
+COPY bx_client.py bx_universe.py bx_radar.py bx_shadow.py cg_client.py ./
 COPY data/ ./data/
 # Bake narrative watchlist fallback (Harbor may overwrite via /api/sync)
 RUN mkdir -p out narrative

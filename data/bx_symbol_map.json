@@ -1,0 +1,4 @@
+{
+  "_note": "Bitunix contract base (as in the symbol, e.g. 1000PEPE) -> HL perp name. An override skips the automatic price check, so only add verified pairs. Reviewed by Harbor.",
+  "SPX6900": "SPX"
+}

@@ -139,3 +139,18 @@ the baked / synced watchlist when present.
 
 Paste-ready Grok.ai automation prompt: [`GROK_AI_NARRATIVE_PROMPT.md`](./GROK_AI_NARRATIVE_PROMPT.md).
 Suggested daily **07:30 HKT**. Output → `narrative/watchlist.json` → Harbor `/api/sync`.
+
+## Bitunix shadow radar (display / shadow only, 2026-09-29)
+
+APScheduler jobs in `serve.py` (HKT). Own lock `_bx_lock`, never the scan or executor lock; each run is a
+subprocess with a hard timeout (`BX_TIMEOUT_S`, default 480 s) and without `HL_API_PRIVATE_KEY`.
+
+| Job | HKT | What |
+|-----|-----|------|
+| `bx_daily` | 08:20 | Bitunix catalog + tickers, HL mids (BX↔HL match), CoinGecko markets, 1D + 4H candles, depth for vol ≥ $2M, shadow book |
+| `bx_4h` | 00/04/12/16/20 :25 | 4H candles, Chase pending (N/N+1), 4H exits, 4H new-token signals |
+| `bx_1h` | hourly :27 | 1H candles for 1H-GC new tokens and open shadow positions only |
+
+Env: `BX_ENABLED` (default 1), `BX_TIMEOUT_S`, `BX_REQ_PER_S` (default 5), `COINGECKO_API_KEY` (Demo key; optional).
+Endpoints: `GET /api/bx-ui` (password), `GET /api/bx/radar?tf=1d|4h|1h|tradfi`, `/api/bx/shadow`, `/api/bx/review` (AI key).
+Manual run: `POST /api/jobs/run` with `bx`, `bx_4h` or `bx_1h`.

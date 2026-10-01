@@ -494,6 +494,7 @@
     border-radius: 6px; padding: 4px 10px; cursor: pointer; font: inherit; font-size: 0.75rem; }
   .dims-seg button.active { color: var(--text); border-color: var(--accent); }
   #viewDims .entry-grid > .panel { min-width: 0; }
+  #viewBx .entry-grid table { min-width: 0; }
 
   /* ───── FOOTER ───── */
   footer { margin-top: 16px; color: var(--muted); font-size: 0.75rem; font-family: var(--mono); }
@@ -582,6 +583,7 @@
   <button type="button" data-view="radar">Market</button>
   <button type="button" data-view="narrative">Themes</button>
   <button type="button" data-view="dims">Lab · 維度</button>
+  <button type="button" data-view="bx" title="Bitunix shadow radar — display only, no orders">Bitunix</button>
 </nav>
 
 <main>
@@ -950,6 +952,84 @@
   </div>
 </div>
 
+<!-- ═══════════════ BITUNIX (shadow, display only) ═══════════════ -->
+<div id="viewBx" class="hidden">
+  <section class="breadth-box">
+    <div class="breadth-stats">
+      <div class="stat">Contracts <span class="pct" id="bxN">—</span></div>
+      <div class="stat">Scanned <span class="g" id="bxScan">—</span></div>
+      <div class="stat">Review <span id="bxReviewN">—</span></div>
+      <div class="stat" style="color:var(--muted)" id="bxTs">—</div>
+    </div>
+    <div class="dims-note">Shadow only — no Bitunix orders, no keys. HL rows come from the HL radar; BX rows from the
+      Bitunix scan. TradFi is kept apart and never counts in crypto breadth or candidates.</div>
+  </section>
+
+  <div class="panel" style="margin-bottom:12px">
+    <div class="panel-head" style="flex-wrap:wrap;gap:8px">
+      <h2>1D radar · by venue</h2>
+      <div class="dims-seg" id="bxExSeg">
+        <button type="button" data-ex="all" class="active">All</button>
+        <button type="button" data-ex="HL">HL</button>
+        <button type="button" data-ex="BX">BX</button>
+        <button type="button" data-ex="HL+BX">HL+BX</button>
+      </div>
+      <div class="dims-seg" id="bxQSeg">
+        <button type="button" data-q="all" class="active">All rows</button>
+        <button type="button" data-q="cross">Cross ↑</button>
+        <button type="button" data-q="new">New</button>
+        <button type="button" data-q="ign">IGN</button>
+      </div>
+    </div>
+    <div class="table-wrap" style="border:none;border-radius:0;max-height:560px;overflow:auto">
+      <table>
+        <thead><tr>
+          <th>Coin</th><th title="venue">EX</th><th>Trend</th><th>Close</th><th>Upper</th><th>Cross ↑</th>
+          <th title="24h volume, USD">Vol</th><th title="24h vol ÷ 7-day average">IGN</th>
+          <th title="T = tradeable (shadow), W = watch">LIQ</th><th title="best bid/ask spread">Spr bp</th>
+          <th title="contract age, days">Age</th><th title="GC timeframe used">GC</th><th>CAT</th>
+        </tr></thead>
+        <tbody id="bxBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="entry-grid" style="grid-template-columns:repeat(auto-fit,minmax(min(100%,420px),1fr))">
+    <div class="panel" style="min-width:0">
+      <div class="panel-head"><h2>Shadow · BX-only vs HL</h2><span class="kpi-sub" id="bxVerdict"></span></div>
+      <div class="table-wrap" style="border:none;border-radius:0;overflow-x:auto">
+        <table><thead><tr><th>Group</th><th>n</th><th>Mean 7d</th><th>Win %</th><th>SL hit %</th></tr></thead>
+          <tbody id="bxCmpBody"></tbody></table>
+      </div>
+      <div class="dims-note" style="padding:8px 12px">Primary: BX counted vs HL rule-only. Counted = tradeable tier, 1D/4H GC.
+        Watch tier and 1H-GC signals are shown apart. Test needs 30 signals each side.</div>
+    </div>
+    <div class="panel" style="min-width:0">
+      <div class="panel-head"><h2>Shadow book</h2><span class="kpi-sub" id="bxOpenN"></span></div>
+      <div class="table-wrap" style="border:none;border-radius:0;max-height:300px;overflow:auto">
+        <table><thead><tr><th>Coin</th><th>Kind</th><th>Status</th><th>Entry</th><th>Result</th></tr></thead>
+          <tbody id="bxBookBody"></tbody></table>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel" style="margin-top:12px">
+    <div class="panel-head"><h2>TradFi · separate view</h2><span class="kpi-sub">perp prints, session gaps</span></div>
+    <div class="table-wrap" style="border:none;border-radius:0">
+      <table><thead><tr><th>Ticker</th><th>Class</th><th>TF</th><th>Trend</th><th>Close</th><th>Upper</th><th>Cross ↑</th><th>Vol</th><th>Gap</th></tr></thead>
+        <tbody id="bxTradfiBody"></tbody></table>
+    </div>
+  </div>
+
+  <div class="panel" style="margin-top:12px">
+    <div class="panel-head"><h2>Review · unclassified or unmatched</h2><span class="kpi-sub">weekly, Sunday</span></div>
+    <div class="table-wrap" style="border:none;border-radius:0;max-height:260px;overflow:auto">
+      <table><thead><tr><th>Contract</th><th>Reason</th><th>Price</th><th>Vol</th></tr></thead>
+        <tbody id="bxReviewBody"></tbody></table>
+    </div>
+  </div>
+</div>
+
 <!-- ═══════════════ DESK (legacy) ═══════════════ -->
 <div id="viewDesk" class="hidden">
   <section class="breadth-box">
@@ -1109,7 +1189,7 @@
   }
 
   // ── View switching ─────────────────────────────────────────────────────
-  const VIEWS = ["cockpit","entry","radar","narrative","dims","desk"];
+  const VIEWS = ["cockpit","entry","radar","narrative","dims","bx","desk"];
   function showView(v) {
     view = v;
     VIEWS.forEach(id => el("view"+id[0].toUpperCase()+id.slice(1)).classList.toggle("hidden", id !== v));
@@ -1306,6 +1386,7 @@
     else if (view === "radar")     renderMarket();
     else if (view === "narrative") renderNarrative();
     else if (view === "dims")      renderDims();
+    else if (view === "bx")        renderBx();
     else if (view === "desk")      renderDesk();
   }
 
@@ -1819,6 +1900,89 @@
     return `<td title="win ${rate(b.win_rate)} · SL hit ${rate(b.sl_hit_rate)}">${pct(b.mean)} <span style="color:var(--muted)">(${b.n})</span></td>`;
   }
   let dimsData = null;
+  // ══════════════════════════════════════════════════════════
+  // BITUNIX (shadow, display only) — /api/bx-ui
+  // ══════════════════════════════════════════════════════════
+  let bxUi = null, bxEx = "all", bxQ = "all";
+  const usdShort = v => v == null ? "—" : v >= 1e9 ? "$" + (v / 1e9).toFixed(1) + "B" : v >= 1e6 ? "$" + (v / 1e6).toFixed(1) + "M" : "$" + Math.round(v / 1e3) + "k";
+  async function renderBx() {
+    try {
+      const r = await fetch("/api/bx-ui?t=" + Date.now(), {cache: "no-store"});
+      if (!r.ok) throw new Error("bx-ui " + r.status);
+      bxUi = await r.json();
+    } catch (e) {
+      el("bxBody").innerHTML = `<tr><td colspan="13" class="empty">load failed: ${esc(e.message)}</td></tr>`;
+      return;
+    }
+    renderBxBody();
+  }
+  function renderBxBody() {
+    const B = bxUi || {};
+    if (!B.ok) { el("bxBody").innerHTML = '<tr><td colspan="13" class="empty">No Bitunix scan yet (daily 08:20 HKT)</td></tr>'; }
+    const c = B.counts || {};
+    el("bxN").textContent = B.n_contracts ?? "—";
+    el("bxScan").textContent = (B.n_scanned ?? "—") + " · T " + (c.tier_tradeable || 0) + " · W " + (c.tier_watch || 0);
+    el("bxReviewN").textContent = (B.review || []).length;
+    el("bxTs").textContent = B.ts ? "scan " + ageStr(B.ts) : "—";
+    // merged rows: HL radar (display) + BX-only rows; HL+BX flagged from the BX catalog view is not needed here
+    const hlRows = ((radar["1d"] || {}).rows || []).map(r => ({symbol: r.symbol, ex: "HL", trend: r.trend, close: r.close, upper: r.upper,
+      dual_cross_up: r.dual_cross_up, vol24h_usd: r.day_ntl_vlm, cat_tags: r.cat_tags}));
+    const bxRows = ((B.radar_1d || {}).rows || []).concat(((B.radar_4h || {}).rows || []).filter(r => r.gc_tf === "4h"));
+    const both = new Set((B.overlap || []));
+    let rows = hlRows.concat(bxRows).map(r => both.has(r.symbol) ? Object.assign({}, r, {ex: "HL+BX"}) : r);
+    if (bxEx !== "all") rows = rows.filter(r => r.ex === bxEx);
+    if (bxQ === "cross") rows = rows.filter(r => r.dual_cross_up);
+    if (bxQ === "new") rows = rows.filter(r => r.new_contract);
+    if (bxQ === "ign") rows = rows.filter(r => r.ign);
+    rows.sort((a, b) => (b.dual_cross_up ? 1 : 0) - (a.dual_cross_up ? 1 : 0) || (b.vol24h_usd || 0) - (a.vol24h_usd || 0));
+    el("bxBody").innerHTML = rows.length ? rows.slice(0, 400).map(r => `<tr class="${r.dual_cross_up ? "hl-up" : ""}">
+      <td>${esc(r.symbol)}</td><td><span class="chip">${esc(r.ex)}</span></td>
+      <td class="${r.trend === "Green" ? "trend-g" : "trend-r"}">${esc(r.trend || "—")}</td>
+      <td>${fmtNum(r.close)}</td><td>${fmtNum(r.upper)}</td><td>${boolCell(r.dual_cross_up)}</td>
+      <td class="num">${usdShort(r.vol24h_usd)}</td>
+      <td class="num">${r.ign_x == null ? "—" : (r.ign ? "<b>" + r.ign_x + "×</b>" : r.ign_x + "×")}</td>
+      <td>${r.liq_tier ? (r.liq_tier === "tradeable" ? "T" : "W") : "—"}</td>
+      <td class="num">${r.spread_bp == null ? "—" : r.spread_bp}</td>
+      <td class="num">${r.contract_age_days == null ? "—" : r.contract_age_days + (r.new_contract ? ' <span class="chip">new</span>' : "")}</td>
+      <td>${esc((r.gc_tf || (r.ex === "HL" ? "1d" : "—")).toUpperCase())}</td>
+      <td>${esc(r.cat_tags || "")}</td></tr>`).join("") : '<tr><td colspan="13" class="empty">No rows for this filter</td></tr>';
+    // comparison
+    const C = (B.shadow || {}).compare || {};
+    el("bxVerdict").textContent = C.verdict || (B.shadow && B.shadow.error ? "error: " + B.shadow.error : "—");
+    const st = (name, x) => `<tr><td>${name}</td><td class="num">${(x || {}).n || 0}</td>
+      <td class="num">${x && x.mean != null ? fmtPct(x.mean, 2) : "—"}</td>
+      <td class="num">${x && x.win_rate != null ? Math.round(x.win_rate * 100) + "%" : "—"}</td>
+      <td class="num">${x && x.sl_hit_rate != null ? Math.round(x.sl_hit_rate * 100) + "%" : "—"}</td></tr>`;
+    el("bxCmpBody").innerHTML = st("<b>BX-only · counted</b>", C.bx_counted) + st("HL · rule-only", C.hl_rule_only) +
+      st('HL · Claude-approved <span class="kpi-sub">(ref)</span>', C.hl_claude_approved) + st("BX · watch", C.bx_watch) +
+      st("BX · 1H GC (watch)", C.bx_watch_1h);
+    const SB = B.shadow || {}, open = SB.open || [], closed = SB.closed || [];
+    el("bxOpenN").textContent = open.length + " open";
+    el("bxBookBody").innerHTML = open.map(t => `<tr><td>${esc(t.symbol)}</td><td>${esc(t.kind)}${t.counted ? "" : ' <span class="kpi-sub">watch</span>'}</td>
+        <td>open</td><td>${fmtNum(t.entry_px)}</td><td class="kpi-sub">SL ${fmtNum(t.hard_sl)}</td></tr>`).join("") +
+      closed.map(t => `<tr><td>${esc(t.symbol)}</td><td>${esc(t.kind)}</td><td class="kpi-sub">${esc(t.exit_reason || "")}</td>
+        <td class="kpi-sub">${t.entry_time ? ageStr(t.entry_time) : "—"}</td>
+        <td class="num ${signedCls(t.ret_pct)}">${fmtPct(t.ret_pct, 2)}</td></tr>`).join("") ||
+      '<tr><td colspan="5" class="empty">No shadow trades yet</td></tr>';
+    const cls = {stock: "STK", commodity: "CMD", index_etf: "IDX"};
+    el("bxTradfiBody").innerHTML = ((B.tradfi || {}).rows || []).map(r => `<tr><td>${esc(r.symbol)}</td><td>${cls[r.asset_class] || "—"}</td>
+      <td>${esc((r.tf || "").toUpperCase())}</td><td class="${r.trend === "Green" ? "trend-g" : "trend-r"}">${esc(r.trend || "—")}</td>
+      <td>${fmtNum(r.close)}</td><td>${fmtNum(r.upper)}</td><td>${boolCell(r.dual_cross_up)}</td>
+      <td class="num">${usdShort(r.vol24h_usd)}</td><td>${r.session_gap ? '<span class="chip">gap</span>' : ""}</td></tr>`).join("") ||
+      '<tr><td colspan="9" class="empty">No TradFi rows</td></tr>';
+    el("bxReviewBody").innerHTML = (B.review || []).map(x => `<tr><td>${esc(x.bx_symbol)}</td><td class="kpi-sub">${esc(x.reason)}</td>
+      <td>${fmtNum(x.price)}</td><td class="num">${usdShort(x.vol24h_usd)}</td></tr>`).join("") ||
+      '<tr><td colspan="4" class="empty">Nothing to review</td></tr>';
+  }
+  document.addEventListener("click", ev => {
+    const b = ev.target.closest("#bxExSeg button, #bxQSeg button");
+    if (!b) return;
+    const seg = b.parentElement;
+    seg.querySelectorAll("button").forEach(x => x.classList.toggle("active", x === b));
+    if (b.dataset.ex) bxEx = b.dataset.ex; else bxQ = b.dataset.q;
+    renderBxBody();
+  });
+
   async function renderDims() {
     try {
       const r = await fetch("/api/dims-ui?t=" + Date.now(), {cache: "no-store"});
