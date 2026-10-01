@@ -269,6 +269,32 @@ class TestEntriesFailClosed(Tmp):
         t = L.open_live_trades(self.conn)[0]
         self.assertEqual((t["mode"], t["position_id"], t["size_pct_nav"]), ("live", "P1", 1.0))
 
+    def test_refuses_when_exchange_already_has_a_position(self):
+        # a position the ledger does not know (e.g. opened by hand on Bitunix) -> no order
+        self.seed([cand()], [meta()], [{"symbol": "FOOUSDT", "decision": "approve"}])
+        api = FakeAPI(positions=[{"positionId": "PX", "symbol": "FOOUSDT", "side": "LONG", "qty": "10"}])
+        rep = self.entries(api)
+        self.assertEqual(api.orders(), [])
+        self.assertIn("already has a LONG position", rep["skipped"][0]["reason"])
+        # a SHORT on the same contract (hedge mode) also blocks
+        api = FakeAPI(positions=[{"positionId": "PY", "symbol": "FOOUSDT", "side": "SHORT", "qty": "5"}])
+        self.assertEqual(api.orders(), [])
+        self.assertIn("SHORT", self.entries(api)["skipped"][0]["reason"])
+        # a position on ANOTHER contract does not block this one
+        api = FakeAPI(positions=[{"positionId": "PZ", "symbol": "BARUSDT", "side": "LONG", "qty": "5"}])
+        self.assertEqual(self.entries(api)["entered"][0]["status"], "filled")
+
+    def test_refuses_when_position_check_fails(self):
+        self.seed([cand()], [meta()], [{"symbol": "FOOUSDT", "decision": "approve"}])
+        api = FakeAPI()
+
+        def boom(s=None):
+            raise bx_trade.BXTradeError("pending_positions: code 500 down", 500)
+        api.pending_positions = boom
+        rep = self.entries(api)
+        self.assertEqual(api.orders(), [])
+        self.assertIn("position check failed", rep["skipped"][0]["reason"])
+
     def test_one_new_entry_per_day(self):
         self.seed([cand(), cand("BARUSDT")], [meta(), meta("BARUSDT")],
                   [{"symbol": "FOOUSDT", "decision": "approve"}, {"symbol": "BARUSDT", "decision": "approve"}])
