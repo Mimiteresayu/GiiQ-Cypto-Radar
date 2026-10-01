@@ -732,6 +732,19 @@ def _try_enter(api, conn, c, meta_all, acct, nav, now, market, tiers_fn, rep, ki
     except Exception as e:  # noqa: BLE001
         rep["skipped"].append({"symbol": c["symbol"], "reason": f"market data failed: {str(e)[:120]}"})
         return False
+    # Exchange-side guard (Harbor 2026-10-01): refuse if Bitunix already shows ANY position on this contract,
+    # even one our ledger does not know (manual trade, lost ledger row). A failed read refuses too (fail closed).
+    try:
+        held = [p for p in (api.pending_positions(c["symbol"]) or []) if str(p.get("symbol") or c["symbol"]) == c["symbol"]
+                and _f(p.get("qty")) != 0]
+    except Exception as e:  # noqa: BLE001
+        rep["skipped"].append({"symbol": c["symbol"], "reason": f"position check failed: {str(e)[:120]}"})
+        return False
+    if held:
+        sides = sorted({str(p.get("side") or "?").upper() for p in held})
+        rep["skipped"].append({"symbol": c["symbol"],
+                               "reason": f"Bitunix already has a {'/'.join(sides)} position on this contract"})
+        return False
     chk = check_entry(c, meta, live, nav, _f(acct.get("available")), open_live_trades(conn),
                       live_entries_today(conn, now), approval_for(c["symbol"], now), tiers)
     if not chk["ok"]:
