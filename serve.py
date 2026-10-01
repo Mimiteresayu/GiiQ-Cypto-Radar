@@ -22,7 +22,7 @@ import urllib.request as _url_req
 from datetime import datetime, timedelta, timezone
 from http.cookies import SimpleCookie
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import urlencode, parse_qs, urlparse
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 PORT = int(os.environ.get("PORT") or "8787")
@@ -2340,11 +2340,12 @@ class Handler(SimpleHTTPRequestHandler):
                                       ("ts", "n_wallets", "n_manual", "errors", "wallets")} if snap else None,
                                       "coins": snap.get("coins") if snap else None, "watchlist": wl})
             return
-        if path in ("/api/bx/radar", "/api/bx/shadow", "/api/bx/review", "/api/bx/status"):
+        if path in ("/api/bx/radar", "/api/bx/shadow", "/api/bx/review", "/api/bx/status", "/api/bx/day"):
             # keyed, read-only BX shadow data (Claude weekly review of unknown-class contracts, reports)
             if self._ai_key_ok():
                 if BX_SERVICE_URL:
-                    code, d = _bx_service(path + (("?" + parsed.query) if parsed.query and path == "/api/bx/radar" else ""))
+                    qs = {k: v for k, v in parse_qs(parsed.query).items() if k in ("tf", "date")}   # never forward ?key=
+                    code, d = _bx_service(path + (("?" + urlencode(qs, doseq=True)) if qs else ""))
                     self._send_json(code, d)
                     return
                 try:

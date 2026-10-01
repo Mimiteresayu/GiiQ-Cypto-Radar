@@ -16,7 +16,7 @@ Switches: BX_ENABLED=0 stops everything (no scans, no orders; exchange SL orders
           BX_LIVE=0 (default) -> shadow only: no new live orders; exits / SL repair of open live positions continue.
 
 HTTP (PORT): GET /health (open, no secrets)  ·  X-BX-Key = BX_SERVICE_KEY for everything else:
-  GET  /api/bx/status /api/bx/candidates /api/bx-ui /api/bx/radar?tf= /api/bx/review /api/bx/shadow
+  GET  /api/bx/status /api/bx/candidates /api/bx/day?date= /api/bx-ui /api/bx/radar?tf= /api/bx/review /api/bx/shadow
   POST /api/bx/decision   {decisions:[{symbol|coin, decision|action, type, rule, reason}], source:"claude"}
   POST /api/bx/breaker/reset  (header X-BX-Admin-Key = BX_ADMIN_KEY; MMT only)
 """
@@ -100,6 +100,10 @@ def run_job(job: str) -> Dict[str, Any]:
             _write_json("bx_live_problems.json", {"at": res["at"], "job": job, "problems": live["problems"]})
         elif job in ("4h", "1h") and "live" in res["steps"]:
             _write_json("bx_live_problems.json", {"at": res["at"], "job": job, "problems": []})
+        if job == "entries":
+            day = day_report(live, datetime.now(timezone.utc))
+            _write_json(f"bx_day/bx_day_{day['date'].replace('-', '')}.json", day)
+            bx_live._log("[BX_DAY] " + json.dumps(day, default=str, separators=(",", ":")))
         bx_live._log(f"[BX_DATA] {job} {res['status']} " + json.dumps(
             {k: {kk: v.get(kk) for kk in ("status", "n", "n_scanned", "live", "gate", "entered", "closed", "breaker", "note")
                  if v.get(kk) not in (None, [], {})} for k, v in res["steps"].items()}, default=str)[:900])
@@ -124,6 +128,40 @@ def _read_json(name: str) -> dict:
         return json.loads((OUT_DIR / name).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
+
+
+def day_report(entries_rep: Dict[str, Any], now: datetime) -> Dict[str, Any]:
+    """One line per trading day after the 08:56 run (log [BX_DAY] + out/bx_day/): egress check, today's candidates,
+    ENTRY_DESK BX decisions, orders with Hard SL confirmation, breaker. No secrets. Read by the first-live-day
+    report and by anyone checking the pilot from the Railway logs."""
+    day = bx_live.hkt_date(now)
+    eg = bx_egress.check()
+    cand = _read_json("bx_candidates_latest.json")
+    decs = (_read_json(f"bx_decisions/bx_decisions_{day.replace('-', '')}.json").get("decisions") or {})
+    orders = []
+    for e in entries_rep.get("entered") or []:
+        plan = e.get("plan") or {}
+        orders.append({"symbol": e.get("symbol"), "status": e.get("status"), "order_id": e.get("order_id"),
+                       "position_id": e.get("position_id"), "qty": e.get("filled_qty") or plan.get("qty"),
+                       "entry_px": e.get("entry_px"), "hard_sl": plan.get("sl_price"),
+                       "sl_order_id": e.get("sl_order_id"),
+                       "sl_confirmed": bool(e.get("status") == "filled" and e.get("sl_order_id")),
+                       "margin_usd": plan.get("margin_usd"), "liq_est": plan.get("liq_est"),
+                       "problems": e.get("problems")})
+    br = bx_live.breaker_state()
+    st = bx_live.status()
+    return {"date": day, "at": now.isoformat(), "live": bool(entries_rep.get("live")),
+            "gate": entries_rep.get("gate") or [],
+            "egress": {k: eg.get(k) for k in ("ok", "ip", "countries", "region", "reason")},
+            "candidates": [{"symbol": c.get("symbol"), "type": c.get("type"), "gc_tf": c.get("gc_tf")}
+                           for c in (cand.get("candidates") or [])] if cand.get("date") == day else [],
+            "decisions": [{"symbol": k, "decision": v.get("decision"), "rule": v.get("rule"), "late": v.get("late"),
+                           "reason": str(v.get("reason") or "")[:200]} for k, v in decs.items()],
+            "orders": orders, "pending_created": entries_rep.get("pending") or [],
+            "skipped": entries_rep.get("skipped") or [],
+            "breaker": {"tripped": bool(br.get("tripped")), "at": br.get("at"),
+                        "realized_pnl_usd": st.get("realized_pnl_usd"), "baseline_nav": st.get("baseline_nav")},
+            "open_live": st.get("open") or []}
 
 
 def account_check() -> Dict[str, Any]:
@@ -197,6 +235,10 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if u.path == "/api/bx/status":
                 self._send(200, status_payload())
+            elif u.path == "/api/bx/day":
+                d = (parse_qs(u.query).get("date") or [bx_live.hkt_date(datetime.now(timezone.utc))])[0]
+                r = _read_json(f"bx_day/bx_day_{d.replace('-', '')}.json")
+                self._send(200 if r else 404, r or {"ok": False, "error": f"no BX day report for {d}"})
             elif u.path == "/api/bx/candidates":
                 d = _read_json("bx_candidates_latest.json")
                 self._send(200 if d else 404, d or {"ok": False, "error": "no BX candidates yet (08:02 HKT)"})
