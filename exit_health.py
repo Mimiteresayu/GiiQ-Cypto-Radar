@@ -67,7 +67,7 @@ def _positions(perp: Any) -> List[dict]:
 
 def check(*, perp: Any, open_orders: Any, nav: Optional[float], radar_1h: dict, radar_4h: dict,
           tier_for, job_status: Dict[str, dict], pending: List[dict], now: Optional[datetime] = None,
-          pending_skips: Optional[List[dict]] = None) -> Dict[str, Any]:
+          pending_skips: Optional[List[dict]] = None, bx_status: Optional[dict] = None) -> Dict[str, Any]:
     now = now or datetime.now(timezone.utc)
     now_ms = int(now.timestamp() * 1000)
     problems: List[dict] = []
@@ -165,6 +165,25 @@ def check(*, perp: Any, open_orders: Any, nav: Optional[float], radar_1h: dict, 
         info.append({"code": "PENDING_SKIPPED", "coin": None,
                      "msg": f"pending check skipped at {_ts(x['ts']).astimezone(HKT).strftime('%m-%d %H:%M')} HKT "
                             f"(exits failed; fills delayed to the next 4h run): {str(x.get('why') or '')[:160]}"})
+    # Bitunix live pilot (bx-exec service). A tripped breaker or a live BX position without its SL is a problem
+    # (EXIT_DESK emails MMT); an unreachable service is info (the exchange Hard SL stays in place).
+    if bx_status is not None:
+        if bx_status.get("ok") is not True:
+            info.append({"code": "BX_SERVICE", "coin": None, "msg": str(bx_status.get("error") or "bx-exec not ok")[:160]})
+        else:
+            br = bx_status.get("breaker") or {}
+            if br.get("tripped"):
+                add("BX_BREAKER", None, f"Bitunix circuit breaker tripped at {br.get('at')}: live P&L {br.get('pnl_usd')} USD "
+                    f"({br.get('pct_nav')}% NAV); new BX entries stopped, BX_LIVE {br.get('railway_var')}")
+            for p in bx_status.get("problems") or []:
+                add(str(p.get("code") or "BX_PROBLEM"), p.get("coin"), str(p.get("msg") or "")[:160])
+            eg = bx_status.get("egress") or {}
+            if bx_status.get("bx_live") and not eg.get("ok"):
+                add("BX_EGRESS", None, f"BX_LIVE=1 but egress not verified non-US: {eg.get('reason')}")
+            if bx_status.get("open"):
+                info.append({"code": "BX_OPEN", "coin": None,
+                             "msg": f"{len(bx_status['open'])} live BX position(s): "
+                                    + ", ".join(str(o.get('bx_symbol')) for o in bx_status['open'])})
     res = _result(problems, len(pos), now, info)
     if skips:
         res["summary"] += f" · pending skipped {len(skips)}x (exits failed)"

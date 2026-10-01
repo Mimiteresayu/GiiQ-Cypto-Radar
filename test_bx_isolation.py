@@ -21,7 +21,8 @@ ROOT = Path(__file__).resolve().parent
 ORDER_PATH = ["executor.py", "pending_worker.py", "exit_worker.py", "failsafe_exit_worker.py",
               "entry_candidates.py", "hl_exec.py", "exec_common.py", "pending_entries.py", "decisions.py",
               "exec_preflight.py", "align_hard_sl.py"]
-BX_MODULES = ["bx_client.py", "bx_universe.py", "bx_radar.py", "bx_shadow.py", "cg_client.py"]
+BX_MODULES = ["bx_client.py", "bx_universe.py", "bx_radar.py", "bx_shadow.py", "cg_client.py", "bx_view.py",
+              "bx_egress.py"]          # read-only modules: no order code (orders live only in bx_trade.py)
 
 
 def _imports(path: Path):
@@ -53,7 +54,8 @@ class TestOrderPathNeverReadsBX(unittest.TestCase):
             if not p.exists():
                 continue
             src = p.read_text(encoding="utf-8").lower()
-            for token in ("bx_radar", "bx_meta", "bx_candles", "bx_shadow", "bx_tradfi", "bitunix", "coingecko"):
+            for token in ("bx_radar", "bx_meta", "bx_candles", "bx_shadow", "bx_tradfi", "bitunix", "coingecko",
+                          "bx_live", "bx_trade", "bx_decisions", "bx_candidates", "bx_breaker"):
                 self.assertNotIn(token, src, f"{f} mentions {token}")
 
     def test_candidates_identical_with_bx_files_present(self):
@@ -96,6 +98,27 @@ class TestOrderPathNeverReadsBX(unittest.TestCase):
             self.assertNotIn(token, src)
         src_c = inspect.getsource(serve._generate_entry_candidates).lower() if hasattr(serve, "_generate_entry_candidates") else ""
         self.assertNotIn("bx_", src_c)
+
+
+class TestLivePilotBoundary(unittest.TestCase):
+    """Live Bitunix orders exist only in the Singapore bx-exec service (bx_service -> bx_live -> bx_trade)."""
+
+    def test_cockpit_never_imports_trade_code(self):
+        names = _imports(ROOT / "serve.py")
+        self.assertFalse(names & {"bx_trade", "bx_live", "bx_service", "bx_egress"}, names)
+
+    def test_only_bx_live_imports_bx_trade(self):
+        users = {p.name for p in ROOT.glob("*.py")
+                 if not p.name.startswith("test_") and "bx_trade" in _imports(p) and p.name != "bx_trade.py"}
+        self.assertEqual(users - {"bx_live.py", "bx_service.py"}, set(), users)
+
+    def test_service_never_touches_hl_private_key(self):
+        src = (ROOT / "bx_service.py").read_text(encoding="utf-8")
+        self.assertIn('env.pop("HL_API_PRIVATE_KEY", None)', src)
+        for f in ("bx_live.py", "bx_trade.py", "bx_service.py"):
+            names = _imports(ROOT / f)
+            self.assertFalse(names & {"hl_exec", "hyperliquid", "eth_account", "executor", "pending_worker"},
+                             f"{f}: {names}")
 
 
 class TestBXWorkerSandbox(unittest.TestCase):

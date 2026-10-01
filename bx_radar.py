@@ -217,6 +217,8 @@ def build_catalog(pairs: List[dict], tickers: List[dict], hl_mids: Dict[str, flo
             "match_rule": m["match_rule"], "px_scale": m["px_scale"], "px_diff": m["px_diff"],
             "asset_class": cls, "symbol_status": p.get("symbolStatus"), "launch_time": launch,
             "delist_time": delist, "max_leverage": p.get("maxLeverage"),
+            "base_precision": p.get("basePrecision"), "quote_precision": p.get("quotePrecision"),
+            "min_qty": p.get("minTradeVolume"), "api_supported": p.get("isApiSupported"),
             "price": price, "vol24h_usd": round(vol, 2) if vol else None,
             "cg_id": (cg or {}).get("id"), "mcap_usd": U._f((cg or {}).get("market_cap")),
             # CoinGecko market cap is per coin; a 1000x contract's ATH is per 1000 coins

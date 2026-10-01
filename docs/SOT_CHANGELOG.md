@@ -12,6 +12,19 @@ header, the executor / pending run reports, the preflight JSON and `[DESK_DATA]`
 
 ---
 
+## Bitunix live pilot (2026-09-30, MMT-approved; HL SoT id unchanged: no HL executor rule changed)
+Separate rule set for Bitunix only — see `docs/BX_LIVE_PILOT.md`. Runs in the Singapore `bx-exec` service.
+- Fail closed: non-US egress (two geo sources, Railway region, static IP), key present + signed read OK,
+  BX_ENABLED=1 and BX_LIVE=1 (default 0), breaker not tripped, ENTRY_DESK approval (no fallback).
+- 1% NAV isolated margin, 3x; ≤ 0.5% of 24h vol; max 2 open, max 1 new entry per day; entry tier only
+  (≥ $2M, < 10 bp, 1D/4H GC, crypto only). Hard SL attached on the exchange; liq must sit below it.
+- Exits: 4H close < 4H Filter, 7-day time cap (5 for new tokens), liquidity exit, exchange Hard SL.
+- Circuit breaker at −3% NAV cumulative live P&L → no new entries, BX_BREAKER on the exit health, BX_LIVE=0.
+- Cockpit: `/api/ai/candidates` gets a separate `bx` section; `/api/ai/decision` forwards `bx_decisions` to
+  bx-exec (never into the HL decisions store); cockpit BX jobs stop when `BX_SERVICE_URL` is set.
+
+---
+
 ## Bitunix shadow radar + reporting (2026-09-29, SoT id unchanged: no executor rule changed)
 Approved by Harbor 2026-09-29 (design doc: Bitunix Universe Expansion). Display and shadow only.
 - New jobs (own lock, subprocess without `HL_API_PRIVATE_KEY`): BX daily 08:20 HKT, 4H at :25, 1H at :27.
