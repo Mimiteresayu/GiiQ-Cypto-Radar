@@ -34,7 +34,7 @@ def _radar(n, requested=None):
 
 class TestSotId(unittest.TestCase):
     def test_sot_id(self):
-        self.assertEqual(ec.SOT_ID, "GIIQ-SoT-3")
+        self.assertEqual(ec.SOT_ID, "GIIQ-SoT-4")
         doc = (ROOT / "docs" / "SOT_CHANGELOG.md").read_text(encoding="utf-8")
         self.assertIn("GIIQ-SoT-1", doc)
         self.assertIn("GIIQ-SoT-2", doc)
@@ -194,13 +194,13 @@ class TestSot2Sizing(unittest.TestCase):
         self.assertFalse(ec.addon_gates(pos, 1000, None)[0])
 
     def test_sot3_portfolio_caps(self):
-        self.assertTrue(ec.total_margin_nav_ok(250, 50, 1000)[0])
-        self.assertFalse(ec.total_margin_nav_ok(260, 50, 1000)[0])
+        self.assertTrue(ec.total_margin_nav_ok(650, 50, 1000)[0])   # 70% NAV (GIIQ-SoT-4, was 30%)
+        self.assertFalse(ec.total_margin_nav_ok(660, 50, 1000)[0])
         self.assertTrue(ec.coin_notional_ok(100, 100, 1000)[0])
         self.assertFalse(ec.coin_notional_ok(150, 60, 1000)[0])
         self.assertTrue(ec.daily_entry_cap_ok(1, 1)[0])
         self.assertFalse(ec.daily_entry_cap_ok(2, 1)[0])
-        self.assertEqual(ec.SOT_ID, "GIIQ-SoT-3")
+        self.assertEqual(ec.SOT_ID, "GIIQ-SoT-4")
 
 
 class TestExecutorGuardrails(EnvMixin, unittest.TestCase):
@@ -238,7 +238,7 @@ class TestExecutorGuardrails(EnvMixin, unittest.TestCase):
 
     def test_nav_snapshot_and_downsized_report(self):
         hl = FakeHL(equity=1000, meta=self.META, mids={"AAA": 1.0})
-        res = self._run(hl, _cands(_cand("AAA", filt=0.97, lower=0.95, upper_1d=0.99)))  # DRY_RUN
+        res = self._run(hl, _cands(_cand("AAA", tier="small", filt=0.97, lower=0.95, upper_1d=0.99)))  # DRY_RUN
         self.assertEqual(res["nav_snapshot"]["nav"], 1000.0)
         rep = res["run_report"]
         self.assertEqual(rep["executed"][0]["symbol"], "AAA")

@@ -199,14 +199,14 @@ class TestWorker(unittest.TestCase):
 
     def test_continuation_fill_live_with_sl_and_size_band(self):
         hl = FakeHL(mids={"AAA": 0.9})
-        ents = self.entry(size=6)  # approved 6% -> clamped to Continuation band 4%
+        ents = self.entry(size=6, tier="small")  # approved 6% -> clamped to Continuation band 4%
         res = self.run_w(hl, ents, bar(0.88, 0.93))
         self.assertEqual(res["status"], "success", res)
         self.assertEqual([c[0] for c in hl.calls], ["set_leverage", "open_long_ioc", "place_stop_loss"])
         f = res["filled"][0]
         self.assertEqual(f["size_pct"], 4.0)                  # SoT-2 hard cap 4%
         self.assertEqual(f["leverage"], 3)                    # AI 2x lifted to the SoT-2 3x floor
-        self.assertEqual(f["hard_sl"], 0.88)                  # tiny -> 4H Filter
+        self.assertEqual(f["hard_sl"], 0.88)                  # small -> 4H Filter
         self.assertLessEqual(f["risk_margin_pct"], 4.0)
         self.assertEqual(ents[0]["status"], "filled")
         self.assertEqual(self.log[0]["entry_type"], "CONTINUATION")

@@ -316,7 +316,7 @@ class TestExecutorDryRun(EnvMixin, unittest.TestCase):
 
     def test_qty_notional_liq_and_no_orders(self):
         hl = FakeHL(equity=1000, meta=self.META, mids={"AAA": 1.0})
-        res = self.run_exec(hl, _cands(_cand("AAA", filt=0.97, lower=0.95)),
+        res = self.run_exec(hl, _cands(_cand("AAA", tier="small", filt=0.97, lower=0.95)),
                             {"AAA": {"decision": "approve", "size_pct": 6, "leverage": 5}})
         self.assertEqual(res["mode"], "DRY_RUN")
         self.assertEqual(res["status"], "success")
@@ -336,13 +336,13 @@ class TestExecutorDryRun(EnvMixin, unittest.TestCase):
         self.assertEqual(self.log_entry.call_args.kwargs["entry_size"], 119.0)
 
     def test_cumulative_margin_cap(self):
-        # GIIQ-SoT-3: total margin <= 30% NAV (cumulative across the run)
-        hl = FakeHL(equity=1000, margin_used=240, meta=self.META, mids={"AAA": 1.0, "BBB": 1.0})
-        res = self.run_exec(hl, _cands(_cand("AAA", filt=0.97, lower=0.95), _cand("BBB", filt=0.97, lower=0.95)),
+        # GIIQ-SoT-4: total margin <= 70% NAV (cumulative across the run; was 30%)
+        hl = FakeHL(equity=1000, margin_used=640, meta=self.META, mids={"AAA": 1.0, "BBB": 1.0})
+        res = self.run_exec(hl, _cands(_cand("AAA", tier="small", filt=0.97, lower=0.95), _cand("BBB", tier="small", filt=0.97, lower=0.95)),
                             {"AAA": {"decision": "approve", "size_pct": 6, "leverage": 2},
                              "BBB": {"decision": "approve", "size_pct": 6, "leverage": 2}})
-        self.assertEqual([a["symbol"] for a in res["actions"]], ["AAA"])  # 24%+~4% ok
-        self.assertEqual(res["skipped"][0]["symbol"], "BBB")               # ~28%+~4% > 30%
+        self.assertEqual([a["symbol"] for a in res["actions"]], ["AAA"])  # 64%+~4% ok
+        self.assertEqual(res["skipped"][0]["symbol"], "BBB")               # ~68%+~4% > 70% (still < 80% utilisation)
         self.assertIn("cumulative", res["skipped"][0]["reason"])
 
     def test_stale_candidates_fail_closed(self):
@@ -390,7 +390,7 @@ class TestExecutorLive(EnvMixin, unittest.TestCase):
 
     def test_live_entry_then_sl(self):
         hl = FakeHL(equity=1000, meta=self.META, mids={"AAA": 1.0})
-        res = executor.execute_approved_candidates(hl=hl, candidates_data=_cands(_cand("AAA", filt=0.97, lower=0.95)),
+        res = executor.execute_approved_candidates(hl=hl, candidates_data=_cands(_cand("AAA", tier="small", filt=0.97, lower=0.95)),
                                                    decisions={"AAA": {"decision": "approve", "size_pct": 6, "leverage": 2}},
                                                    radar_1h={}, radar_4h={"rows": []}, now=NOW)
         self.assertEqual(res["mode"], "LIVE")
@@ -768,7 +768,7 @@ class TestDeskDataLog(unittest.TestCase):
         self.assertGreater(c["liq"], 0)
         self.assertEqual(c["lev"], 3)  # GIIQ-SoT-2: 3-5x capped by coin maxLeverage 3
         self.assertTrue(c["sot2"]["ok"])
-        self.assertEqual(c["size_pct"], 4.0)  # risk = isolated margin, 4% NAV cap
+        self.assertEqual(c["size_pct"], 2.0)  # risk = isolated margin; Tiny tier 2% NAV cap (AIQ-0022)
 
     def test_single_line_when_small(self):
         lines = self.serve._desk_data_lines({"ts": "t", "candidates": []}, max_bytes=60000)

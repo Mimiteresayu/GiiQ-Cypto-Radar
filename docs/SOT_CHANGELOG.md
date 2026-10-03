@@ -12,6 +12,23 @@ header, the executor / pending run reports, the preflight JSON and `[DESK_DATA]`
 
 ---
 
+## GIIQ-SoT-4 (2026-10-03, MMT decision 2026-10-03 13:35–13:45 HKT via Harbor; AIQ-0022)
+HL executor + pending worker (shared `exec_common`). Bitunix (`bx_live.py`) is not touched: it has its
+own sizing (1% NAV / 3x pilot) and its caps are AIQ-0003.
+- **Total isolated margin ≤ 70% of NAV** (was 30%), cumulative across the run (existing + new).
+  `MAX_TOTAL_MARGIN_NAV_PCT = 70.0`. The **80% margin-utilization cap stays as the outermost hard
+  cap** (`MAX_MARGIN_UTILIZATION_PCT = 80.0`, unchanged). Coin notional ≤ 20% NAV unchanged.
+- **Tiny tier: max 3x leverage and max 2% NAV margin per trade** (`TINY_MAX_LEV = 3`,
+  `TINY_MAX_MARGIN_PCT = 2.0`). With the SoT-2 floors (3x / 2%) a Tiny trade is 3x / 2%. Tiny =
+  mcap < $200M or unknown, so any tier other than mega/large/small is treated as Tiny. A Tiny ADD_ON
+  whose existing leverage is above 3x is refused. Mega/Large/Small unchanged (3–5x, 2–4%).
+- Code: `exec_common.size_by_margin(..., tier=)`, called with the candidate / pending tier by
+  `executor.py`, `pending_worker.py` and the `serve.py` suggestion. `tier=None` keeps the old behaviour.
+- Not changed: Hard SL / exits, HL −3% breaker (not added), SL re-align both ways, BTC gate (none).
+- Tests: `test_aiq0022_margin70_tiny.py`.
+
+---
+
 ## Bitunix live pilot (2026-09-30, MMT-approved; HL SoT id unchanged: no HL executor rule changed)
 Separate rule set for Bitunix only — see `docs/BX_LIVE_PILOT.md`. Runs in the Singapore `bx-exec` service.
 - Fail closed: non-US egress (two geo sources, Railway region, static IP), key present + signed read OK,
