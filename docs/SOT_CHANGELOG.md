@@ -12,28 +12,20 @@ header, the executor / pending run reports, the preflight JSON and `[DESK_DATA]`
 
 ---
 
-## GIIQ-SoT-4 (2026-10-03): total isolated margin cap 70% NAV + Tiny tier constraints (approved by MMT)
-
-MMT decision 2026-10-03 13:35–13:45 HKT (via Harbor).
-
-### 1. Total isolated margin cap raised from 30% to 70% NAV
-- **Total isolated margin cap: 30% → 70% NAV** (`MAX_TOTAL_MARGIN_NAV_PCT`).
-- The outer 80% utilization cap (`MAX_MARGIN_UTILIZATION_PCT`) remains unchanged.
-- The 20% per-coin notional cap (`MAX_COIN_NOTIONAL_NAV_PCT`) remains unchanged.
-
-### 2. Tiny tier leverage and margin constraints
-- **Tiny tier (or unknown/missing tier) is clamped to max 3x leverage and 2% NAV margin.**
-  - `size_by_margin` now accepts a `tier` input parameter.
-  - Unknown or missing tier is treated as Tiny (fail-safe).
-  - Leverage capped at 3x for Tiny tier (never above 3x, even if AI or coin maxLeverage allows higher).
-  - Margin capped at 2% NAV for Tiny tier.
-- **Tiny ADD_ON refused if existing position leverage > 3x.**
-  - ADD_ON fills for Tiny tier coins are skipped when the base position's leverage exceeds 3x.
-- **All callers updated**: `executor.py`, `pending_worker.py`, and `serve.py` now pass tier to `size_by_margin`.
-- Mega/Large/Small tier rules unchanged: max 5x leverage, 2-4% NAV margin per GIIQ-SoT-2.
-
-### 3. BX code untouched
-No changes to Bitunix (BX) trade execution code.
+## GIIQ-SoT-4 (2026-10-03, MMT decision 2026-10-03 13:35–13:45 HKT via Harbor; AIQ-0022)
+HL executor + pending worker (shared `exec_common`). Bitunix (`bx_live.py`) is not touched: it has its
+own sizing (1% NAV / 3x pilot) and its caps are AIQ-0003.
+- **Total isolated margin ≤ 70% of NAV** (was 30%), cumulative across the run (existing + new).
+  `MAX_TOTAL_MARGIN_NAV_PCT = 70.0`. The **80% margin-utilization cap stays as the outermost hard
+  cap** (`MAX_MARGIN_UTILIZATION_PCT = 80.0`, unchanged). Coin notional ≤ 20% NAV unchanged.
+- **Tiny tier: max 3x leverage and max 2% NAV margin per trade** (`TINY_MAX_LEV = 3`,
+  `TINY_MAX_MARGIN_PCT = 2.0`). With the SoT-2 floors (3x / 2%) a Tiny trade is 3x / 2%. Tiny =
+  mcap < $200M or unknown, so any tier other than mega/large/small is treated as Tiny. A Tiny ADD_ON
+  whose existing leverage is above 3x is refused. Mega/Large/Small unchanged (3–5x, 2–4%).
+- Code: `exec_common.size_by_margin(..., tier=)`, called with the candidate / pending tier by
+  `executor.py`, `pending_worker.py` and the `serve.py` suggestion. `tier=None` keeps the old behaviour.
+- Not changed: Hard SL / exits, HL −3% breaker (not added), SL re-align both ways, BTC gate (none).
+- Tests: `test_aiq0022_margin70_tiny.py`.
 
 ---
 

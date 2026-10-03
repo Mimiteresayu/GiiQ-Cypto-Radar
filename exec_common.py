@@ -8,6 +8,8 @@ SoT (do not change without MMT):
 - Small/Tiny: primary exit = 1H close < 1H Lower; Hard SL = 4H Filter (mid)
 - Leverage (GIIQ-SoT-2): 3-5x isolated chosen by size_by_margin (never above the coin HL maxLeverage), min notional $10,
   total margin <= 80% equity, liquidation must lie beyond the Hard SL.
+- GIIQ-SoT-4 (MMT 2026-10-03): total isolated margin <= 70% NAV (80% stays the outer hard cap);
+  Tiny tier (incl. unknown mcap) max 3x leverage and max 2% NAV margin per trade.
 
 Sizing convention: ``size_pct`` = MARGIN as % of equity; notional = margin x leverage.
 """
@@ -57,7 +59,9 @@ SOT2_MIN_MARGIN_PCT = 2.0
 SOT2_MAX_MARGIN_PCT = 4.0
 # ---------------------------------------------------------------- GIIQ-SoT-3 (MMT 2026-09-28)
 # Portfolio caps on top of the per-trade 2-4% margin risk (alts move with BTC, so cap the total):
-MAX_TOTAL_MARGIN_NAV_PCT = 70.0   # all isolated margin (existing + new, cumulative) <= 70% NAV (raised GIIQ-SoT-4)
+# MMT 2026-10-03 13:35-13:45 HKT (AIQ-0022): total cap raised 30% -> 70% NAV. The 80% margin
+# utilization cap (MAX_MARGIN_UTILIZATION_PCT) stays as the outermost hard cap; 20% coin cap unchanged.
+MAX_TOTAL_MARGIN_NAV_PCT = 70.0   # all isolated margin (existing + new, cumulative) <= 70% NAV
 MAX_COIN_NOTIONAL_NAV_PCT = 20.0  # one coin's notional (existing + add) <= 20% NAV (also after ADD_ON)
 MAX_NEW_ENTRIES_PER_DAY = 3       # new fills per HKT day: Base + CONTINUATION + ADD_ON together
 # ADD_ON: the base position must be a real winner in PRICE terms (Signum 1x meaning), not leveraged ROE:
@@ -65,10 +69,17 @@ MAX_NEW_ENTRIES_PER_DAY = 3       # new fills per HKT day: Base + CONTINUATION +
 ADDON_MIN_PRICE_GAIN_PCT = 10.0
 # Fallback decisions (Harbor 08:40, only when Claude's POST never arrived): Base only, 2% margin.
 FALLBACK_MARGIN_PCT = 2.0
-# ---------------------------------------------------------------- GIIQ-SoT-4 (MMT 2026-10-03)
-# Tiny tier constraints (max 3x leverage, max 2% NAV margin)
-TINY_MAX_LEVERAGE = 3
-TINY_MAX_MARGIN_NAV_PCT = 2.0
+# Tiny tier limits (MMT 2026-10-03 13:35-13:45 HKT, AIQ-0022): leverage <= 3x, margin <= 2% NAV per
+# trade. Tiny = mcap < $200M or unknown (mcap_tiers.tier_for), so any tier other than
+# mega/large/small (incl. "unknown" / empty) is treated as Tiny (fail-safe).
+TINY_MAX_LEV = 3
+TINY_MAX_MARGIN_PCT = 2.0
+NON_TINY_TIERS = ("mega", "large", "small")
+
+
+def is_tiny_tier(tier: Optional[str]) -> bool:
+    """True for Tiny and for any unknown / empty tier (unknown mcap = Tiny)."""
+    return (tier or "").strip().lower() not in NON_TINY_TIERS
 
 
 def is_live_mode() -> bool:
@@ -394,7 +405,7 @@ def size_by_margin(nav: float, entry_px: float, hard_sl: float, coin_max_leverag
                    ai_size_pct: Any = None, ai_leverage: Any = None, fixed_leverage: Optional[int] = None,
                    max_margin_pct: Optional[float] = None, liq_ref_px: Optional[float] = None,
                    tier: Optional[str] = None) -> Dict[str, Any]:
-    """GIIQ-SoT-2/4: choose (leverage, margin %) for a LONG entry. Risk = the isolated margin.
+    """GIIQ-SoT-2: choose (leverage, margin %) for a LONG entry. Risk = the isolated margin.
 
     - margin = AI size clamped to 2-4% NAV (AI value = maximum; missing -> the 4% cap; an AI value
       below 2% is lifted to the 2% floor). `max_margin_pct` can lower the cap (ADD_ON 5.5% room);
@@ -402,24 +413,14 @@ def size_by_margin(nav: float, entry_px: float, hard_sl: float, coin_max_leverag
     - leverage: from min(5x, AI leverage [floored at 3x], coin maxLeverage) down to 3x, the first
       whose isolated liq (from the worst-case entry / liq_ref_px) is strictly below the Hard SL.
       fixed_leverage (ADD_ON = existing position leverage) is not stepped. Impossible -> skip.
-    - tier (GIIQ-SoT-4): Tiny tier (or unknown/missing tier) clamped to max 3x leverage and 2% NAV margin.
-      ADD_ON refused if existing position leverage > 3x.
+    - tier (MMT 2026-10-03, AIQ-0022): when given and Tiny (or unknown), leverage is capped at
+      TINY_MAX_LEV (3x) and margin at TINY_MAX_MARGIN_PCT (2% NAV); a Tiny ADD_ON whose existing
+      leverage is above 3x is refused. tier=None keeps the old (tier-blind) behaviour.
     Returns {"ok", "leverage", "margin_pct", "notional_usd", "liq", "reason", "notes"}."""
     notes: list = []
-    # GIIQ-SoT-4: treat unknown/missing tier as Tiny
-    tier_normalized = (tier or "").strip().lower()
-    is_tiny = tier_normalized in ("tiny", "") or not tier_normalized
     if not nav or nav <= 0 or not entry_px or entry_px <= 0 or not hard_sl or hard_sl <= 0 or hard_sl >= entry_px:
         return {"ok": False, "reason": "sizing inputs invalid (NAV / entry / Hard SL)", "notes": notes}
-    # GIIQ-SoT-4: Tiny tier ADD_ON refused if existing position leverage > 3x
-    if is_tiny and fixed_leverage and int(fixed_leverage) > TINY_MAX_LEVERAGE:
-        return {"ok": False, "reason": f"Tiny tier ADD_ON refused: existing position leverage {fixed_leverage}x > {TINY_MAX_LEVERAGE}x", "notes": notes}
     m = SOT2_MAX_MARGIN_PCT
-    # GIIQ-SoT-4: Tiny tier max margin 2% NAV
-    if is_tiny:
-        m = min(m, TINY_MAX_MARGIN_NAV_PCT)
-        if m < TINY_MAX_MARGIN_NAV_PCT + 1e-9:
-            notes.append(f"Tiny tier: margin capped at {TINY_MAX_MARGIN_NAV_PCT:g}% NAV")
     a_sz = _f(ai_size_pct)
     if a_sz is not None and a_sz > 0:
         if a_sz < SOT2_MIN_MARGIN_PCT:
@@ -427,25 +428,29 @@ def size_by_margin(nav: float, entry_px: float, hard_sl: float, coin_max_leverag
         m = min(m, max(SOT2_MIN_MARGIN_PCT, a_sz))
     if max_margin_pct is not None:
         m = min(m, max_margin_pct)
+    tiny = tier is not None and is_tiny_tier(tier)
+    if tiny and m > TINY_MAX_MARGIN_PCT:
+        notes.append(f"Tiny tier: margin {m:g}% -> {TINY_MAX_MARGIN_PCT:g}% NAV cap")
+        m = TINY_MAX_MARGIN_PCT
     if m < SOT2_MIN_MARGIN_PCT - 1e-9:
         return {"ok": False, "reason": f"margin room {m:.2f}% < {SOT2_MIN_MARGIN_PCT:g}% minimum", "notes": notes}
     coin_cap = int(math.floor(float(coin_max_leverage))) if coin_max_leverage and coin_max_leverage > 0 else SOT2_MAX_LEV
-    # GIIQ-SoT-4: Tiny tier max leverage 3x
-    if is_tiny:
-        coin_cap = min(coin_cap, TINY_MAX_LEVERAGE)
     if fixed_leverage:
+        if tiny and int(fixed_leverage) > TINY_MAX_LEV:
+            return {"ok": False, "reason": (f"Tiny tier: existing leverage {int(fixed_leverage)}x > "
+                                            f"{TINY_MAX_LEV}x cap"), "notes": notes}
         levs = [int(fixed_leverage)]
     else:
         a_lev = _f(ai_leverage)
         l_max = SOT2_MAX_LEV
-        # GIIQ-SoT-4: Tiny tier max leverage 3x
-        if is_tiny:
-            l_max = min(l_max, TINY_MAX_LEVERAGE)
         if a_lev is not None and a_lev > 0:
             if a_lev < SOT2_MIN_LEV:
                 notes.append(f"AI leverage {a_lev:g}x < {SOT2_MIN_LEV}x floor -> {SOT2_MIN_LEV}x")
             l_max = min(l_max, max(SOT2_MIN_LEV, int(math.floor(a_lev + 1e-9))))
         l_max = min(l_max, coin_cap)
+        if tiny and l_max > TINY_MAX_LEV:
+            notes.append(f"Tiny tier: leverage {l_max}x -> {TINY_MAX_LEV}x cap")
+            l_max = TINY_MAX_LEV
         if l_max < SOT2_MIN_LEV:
             return {"ok": False, "reason": f"coin maxLeverage {coin_max_leverage} < {SOT2_MIN_LEV}x minimum", "notes": notes}
         levs = list(range(l_max, SOT2_MIN_LEV - 1, -1))
@@ -491,7 +496,7 @@ def addon_gates(pos: Optional[dict], nav: float, mid: Optional[float] = None,
 
 
 def total_margin_nav_ok(margin_used: float, new_margin: float, nav: float) -> Tuple[bool, float]:
-    """GIIQ-SoT-3: total isolated margin (existing + new) <= 30% NAV. Returns (ok, pct)."""
+    """GIIQ-SoT-4: total isolated margin (existing + new) <= 70% NAV (was 30%). Returns (ok, pct)."""
     if not nav or nav <= 0:
         return False, 100.0
     pct = (margin_used + new_margin) / nav * 100.0

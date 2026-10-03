@@ -9,7 +9,7 @@ For each ACTIVE pending entry (created by the executor from AI-approved Chase de
 On trigger the SAME fail-closed SoT checks as the executor run again at fill time:
   radar freshness, all open positions liq beyond tier Hard SL, Hard SL per tier (4H radar),
   SL distance >= 1.5% from live mid, GIIQ-SoT-2 margin 2-4% NAV + 3-5x (liq below Hard SL), min notional,
-  total margin <= 30% NAV (and <= 80% utilisation), isolated liq beyond Hard SL. LIVE entry = hl_exec.enter_long_with_sl
+  total margin <= 70% NAV (and <= 80% utilisation), isolated liq beyond Hard SL. LIVE entry = hl_exec.enter_long_with_sl
   (IOC + reduce-only Hard SL, fill closed if the SL fails).
 Guardrails (GIIQ-SoT-1): radar row-count check on 1D + 4H (fail-closed, no state change),
 NAV snapshot once per run, price sanity (HL mid vs radar price <= 50%), minimum order
@@ -18,10 +18,10 @@ after the exit worker finished OK (exits -> re-fetch positions here -> entries);
 --after-exits <ts>.
 Sizing (GIIQ-SoT-2): exec_common.size_by_margin (risk = isolated margin 2-4% NAV, 3-5x isolated,
 liq strictly below the Hard SL - step leverage down toward 3x, skip if impossible; total margin
-<= 30% NAV (GIIQ-SoT-3) and <= 80% utilisation).
+<= 70% NAV (GIIQ-SoT-4; was 30%) and <= 80% utilisation).
 ADD_ON keeps the existing position's leverage and additionally needs
 base position PRICE gain >= +10% and coin notional after the add <= 20% NAV (GIIQ-SoT-3,
-exec_common.addon_gates); total margin <= 30% NAV; max 3 new fills per HKT day; otherwise it stays pending with
+exec_common.addon_gates); total margin <= 70% NAV; max 3 new fills per HKT day; otherwise it stays pending with
 the reason in the run report.
 DRY_RUN unless EXEC_DRY_RUN=0 AND HL_API_PRIVATE_KEY (exec_common.is_live_mode). In DRY_RUN the
 store is not modified. Prints one JSON object; exit 0 ok, 1 error.

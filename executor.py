@@ -13,7 +13,7 @@ SoT enforcement (see exec_common.py):
   zone [1D Lower, 1D Filter]); pending_worker.py checks them every 4h at :10 HKT, right after the 4H exits,
   with the same SoT checks (skipped for that run if the exit step failed).
   Pending records are only written in LIVE mode (DRY_RUN reports "would_create").
-- Total margin (existing + all new entries, cumulative) <= 80% equity AND <= 30% NAV (GIIQ-SoT-3)
+- Total margin (existing + all new entries, cumulative) <= 80% equity (outer hard cap) AND <= 70% NAV (GIIQ-SoT-4; was 30%)
 - GIIQ-SoT-3: coin notional <= 20% NAV; max 3 new fills per HKT day (Base + pending together);
   fallback decisions (Harbor, only when Claude's POST never arrived) = Base only at 2% margin;
   loud alert when Claude's POST is missing (RED after 2 consecutive days)
