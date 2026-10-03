@@ -250,7 +250,7 @@ class TestExecutorGuardrails(EnvMixin, unittest.TestCase):
 
     def test_price_sanity_skip(self):
         hl = FakeHL(meta=self.META, mids={"AAA": 2.0})  # candidate/radar close 1.0 -> +100%
-        res = self._run(hl, _cands(_cand("AAA", filt=0.97, lower=0.95, upper_1d=0.99)))
+        res = self._run(hl, _cands(_cand("AAA", filt=0.97, lower=0.95, upper_1d=0.99)), r4h=_radar(170), r1d=_radar(170))
         self.assertEqual(hl.calls, [])
         self.assertIn("price sanity", res["skipped"][0]["reason"])
         self.assertIn("price sanity", res["run_report"]["skipped"][0]["reason"])
@@ -258,13 +258,14 @@ class TestExecutorGuardrails(EnvMixin, unittest.TestCase):
     def test_min_order_one_pct_nav(self):
         hl = FakeHL(meta=self.META, mids={"AAA": 1.0})
         with patch.object(executor, "min_order_usd", side_effect=lambda nav: nav * 0.5):
-            res = self._run(hl, _cands(_cand("AAA", filt=0.97, lower=0.95, upper_1d=0.99)))
+            res = self._run(hl, _cands(_cand("AAA", filt=0.97, lower=0.95, upper_1d=0.99)), r4h=_radar(170), r1d=_radar(170))
         self.assertEqual(hl.calls, [])
         self.assertIn("< minimum $500.00", res["skipped"][0]["reason"])
 
     def test_nav_snapshot_and_downsized_report(self):
         hl = FakeHL(equity=1000, meta=self.META, mids={"AAA": 1.0})
-        res = self._run(hl, _cands(_cand("AAA", filt=0.97, lower=0.95, upper_1d=0.99)))  # DRY_RUN
+        # GIIQ-SoT-4: Tiny tier capped at 2%, not 4% - use large tier to test downsizing from 10% to 4%
+        res = self._run(hl, _cands(_cand("AAA", tier="large", filt=0.97, lower=0.95, upper_1d=0.99)), r4h=_radar(170), r1d=_radar(170))
         self.assertEqual(res["nav_snapshot"]["nav"], 1000.0)
         rep = res["run_report"]
         self.assertEqual(rep["executed"][0]["symbol"], "AAA")
