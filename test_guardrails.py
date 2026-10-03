@@ -34,7 +34,7 @@ def _radar(n, requested=None):
 
 class TestSotId(unittest.TestCase):
     def test_sot_id(self):
-        self.assertEqual(ec.SOT_ID, "GIIQ-SoT-3")
+        self.assertEqual(ec.SOT_ID, "GIIQ-SoT-4")
         doc = (ROOT / "docs" / "SOT_CHANGELOG.md").read_text(encoding="utf-8")
         self.assertIn("GIIQ-SoT-1", doc)
         self.assertIn("GIIQ-SoT-2", doc)
@@ -134,48 +134,48 @@ class TestSot2Sizing(unittest.TestCase):
     AI size/lev = maximums."""
 
     def test_default_max_margin_and_5x(self):
-        r = ec.size_by_margin(1000, 100.0, 95.0, 10)
+        r = ec.size_by_margin(1000, 100.0, 95.0, 10, tier="large")
         self.assertTrue(r["ok"], r)
         self.assertEqual((r["leverage"], r["margin_pct"]), (5, 4.0))
         self.assertAlmostEqual(r["notional_usd"], 200.0)
 
     def test_not_sized_by_sl_distance(self):
-        a = ec.size_by_margin(1000, 100.0, 98.0, 10, ai_size_pct=3)
-        b = ec.size_by_margin(1000, 100.0, 90.0, 10, ai_size_pct=3)  # 10% SL: same margin
+        a = ec.size_by_margin(1000, 100.0, 98.0, 10, ai_size_pct=3, tier="large")
+        b = ec.size_by_margin(1000, 100.0, 90.0, 10, ai_size_pct=3, tier="large")  # 10% SL: same margin
         self.assertEqual(a["margin_pct"], b["margin_pct"])
 
     def test_liq_steps_leverage_down(self):
-        r = ec.size_by_margin(1000, 100.0, 85.0, 10)  # 5x liq 84.2 < 85 ok
+        r = ec.size_by_margin(1000, 100.0, 85.0, 10, tier="large")  # 5x liq 84.2 < 85 ok
         self.assertEqual(r["leverage"], 5)
-        r = ec.size_by_margin(1000, 100.0, 80.0, 10)  # 5x liq 84.2, 4x 78.9 -> 4x
+        r = ec.size_by_margin(1000, 100.0, 80.0, 10, tier="large")  # 5x liq 84.2, 4x 78.9 -> 4x
         self.assertEqual(r["leverage"], 4)
         self.assertTrue(any("5x liq" in n for n in r["notes"]))
         self.assertLess(r["liq"], 80.0)
 
     def test_impossible_at_3x_skips(self):
-        r = ec.size_by_margin(1000, 100.0, 72.0, 10)  # 3x liq 70.2 < 72 ok
+        r = ec.size_by_margin(1000, 100.0, 72.0, 10, tier="large")  # 3x liq 70.2 < 72 ok
         self.assertEqual(r["leverage"], 3)
-        r = ec.size_by_margin(1000, 100.0, 70.0, 10)  # 3x liq 70.18 >= 70 -> skip
+        r = ec.size_by_margin(1000, 100.0, 70.0, 10, tier="large")  # 3x liq 70.18 >= 70 -> skip
         self.assertFalse(r["ok"])
         self.assertIn("SoT-2 leverage impossible", r["reason"])
 
     def test_ai_values_are_maximums_inside_band(self):
-        r = ec.size_by_margin(1000, 100.0, 98.0, 10, ai_size_pct=3, ai_leverage=4)
+        r = ec.size_by_margin(1000, 100.0, 98.0, 10, ai_size_pct=3, ai_leverage=4, tier="large")
         self.assertEqual((r["leverage"], r["margin_pct"]), (4, 3.0))
-        r = ec.size_by_margin(1000, 100.0, 98.0, 10, ai_size_pct=6, ai_leverage=9)
+        r = ec.size_by_margin(1000, 100.0, 98.0, 10, ai_size_pct=6, ai_leverage=9, tier="large")
         self.assertEqual((r["leverage"], r["margin_pct"]), (5, 4.0))  # hard caps
-        r = ec.size_by_margin(1000, 100.0, 98.0, 10, ai_size_pct=1, ai_leverage=2)  # floors 2% / 3x
+        r = ec.size_by_margin(1000, 100.0, 98.0, 10, ai_size_pct=1, ai_leverage=2, tier="large")  # floors 2% / 3x
         self.assertEqual((r["leverage"], r["margin_pct"]), (3, 2.0))
         self.assertEqual(len(r["notes"]), 2)
 
     def test_coin_max_below_3x_skips(self):
-        self.assertFalse(ec.size_by_margin(1000, 100.0, 98.0, 2)["ok"])
-        self.assertEqual(ec.size_by_margin(1000, 100.0, 98.0, 3)["leverage"], 3)
+        self.assertFalse(ec.size_by_margin(1000, 100.0, 98.0, 2, tier="large")["ok"])
+        self.assertEqual(ec.size_by_margin(1000, 100.0, 98.0, 3, tier="large")["leverage"], 3)
 
     def test_fixed_leverage_and_room_for_add_on(self):
-        r = ec.size_by_margin(1000, 100.0, 97.0, 10, fixed_leverage=2, max_margin_pct=2.5)
+        r = ec.size_by_margin(1000, 100.0, 97.0, 10, fixed_leverage=2, max_margin_pct=2.5, tier="large")
         self.assertEqual((r["leverage"], r["margin_pct"]), (2, 2.5))
-        self.assertFalse(ec.size_by_margin(1000, 100.0, 97.0, 10, fixed_leverage=2, max_margin_pct=1.5)["ok"])
+        self.assertFalse(ec.size_by_margin(1000, 100.0, 97.0, 10, fixed_leverage=2, max_margin_pct=1.5, tier="large")["ok"])
 
     def test_no_sl_risk_caps_in_code(self):
         for name in ("SOT2_MAX_RISK_PCT", "SOT2_MAX_TOTAL_RISK_PCT", "SOT2_TARGET_RISK_PCT", "size_by_risk"):
@@ -194,13 +194,39 @@ class TestSot2Sizing(unittest.TestCase):
         self.assertFalse(ec.addon_gates(pos, 1000, None)[0])
 
     def test_sot3_portfolio_caps(self):
-        self.assertTrue(ec.total_margin_nav_ok(250, 50, 1000)[0])
-        self.assertFalse(ec.total_margin_nav_ok(260, 50, 1000)[0])
+        # GIIQ-SoT-4: total margin cap raised from 30% to 70% NAV
+        self.assertTrue(ec.total_margin_nav_ok(650, 50, 1000)[0])  # (650+50)/1000 = 70%
+        self.assertFalse(ec.total_margin_nav_ok(660, 50, 1000)[0])  # (660+50)/1000 = 71% > 70%
         self.assertTrue(ec.coin_notional_ok(100, 100, 1000)[0])
         self.assertFalse(ec.coin_notional_ok(150, 60, 1000)[0])
         self.assertTrue(ec.daily_entry_cap_ok(1, 1)[0])
         self.assertFalse(ec.daily_entry_cap_ok(2, 1)[0])
-        self.assertEqual(ec.SOT_ID, "GIIQ-SoT-3")
+        self.assertEqual(ec.SOT_ID, "GIIQ-SoT-4")
+
+    def test_sot4_tiny_tier_constraints(self):
+        # GIIQ-SoT-4: Tiny tier (or unknown) max 3x leverage, 2% NAV margin
+        # Tiny tier
+        r = ec.size_by_margin(1000, 100.0, 95.0, 10, tier="tiny")
+        self.assertTrue(r["ok"])
+        self.assertLessEqual(r["leverage"], 3)
+        self.assertLessEqual(r["margin_pct"], 2.0)
+        # Unknown tier treated as Tiny
+        r = ec.size_by_margin(1000, 100.0, 95.0, 10, tier=None)
+        self.assertLessEqual(r["leverage"], 3)
+        self.assertLessEqual(r["margin_pct"], 2.0)
+        r = ec.size_by_margin(1000, 100.0, 95.0, 10, tier="")
+        self.assertLessEqual(r["leverage"], 3)
+        self.assertLessEqual(r["margin_pct"], 2.0)
+        # Large tier not affected
+        r = ec.size_by_margin(1000, 100.0, 95.0, 10, ai_leverage=5, tier="large")
+        self.assertEqual(r["leverage"], 5)
+        # Tiny ADD_ON refused if existing leverage > 3x
+        r = ec.size_by_margin(1000, 100.0, 95.0, 10, fixed_leverage=4, tier="tiny")
+        self.assertFalse(r["ok"])
+        self.assertIn("Tiny tier ADD_ON refused", r["reason"])
+        # Tiny ADD_ON ok if existing leverage <= 3x
+        r = ec.size_by_margin(1000, 100.0, 97.0, 10, fixed_leverage=3, tier="tiny")
+        self.assertTrue(r["ok"])
 
 
 class TestExecutorGuardrails(EnvMixin, unittest.TestCase):

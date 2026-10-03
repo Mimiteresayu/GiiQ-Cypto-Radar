@@ -12,6 +12,31 @@ header, the executor / pending run reports, the preflight JSON and `[DESK_DATA]`
 
 ---
 
+## GIIQ-SoT-4 (2026-10-03): total isolated margin cap 70% NAV + Tiny tier constraints (approved by MMT)
+
+MMT decision 2026-10-03 13:35–13:45 HKT (via Harbor).
+
+### 1. Total isolated margin cap raised from 30% to 70% NAV
+- **Total isolated margin cap: 30% → 70% NAV** (`MAX_TOTAL_MARGIN_NAV_PCT`).
+- The outer 80% utilization cap (`MAX_MARGIN_UTILIZATION_PCT`) remains unchanged.
+- The 20% per-coin notional cap (`MAX_COIN_NOTIONAL_NAV_PCT`) remains unchanged.
+
+### 2. Tiny tier leverage and margin constraints
+- **Tiny tier (or unknown/missing tier) is clamped to max 3x leverage and 2% NAV margin.**
+  - `size_by_margin` now accepts a `tier` input parameter.
+  - Unknown or missing tier is treated as Tiny (fail-safe).
+  - Leverage capped at 3x for Tiny tier (never above 3x, even if AI or coin maxLeverage allows higher).
+  - Margin capped at 2% NAV for Tiny tier.
+- **Tiny ADD_ON refused if existing position leverage > 3x.**
+  - ADD_ON fills for Tiny tier coins are skipped when the base position's leverage exceeds 3x.
+- **All callers updated**: `executor.py`, `pending_worker.py`, and `serve.py` now pass tier to `size_by_margin`.
+- Mega/Large/Small tier rules unchanged: max 5x leverage, 2-4% NAV margin per GIIQ-SoT-2.
+
+### 3. BX code untouched
+No changes to Bitunix (BX) trade execution code.
+
+---
+
 ## Bitunix live pilot (2026-09-30, MMT-approved; HL SoT id unchanged: no HL executor rule changed)
 Separate rule set for Bitunix only — see `docs/BX_LIVE_PILOT.md`. Runs in the Singapore `bx-exec` service.
 - Fail closed: non-US egress (two geo sources, Railway region, static IP), key present + signed read OK,

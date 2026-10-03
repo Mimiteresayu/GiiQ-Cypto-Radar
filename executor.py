@@ -455,7 +455,7 @@ def _execute(
             skip(why_day)
             continue
         ai_size = FALLBACK_MARGIN_PCT if fallback else decision.get("size_pct")
-        sz = size_by_margin(equity, limit_px, hard_sl, coin_max, ai_size, decision.get("leverage"))
+        sz = size_by_margin(equity, limit_px, hard_sl, coin_max, ai_size, decision.get("leverage"), tier=tier)
         if not sz["ok"]:
             skip(sz["reason"], mid=mid)
             continue

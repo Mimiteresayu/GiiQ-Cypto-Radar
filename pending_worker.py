@@ -283,7 +283,7 @@ def _run_pending(hl: Any = None, radar_1d: Optional[dict] = None, radar_4h: Opti
         limit_px = round_price(mid * (1 + slip / 100.0), sz_dec)
         ref_px = max(limit_px, (pos_by_coin.get(sym) or {}).get("entry_px") or 0)  # add-on: worst of both
         sz = size_by_margin(equity, limit_px, hard_sl, coin_max, rec.get("size_pct"), rec.get("leverage"),
-                            fixed_leverage=fixed_lev, max_margin_pct=room, liq_ref_px=ref_px)
+                            fixed_leverage=fixed_lev, max_margin_pct=room, liq_ref_px=ref_px, tier=tier)
         if not sz["ok"]:
             note(f"in zone but {sz['reason']}")
             continue
