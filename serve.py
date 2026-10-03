@@ -12,6 +12,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import subprocess
 import sys
@@ -40,6 +41,17 @@ COOKIE_NAME = "otr_session"
 SESSION_SECRET = (os.environ.get("SESSION_SECRET") or PASSWORD or "dev-local").encode()
 ENTRY_READ_KEY = (os.environ.get("ENTRY_READ_KEY") or "").strip()
 AI_DECISION_KEY = (os.environ.get("AI_DECISION_KEY") or ENTRY_READ_KEY or "").strip()
+_SECRET_QS_RE = re.compile(r"(?i)([?&;][a-z0-9_\-]*(?:key|token|password|secret)=)[^&;\s\"']*")
+# Top-level radar fields kept off /api/public/radar: strategy parameters and the watchlist / universe lists.
+_PUBLIC_RADAR_DROP = ("gc_params", "universe_requested", "universe_source", "universe_floors", "narrative_map",
+                      "narrative_forced", "narrative_not_on_hl", "narrative_retry_after_ms", "cemetery_forced")
+
+
+def redact_secrets(s: str) -> str:
+    """Mask the value of key / token / password / secret query parameters (key=***)."""
+    return _SECRET_QS_RE.sub(r"\1***", s)
+
+
 # New auto-execution scheduler (APScheduler in-process, Asia/Hong_Kong timezone)
 SCHEDULER_ENABLED = (os.environ.get("SCHEDULER_ENABLED") or ("1" if ON_RAILWAY else "0")).strip() in (
     "1",
@@ -2241,7 +2253,7 @@ class Handler(SimpleHTTPRequestHandler):
         super().__init__(*args, directory=ROOT, **kwargs)
 
     def log_message(self, fmt: str, *args) -> None:
-        sys.stderr.write("[%s] %s\n" % (self.log_date_time_string(), fmt % args))
+        sys.stderr.write("[%s] %s\n" % (self.log_date_time_string(), redact_secrets(fmt % args)))
 
     def _authed(self) -> bool:
         if not PASSWORD:
@@ -2627,9 +2639,7 @@ class Handler(SimpleHTTPRequestHandler):
             self._send_json(404, {"ok": False, "error": "AI candidates endpoint disabled"})
             return
         
-        qs = parse_qs(query_str)
-        provided_key = (qs.get("key") or [""])[0]
-        
+        provided_key = self._provided_key()
         if not provided_key or not hmac.compare_digest(provided_key, AI_DECISION_KEY):
             self._send_json(403, {"ok": False, "error": "forbidden"})
             return
@@ -2791,8 +2801,12 @@ class Handler(SimpleHTTPRequestHandler):
         except Exception as e:
             self._send_json(500, {"ok": False, "error": str(e)})
 
+    def _provided_key(self) -> str:
+        """Key from the X-AI-Key header, else the legacy ?key= query param."""
+        return self.headers.get("X-AI-Key") or (parse_qs(urlparse(self.path).query).get("key") or [""])[0]
+
     def _ai_key_ok(self) -> bool:
-        provided = self.headers.get("X-AI-Key") or (parse_qs(urlparse(self.path).query).get("key") or [""])[0]
+        provided = self._provided_key()
         if not AI_DECISION_KEY:
             self._send_json(404, {"ok": False, "error": "AI endpoints disabled"})
             return False
@@ -2918,6 +2932,7 @@ class Handler(SimpleHTTPRequestHandler):
         Returns:
             gc_radar_1h, gc_radar_4h, gc_radar_1d (from volume mount)
             No positions, no account data, no keys required.
+            No strategy parameters or watchlist/universe lists (_PUBLIC_RADAR_DROP).
         """
         result: dict = {}
         
@@ -2927,6 +2942,8 @@ class Handler(SimpleHTTPRequestHandler):
             try:
                 with open(fp) as f:
                     data = json.load(f)
+                    if isinstance(data, dict):
+                        data = {k: v for k, v in data.items() if k not in _PUBLIC_RADAR_DROP}
                     result[f"gc_radar_{tf}"] = data
             except Exception as e:
                 result[f"gc_radar_{tf}"] = {"error": str(e)}
@@ -2935,12 +2952,21 @@ class Handler(SimpleHTTPRequestHandler):
         self._send_json(200, result)
 
     def _scheduler_status(self) -> None:
-        """GET /api/scheduler/status: password-gated endpoint for scheduler job status.
-        
+        """GET /api/scheduler/status: scheduler job status.
+
+        Auth: cockpit login (cookie / Bearer / Basic / X-Cockpit-Password) or the AI key
+        (AI_DECISION_KEY, or ENTRY_READ_KEY) via X-AI-Key header or ?key=. Otherwise 401.
+
         Returns:
             enabled: bool
             jobs: dict of job_name -> {last_run, status, message, error}
         """
+        if not self._authed():
+            provided = self._provided_key()
+            if not provided or not any(k and hmac.compare_digest(provided, k)
+                                       for k in (AI_DECISION_KEY, ENTRY_READ_KEY)):
+                self._send_json(401, {"ok": False, "error": "unauthorized"})
+                return
         if not SCHEDULER_ENABLED:
             self._send_json(200, {
                 "enabled": False,
@@ -2993,9 +3019,7 @@ class Handler(SimpleHTTPRequestHandler):
             self._send_json(404, {"ok": False, "error": "entry candidates endpoint disabled"})
             return
         
-        qs = parse_qs(query_str)
-        provided_key = (qs.get("key") or [""])[0]
-        
+        provided_key = self._provided_key()
         if not provided_key or not hmac.compare_digest(provided_key, ENTRY_READ_KEY):
             self._send_json(403, {"ok": False, "error": "forbidden"})
             return
