@@ -112,7 +112,7 @@ trading rules, including:
 
 Fetch today's entry candidates with enhanced data for AI decision-making.
 
-**Auth:** Query parameter `key` must match `AI_DECISION_KEY` env var
+**Auth:** `X-AI-Key` header (preferred) or query parameter `key` must match `AI_DECISION_KEY` env var
 
 **Returns:**
 ```json
@@ -289,6 +289,7 @@ python3 -c "from trade_log import get_all_trades; import json; print(json.dumps(
 Trimmed radar feed for public consumption (e.g., giiqquant site):
 - Returns: `gc_radar_1h`, `gc_radar_4h`, `gc_radar_1d`
 - No positions, no account data, no keys required
+- No strategy parameters (`gc_params`) or watchlist / universe lists (`universe_requested`, `narrative_map`, ...)
 
 ### Environment Variables (NEW)
 
@@ -377,7 +378,8 @@ Executor / exit workers are always forced to DRY_RUN on manual runs. `POST /api/
 now also rebuilds candidates.
 
 **Scheduler status:**
-- Password-gated: `GET /api/scheduler/status` (persisted to `out/scheduler_status.json`, survives restarts;
+- `GET /api/scheduler/status`: cockpit login, or the AI key (`AI_DECISION_KEY` / `ENTRY_READ_KEY`) via `X-AI-Key`
+  header or `?key=`; otherwise 401 (persisted to `out/scheduler_status.json`, survives restarts;
   executor `fail_closed` is reported as `fail_closed`, not `error`; exit-worker failures are `error`)
 - Included in `GET /api/desk-data` under `scheduler` key
 - Shows last run time, status, message/error for each job

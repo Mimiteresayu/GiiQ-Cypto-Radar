@@ -58,7 +58,7 @@ The AI may only **remove** candidates from the list. The AI **cannot add** symbo
 **Endpoint**: `GET /api/entry-candidates?key=<ENTRY_READ_KEY>`
 
 ### Authentication
-- Query parameter `key` compared with environment variable `ENTRY_READ_KEY` using constant-time `hmac.compare_digest`.
+- `X-AI-Key` header (preferred) or query parameter `key` compared with environment variable `ENTRY_READ_KEY` using constant-time `hmac.compare_digest`.
 - If `ENTRY_READ_KEY` unset: endpoint returns **404** (disabled).
 - If `key` missing or invalid: returns **403** (forbidden).
 - If `key` matches: returns **200** with JSON.
