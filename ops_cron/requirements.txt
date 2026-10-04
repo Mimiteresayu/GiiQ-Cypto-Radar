@@ -1,0 +1,2 @@
+# Only needed when BRAIN_DSN is set (insert into raw.ops_check_run); everything else is stdlib.
+psycopg[binary]==3.2.10

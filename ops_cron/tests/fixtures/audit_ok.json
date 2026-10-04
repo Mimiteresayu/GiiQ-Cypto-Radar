@@ -1,0 +1,76 @@
+{
+  "now": "2026-10-04T01:22:00+00:00",
+  "inputs": {
+    "run_report_today": {"ok": true, "http": 200, "error": "", "data": {
+      "ok": true, "date": "2026-10-04", "sot": "GIIQ-SoT-4",
+      "runs": [{"job": "executor", "mode": "LIVE", "ts": "2026-10-04T00:55:20+00:00", "status": "success"}],
+      "executed": [{"symbol": "SOL", "kind": "Base", "qty": 2.5, "px": 150.2, "size_pct": 4.0, "leverage": 3,
+                    "notional_usd": 375.5, "hard_sl": 140.0, "dry_run": false, "mid": 149.9, "zone": null,
+                    "upper_ref": 148.0, "run_job": "executor", "run_mode": "LIVE", "run_ts": "2026-10-04T00:55:20+00:00"}],
+      "skipped": [{"symbol": "DOGE", "reason": "SL distance 1.20% from live mid < 1.5%", "run_job": "executor",
+                   "run_mode": "LIVE", "run_ts": "2026-10-04T00:55:20+00:00"}],
+      "downsized": [], "failed": []}},
+    "run_report_yesterday": {"ok": true, "http": 200, "error": "", "data": {
+      "ok": true, "date": "2026-10-03", "sot": "GIIQ-SoT-4",
+      "runs": [{"job": "pending_entries", "mode": "LIVE", "ts": "2026-10-03T08:10:30+00:00", "status": "success"}],
+      "executed": [{"symbol": "ETH", "kind": "ADD_ON", "qty": 0.1, "px": 2510.0, "size_pct": 3.0, "leverage": 4,
+                    "notional_usd": 251.0, "hard_sl": 2400.0, "dry_run": false, "mid": 2505.0,
+                    "zone": [2450.0, 2500.0], "upper_ref": null, "run_job": "pending_entries", "run_mode": "LIVE",
+                    "run_ts": "2026-10-03T08:10:30+00:00"}],
+      "skipped": [{"symbol": "LINK", "kind": "CONTINUATION",
+                   "reason": "waiting: in zone but SL distance 1.10% to 4H Lower 11.2 < 1.5%",
+                   "run_job": "pending_entries", "run_mode": "LIVE", "run_ts": "2026-10-03T04:10:30+00:00"}],
+      "downsized": [], "failed": []}},
+    "pending": {"ok": true, "http": 200, "error": "", "data": {
+      "ok": true, "active": [],
+      "all": [
+        {"id": "ARB_CONTINUATION_20260927", "symbol": "ARB", "kind": "CONTINUATION", "status": "expired",
+         "created_at": "2026-09-27T00:55:00+00:00", "closed_at": "2026-10-04T00:10:00+00:00",
+         "close_reason": "expired after 7 days"},
+        {"id": "ETH_ADD_ON_20261002", "symbol": "ETH", "kind": "ADD_ON", "status": "filled",
+         "created_at": "2026-10-02T00:55:00+00:00", "closed_at": "2026-10-03T08:10:30+00:00",
+         "close_reason": "filled 0.1 @ 2510.0",
+         "fill": {"qty": 0.1, "avg_px": 2510.0, "sl_oid": 9, "hard_sl": 2400.0, "leverage": 4, "at": "2026-10-03T08:10:30+00:00"}}]}},
+    "hl_fills": {"ok": true, "http": 200, "error": "", "data": [
+      {"coin": "ETH", "px": "2380.0", "sz": "0.2", "side": "B", "time": 1790729710000, "startPosition": "0.0",
+       "dir": "Open Long", "closedPnl": "0.0", "hash": "0xb0", "oid": 300, "crossed": true, "fee": "0.2", "tid": 10, "feeToken": "USDC"},
+      {"coin": "AVAX", "px": "30.0", "sz": "10", "side": "B", "time": 1790816100000, "startPosition": "0.0",
+       "dir": "Open Long", "closedPnl": "0.0", "hash": "0xb1", "oid": 301, "crossed": true, "fee": "0.1", "tid": 11, "feeToken": "USDC"},
+      {"coin": "ETH", "px": "2510.0", "sz": "0.1", "side": "B", "time": 1791015030000, "startPosition": "0.2",
+       "dir": "Open Long", "closedPnl": "0.0", "hash": "0xb2", "oid": 302, "crossed": true, "fee": "0.11", "tid": 12, "feeToken": "USDC"},
+      {"coin": "AVAX", "px": "31.5", "sz": "10", "side": "A", "time": 1791058060000, "startPosition": "10",
+       "dir": "Close Long", "closedPnl": "15.0", "hash": "0xb3", "oid": 303, "crossed": true, "fee": "0.2", "tid": 13, "feeToken": "USDC"},
+      {"coin": "SOL", "px": "150.2", "sz": "2.5", "side": "B", "time": 1791075320000, "startPosition": "0.0",
+       "dir": "Open Long", "closedPnl": "0.0", "hash": "0xb4", "oid": 304, "crossed": true, "fee": "0.11", "tid": 14, "feeToken": "USDC"}]},
+    "candles": {
+      "AVAX": {"ok": true, "http": 200, "error": "", "data": [
+        {"t": 1790812800000, "T": 1790816399999, "s": "AVAX", "i": "1h", "o": "29.9", "c": "30.1", "h": "30.2", "l": "29.8", "v": "1000", "n": 50},
+        {"t": 1790942400000, "T": 1790945999999, "s": "AVAX", "i": "1h", "o": "32.0", "c": "32.6", "h": "33.0", "l": "31.9", "v": "1200", "n": 60},
+        {"t": 1791057600000, "T": 1791061199999, "s": "AVAX", "i": "1h", "o": "31.8", "c": "31.4", "h": "31.9", "l": "31.3", "v": "900", "n": 40}]}},
+    "bx_status": {"ok": true, "http": 200, "error": "", "data": {
+      "ok": true, "region": "asia-southeast1-eqsg3a",
+      "egress": {"ok": true, "ip": "203.0.113.7", "countries": {"ipinfo": "SG", "ipapi": "SG"}, "region": "asia-southeast1-eqsg3a", "reason": ""},
+      "live_ready": true, "live_blockers": [], "account_check": {"ok": true},
+      "jobs": {"entries": {"at": "2026-10-04T00:56:00+00:00", "status": "success", "error_steps": null, "message": null}},
+      "problems": [], "bx_enabled": true, "bx_live": true, "keys_present": true, "breaker": {"tripped": false},
+      "baseline_nav": 5000.0, "realized_pnl_usd": -12.5,
+      "open": [
+        {"bx_symbol": "FOOUSDT", "kind": "Base", "entry_time": "2026-10-02T00:56:10+00:00", "entry_px": 2.0, "hard_sl": 1.86, "qty": 75, "position_id": "p1"},
+        {"bx_symbol": "BAZUSDT", "kind": "Base", "entry_time": "2026-10-04T00:56:20+00:00", "entry_px": 1.0, "hard_sl": 0.95, "qty": 100, "position_id": "p2"}],
+      "closed_recent": [{"bx_symbol": "BARUSDT", "exit_time": "2026-10-03T12:05:00+00:00", "exit_reason": "exit_4h_close_below_filter", "pnl_usd": -3.2}],
+      "pending": [],
+      "rules": {"margin_pct_nav": 1.0, "leverage": 3, "max_open": 2, "max_new_per_day": 1, "breaker_pct_nav": 3.0}}},
+    "bx_day": {"ok": true, "http": 200, "error": "", "data": {
+      "date": "2026-10-04", "at": "2026-10-04T00:56:30+00:00", "live": true, "gate": [],
+      "egress": {"ok": true, "ip": "203.0.113.7", "countries": {"ipinfo": "SG", "ipapi": "SG"}, "region": "asia-southeast1-eqsg3a", "reason": ""},
+      "candidates": [{"symbol": "BAZUSDT", "type": "Base", "gc_tf": "1d"}, {"symbol": "QUXUSDT", "type": "Base", "gc_tf": "1d"}],
+      "decisions": [{"symbol": "BAZUSDT", "decision": "approve", "rule": null, "late": false, "reason": "clean breakout"}],
+      "orders": [{"symbol": "BAZUSDT", "status": "filled", "order_id": "o1", "position_id": "p2", "qty": 100.0,
+                  "entry_px": 1.0, "hard_sl": "0.95", "sl_order_id": "s1", "sl_confirmed": true, "margin_usd": 50.0,
+                  "liq_est": 0.7, "problems": null}],
+      "pending_created": [],
+      "skipped": [{"symbol": "QUXUSDT", "reason": "Hard SL only 1.10% below price (< 1.5%)"}],
+      "breaker": {"tripped": false, "at": null, "realized_pnl_usd": -12.5, "baseline_nav": 5000.0},
+      "open_live": []}}
+  }
+}
