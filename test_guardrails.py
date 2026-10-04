@@ -112,7 +112,8 @@ class TestRunReport(unittest.TestCase):
     def test_classification(self):
         res = {"mode": "LIVE", "status": "success", "timestamp": "t",
                "executed": [{"symbol": "AAA", "entry_type": "Base", "qty": 10, "limit_px": 1.0, "size_pct": 4.0,
-                             "leverage": 2, "live_result": {"filled_sz": 10, "avg_px": 1.01}}],
+                             "leverage": 2, "mid": 0.995, "entry_upper_ref": 0.98,
+                             "live_result": {"filled_sz": 10, "avg_px": 1.01}}],
                "skipped": [{"symbol": "BBB", "reason": "below 1D Upper at entry"},
                            {"symbol": "CCC", "reason": "live entry no_fill", "live_result": {"status": "no_fill"}}],
                "actions": [], "alerts": []}
@@ -121,6 +122,7 @@ class TestRunReport(unittest.TestCase):
         self.assertEqual(rep["sot"], ec.SOT_ID)
         self.assertEqual([x["symbol"] for x in rep["executed"]], ["AAA"])
         self.assertEqual(rep["executed"][0]["px"], 1.01)
+        self.assertEqual((rep["executed"][0]["mid"], rep["executed"][0]["upper_ref"]), (0.995, 0.98))
         self.assertEqual([x["symbol"] for x in rep["skipped"]], ["BBB"])
         self.assertEqual([x["symbol"] for x in rep["failed"]], ["CCC"])
         self.assertIn("size 6% -> 4%", rep["downsized"][0]["reason"])

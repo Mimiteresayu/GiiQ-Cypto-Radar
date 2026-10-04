@@ -1740,11 +1740,11 @@ def _record_run_report(job_name: str, res: dict, now: datetime | None = None) ->
         sys.stderr.write(f"[RUN_REPORT] persist failed: {e}\n")
 
 
-def _today_run_report(now: datetime | None = None) -> dict:
+def _today_run_report(now: datetime | None = None, day: str | None = None) -> dict:
     """Daily run report (HKT day): every executor / pending run + merged executed / skipped /
     downsized / failed lists with reasons (cockpit + [DESK_DATA])."""
     now = now or datetime.now(timezone.utc)
-    day = now.astimezone(HKT).strftime("%Y-%m-%d")
+    day = day or now.astimezone(HKT).strftime("%Y-%m-%d")
     try:
         with open(_run_report_path(day)) as f:
             doc = json.load(f)
@@ -2388,6 +2388,15 @@ class Handler(SimpleHTTPRequestHandler):
                 except Exception:
                     allrec = []
                 self._send_json(200, {"ok": True, "active": _pending_view(), "all": allrec[-50:]})
+            return
+        if path == "/api/exec/run-report":
+            # keyed, read-only: one HKT day's executor / pending run report (ops_cron daily audit)
+            if self._ai_key_ok():
+                day = (parse_qs(parsed.query).get("date") or [""])[0] or datetime.now(HKT).strftime("%Y-%m-%d")
+                if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
+                    self._send_json(400, {"ok": False, "error": "date must be YYYY-MM-DD"})
+                    return
+                self._send_json(200, {"ok": True, **_today_run_report(day=day)})
             return
         if self._need_auth():
             return

@@ -24,6 +24,7 @@ SECRET_FIELDS = ("gc_params", "universe_requested", "universe_source", "universe
 
 KEYED_GETS = ("/api/ai/candidates", "/api/ai/narrative", "/api/exec/preflight", "/api/exit/health",
               "/api/ai/dimensions", "/api/dimensions/report", "/api/whales", "/api/exec/pending",
+              "/api/exec/run-report",
               "/api/bx/radar", "/api/bx/shadow", "/api/bx/review", "/api/bx/status", "/api/bx/day")
 
 
@@ -148,6 +149,15 @@ class TestHeaderAuthOnKeyedEndpoints(_Server):
         code_q, body_q = self.get(f"/api/ai/candidates?key={AI_KEY}")
         self.assertEqual((code_h, code_q), (200, 200))
         self.assertEqual(json.loads(body_h)["candidates"], json.loads(body_q)["candidates"])
+
+    def test_run_report_by_date(self):
+        code, body = self.get("/api/exec/run-report?date=2026-10-03", {"X-AI-Key": AI_KEY})
+        self.assertEqual(code, 200)
+        d = json.loads(body)
+        self.assertEqual(d["date"], "2026-10-03")
+        for k in ("runs", "executed", "skipped", "failed"):
+            self.assertIn(k, d)
+        self.assertEqual(self.get("/api/exec/run-report?date=../x", {"X-AI-Key": AI_KEY})[0], 400)
 
     def test_entry_candidates_header(self):
         self.assertEqual(self.get("/api/entry-candidates")[0], 403)

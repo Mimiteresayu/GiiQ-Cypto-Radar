@@ -364,7 +364,8 @@ def build_run_report(run: str, result: Dict[str, Any], nav: Optional[dict] = Non
         return {"symbol": x.get("symbol"), "kind": x.get("kind") or x.get("entry_type"),
                 "qty": lr.get("filled_sz") or x.get("qty"), "px": lr.get("avg_px") or x.get("limit_px"),
                 "size_pct": x.get("size_pct"), "leverage": x.get("leverage"),
-                "notional_usd": x.get("notional_usd"), "hard_sl": x.get("hard_sl"), "dry_run": dry}
+                "notional_usd": x.get("notional_usd"), "hard_sl": x.get("hard_sl"), "dry_run": dry,
+                "mid": x.get("mid"), "zone": x.get("zone"), "upper_ref": x.get("entry_upper_ref")}
 
     done = [(x, False) for x in result.get("executed", []) or []]
     done += [(x, True) for x in result.get("actions", []) or []]
