@@ -5,15 +5,21 @@ Rules (closed bars only, from gc_radar_1d / gc_radar_4h):
 - Base: 1D Upper dual_cross_up (close > upper AND prev_close <= prev_upper) AND 1D Green
 - Chase: 1D Green + 4H Green + 4H Upper dual_cross_up
 - Universe: rows already in radar (dayNtlVlm >= $75k gate applied by scanner)
+
+Decision-day freeze: entry_candidates_latest.json is rewritten all day (4H/1H scans, live radar), but
+decisions are day-scoped. The 08:05 scan (and the first AI decision POST / fallback of the day if that
+is missing) copies it to entry_candidates_decision_YYYYMMDD.json (HKT); executor + preflight match
+today's approvals against that snapshot and fall back to latest only when it is missing.
 """
 from __future__ import annotations
 
 import json
 import os
+import secrets
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 _CAT_ORDER = ("N", "C", "V")
 _CAT_LEGACY = {"NARRATIVE": "N", "Narrative": "N", "CEMETERY": "C", "Cemetery": "C"}
@@ -36,6 +42,67 @@ try:
     from mcap_tiers import tier_for
 except ImportError:
     tier_for = None  # type: ignore
+
+from exec_common import HKT, hkt_date, parse_ts  # noqa: E402
+
+OUT_DIR = ROOT / "out"
+LATEST_NAME = "entry_candidates_latest.json"
+
+
+def decision_snapshot_name(now: Optional[datetime] = None) -> str:
+    now = now or datetime.now(timezone.utc)
+    return f"entry_candidates_decision_{now.astimezone(HKT).strftime('%Y%m%d')}.json"
+
+
+def _read(p: Path) -> dict:
+    if not p.is_file():
+        return {}
+    try:
+        d = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return d if isinstance(d, dict) else {}
+
+
+def _built_today(data: dict, now: datetime) -> bool:
+    gen = parse_ts((data or {}).get("generated_at"))
+    return bool(gen) and hkt_date(gen) == hkt_date(now)
+
+
+def freeze_decision_snapshot(now: Optional[datetime] = None, overwrite: bool = False, source: str = "",
+                             out_dir: Optional[Path] = None) -> Dict[str, Any]:
+    """Copy entry_candidates_latest.json -> entry_candidates_decision_YYYYMMDD.json (HKT day of `now`).
+    overwrite=False keeps an existing snapshot (first freeze of the day wins). Never freezes a list
+    that was not built today HKT."""
+    now = now or datetime.now(timezone.utc)
+    d = Path(out_dir or OUT_DIR)
+    name = decision_snapshot_name(now)
+    path = d / name
+    if path.is_file() and not overwrite:
+        return {"ok": True, "written": False, "file": name, "why": "already frozen for today"}
+    latest = _read(d / LATEST_NAME)
+    if not _built_today(latest, now):
+        return {"ok": False, "written": False, "file": name, "why": f"{LATEST_NAME} missing or not built today HKT"}
+    snap = dict(latest, frozen_at=now.isoformat(), frozen_by=source or "unknown", frozen_from=LATEST_NAME)
+    d.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp." + secrets.token_hex(4))
+    tmp.write_text(json.dumps(snap, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+    return {"ok": True, "written": True, "file": name, "count": snap.get("count"), "source": source}
+
+
+def load_decision_candidates(now: Optional[datetime] = None,
+                             out_dir: Optional[Path] = None) -> Tuple[dict, str, bool]:
+    """Candidates to match today's approvals against -> (data, label, frozen).
+    Today's decision snapshot if present and built today HKT; else entry_candidates_latest.json."""
+    now = now or datetime.now(timezone.utc)
+    d = Path(out_dir or OUT_DIR)
+    name = decision_snapshot_name(now)
+    snap = _read(d / name)
+    if snap and _built_today(snap, now):
+        return snap, f"{name} (frozen {snap.get('frozen_at')} by {snap.get('frozen_by')})", True
+    why = "missing" if not snap else "not built today HKT"
+    return _read(d / LATEST_NAME), f"{LATEST_NAME} (decision snapshot {name} {why} -> fallback to latest)", False
 
 
 def _parse_radar_timestamp(ts_str: str) -> Optional[datetime]:

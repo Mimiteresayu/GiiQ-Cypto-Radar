@@ -13,6 +13,12 @@ SoT enforcement (see exec_common.py):
   zone [1D Lower, 1D Filter]); pending_worker.py checks them every 4h at :10 HKT, right after the 4H exits,
   with the same SoT checks (skipped for that run if the exit step failed).
   Pending records are only written in LIVE mode (DRY_RUN reports "would_create").
+  DISABLED by default (Cove HEALTH FAIL 2026-10-05): Chase approvals are acknowledged with no entry
+  (result "no_entry", no pending) and active CONTINUATION / ADD_ON pendings are cancelled (LIVE),
+  unless PENDING_CONTINUATION_DISABLED=0. Base is unchanged.
+- Approvals are matched against today's frozen decision snapshot entry_candidates_decision_YYYYMMDD.json
+  (HKT), falling back to entry_candidates_latest.json only when it is missing; the freshness guard
+  below still runs on the latest list.
 - Total margin (existing + all new entries, cumulative) <= 80% equity (outer hard cap) AND <= 70% NAV (GIIQ-SoT-4; was 30%)
 - GIIQ-SoT-3: coin notional <= 20% NAV; max 3 new fills per HKT day (Base + pending together);
   fallback decisions (Harbor, only when Claude's POST never arrived) = Base only at 2% margin;
@@ -90,6 +96,8 @@ from exec_common import (  # noqa: E402
 from pending_entries import band as pending_band  # noqa: E402
 from pending_entries import classify_chase, create_pending, load_pending, save_pending  # noqa: E402
 from pending_entries import summary as pending_summary  # noqa: E402
+from pending_entries import DISABLE_ENV, DISABLED_REASON, cancel_active_pending, pending_disabled  # noqa: E402
+from entry_candidates import load_decision_candidates  # noqa: E402
 
 try:
     from decisions import get_decisions_for_today
@@ -262,10 +270,15 @@ def _execute(
     now = now or datetime.now(timezone.utc)
     result: Dict[str, Any] = {
         "mode": mode, "status": "success", "executed": [], "skipped": [], "actions": [], "alerts": [],
-        "pending": [], "timestamp": now.isoformat(),
+        "pending": [], "no_entry": [], "timestamp": now.isoformat(),
     }
 
-    candidates_data = _load_candidates() if candidates_data is None else candidates_data
+    latest_data = candidates_data
+    if candidates_data is None:
+        latest_data = _load_candidates()
+        candidates_data, cand_label, frozen = load_decision_candidates(now)
+        result["candidates_source"] = cand_label
+        _log(f"{mode} candidates: {'decision snapshot' if frozen else 'NO decision snapshot'} -> {cand_label}")
     if decisions is None:
         decisions = get_decisions_for_today()
         # GIIQ-SoT-3: loud when Claude's ENTRY_DESK POST never arrived (fallback-only day)
@@ -289,7 +302,7 @@ def _execute(
         _log(f"{mode} fail_closed: no approved candidates")
         return result
 
-    fresh, why = candidates_fresh(candidates_data, now=now)
+    fresh, why = candidates_fresh(latest_data, now=now)
     if not fresh:
         result.update(status="fail_closed", message=f"Candidates not fresh: {why}")
         _log(f"{mode} fail_closed: {why}")
@@ -331,6 +344,15 @@ def _execute(
     held_long = {p["coin"] for p in account["positions"] if p["side"] == "LONG"}
     pend_entries = load_pending()
     pend_dirty = False
+    disabled = pending_disabled()
+    if disabled:
+        result["pending_disabled"] = DISABLED_REASON
+        if live:
+            gone = cancel_active_pending(pend_entries, now)
+            if gone:
+                pend_dirty = True
+                result["pending_cancelled"] = [e.get("id") for e in gone]
+                _log(f"LIVE cancelled active CONTINUATION/ADD_ON ({DISABLED_REASON}): {result['pending_cancelled']}")
     if equity <= 0:
         result.update(status="error", message="Equity is 0 / unavailable")
         return result
@@ -384,6 +406,12 @@ def _execute(
             skip("fallback decision: Base only (no Chase / pending add-on)")
             continue
         if not is_base and entry_type == "Chase":
+            if disabled:
+                why = (f"Chase acknowledged, no entry: CONTINUATION/ADD_ON pending disabled ({DISABLED_REASON}; "
+                       f"re-enable {DISABLE_ENV}=0)")
+                result["no_entry"].append({"symbol": symbol, "type": "Chase", "reason": why})
+                _log(f"{mode} NO ENTRY {symbol}: {why}")
+                continue
             # Chase -> pending pullback entry (ADD_ON / CONTINUATION), never an 08:55 order
             if symbol in held and symbol not in held_long:
                 skip("Chase signal on a SHORT position: no pending add-on")
