@@ -66,6 +66,7 @@ LIQ_EXIT_VOL = 1_000_000.0
 LIQ_EXIT_SPREAD_BP = 30.0
 LIVE_GC_TFS = ("1d", "4h")
 DECISION_LATE_HKT = (8, 50)
+MIN_SCANNED = 100                # fewer BX contracts in the daily scan -> funnel warn (10/3: 44, CoinGecko outage)
 DEFAULT_MMR = 0.02              # used only if the tier lookup fails (conservative)
 
 
@@ -292,6 +293,14 @@ def pilot_eligible(meta: dict) -> Tuple[bool, str]:
     return True, ""
 
 
+def _funnel_key(why: str) -> str:
+    if not why:
+        return "other"
+    if why.startswith("spread "):
+        return f"spread >= {SPREAD_MAX_BP:g} bp"
+    return why.split(" (")[0]
+
+
 def build_candidates(now: Optional[datetime] = None) -> dict:
     """08:02 HKT (after the BX daily radar): today's pilot-eligible BX signals for the 08:10 ENTRY_DESK."""
     import bx_radar
@@ -300,12 +309,19 @@ def build_candidates(now: Optional[datetime] = None) -> dict:
     meta_all = {m["bx_symbol"]: m for m in (bx_radar.load_meta().get("scanned") or [])}
     r1d, r4h = (S._rows_by_symbol(bx_radar.load_radar(tf)) for tf in ("1d", "4h"))
     out, skipped = [], []
+    funnel: Dict[str, Any] = {"scanned": len(meta_all), "tier_tradeable": 0, "tier_watch": 0, "tier_exclude": 0,
+                              "signals": 0, "dropped": {}}
     for sym, m in meta_all.items():
+        t = f"tier_{m.get('liq_tier') or 'none'}"
+        funnel[t] = funnel.get(t, 0) + 1
         s = S.classify_signal(m, r1d.get(sym), r4h.get(sym), None)
         if not s or s["gc_tf"] not in LIVE_GC_TFS:
             continue
+        funnel["signals"] += 1
         ok, why = pilot_eligible(m)
         if not ok:
+            k = _funnel_key(why)
+            funnel["dropped"][k] = funnel["dropped"].get(k, 0) + 1
             skipped.append({"symbol": sym, "type": s["type"], "reason": why})
             continue
         row1, row4 = r1d.get(sym) or {}, r4h.get(sym) or {}
@@ -330,7 +346,13 @@ def build_candidates(now: Optional[datetime] = None) -> dict:
             "asset_age": m.get("asset_age"),
             "size_rule": f"{MARGIN_PCT_NAV:g}% NAV margin, {LEVERAGE}x, <= 0.5% of 24h vol",
         })
-    doc = {"date": hkt_date(now), "generated_at": now.isoformat(), "ex": "BX", "candidates": out,
+    funnel["candidates"] = len(out)
+    if funnel["scanned"] < MIN_SCANNED:
+        funnel["warn"] = f"short scan ({funnel['scanned']} < {MIN_SCANNED} contracts): check CoinGecko / Bitunix catalog"
+        _log(f"[BX_ALERT] {funnel['warn']}")
+    # n + note are what bx_service copies into the daily [BX_DATA] line
+    doc = {"date": hkt_date(now), "generated_at": now.isoformat(), "ex": "BX", "candidates": out, "funnel": funnel,
+           "n": len(out), "note": json.dumps(funnel, separators=(",", ":"))[:400],
            "not_eligible": skipped[:100],
            "rules": {"veto": ["V1", "V2", "V3", "V5"], "approve_max": MAX_NEW_PER_DAY,
                      "no_fallback": "no approval -> no order"}}
@@ -367,8 +389,17 @@ def store_decisions(decisions: List[dict], source: str, now: Optional[datetime] 
         doc["decisions"][sym] = rec
         doc["history"].append(rec)
         stored.append(rec)
-    _write(p, doc)
-    return {"ok": bool(stored), "stored": len(stored), "rejected": rejected, "late": late, "date": day}
+    if stored:
+        _write(p, doc)
+    res = {"ok": bool(stored), "stored": len(stored), "rejected": rejected, "late": late, "date": day}
+    # Nothing to decide is not an error. A bad shape, or an unknown symbol while today's list is
+    # non-empty, still returns ok=False (-> 422).
+    if not stored:
+        if not decisions:
+            res.update(ok=True, reason="empty bx_decisions list; nothing to decide")
+        elif not valid and all(r.get("why") == "not in today's BX candidate list" for r in rejected):
+            res.update(ok=True, reason="no BX candidates today; nothing stored")
+    return res
 
 
 def approval_for(symbol: str, now: Optional[datetime] = None) -> Optional[dict]:
