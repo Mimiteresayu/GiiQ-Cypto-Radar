@@ -133,6 +133,9 @@ class TestPublicRadar(_Server):
             self.assertEqual(json.load(f)["universe_requested"], ["BTC", "ETH", "SOL"])
 
 
+KEYED_GETS += ("/api/bx/rejects",)
+
+
 class TestHeaderAuthOnKeyedEndpoints(_Server):
     def test_keyed_gets(self):
         for path in KEYED_GETS:
@@ -176,6 +179,26 @@ class TestLogRedaction(_Server):
         self.assertIn("/api/scheduler/status", log)
         self.assertNotIn(AI_KEY, log)
         self.assertNotIn("tok123", log)
+
+
+class TestBxRejectsProxy(_Server):
+    def test_keyed_proxy_forwards_date_only(self):
+        self.assertEqual(self.get("/api/bx/rejects?date=2026-10-05")[0], 403)
+        self.assertEqual(self.get("/api/bx/rejects?date=2026-10-05", {"X-AI-Key": "wrong"})[0], 403)
+        code, body = self.get("/api/bx/rejects?date=2026-10-05&tf=1d", {"X-AI-Key": AI_KEY})
+        self.assertEqual(code, 200)
+        self.assertEqual(json.loads(body)["stub"], "/api/bx/rejects?date=2026-10-05")
+        code, body = self.get(f"/api/bx/rejects?date=2026-10-05&key={AI_KEY}")
+        self.assertEqual(code, 200)
+        self.assertNotIn(AI_KEY, json.loads(body)["stub"])
+        self.assertNotIn("key", json.loads(body)["stub"])
+
+    def test_default_date_and_bad_date(self):
+        code, body = self.get("/api/bx/rejects", {"X-AI-Key": AI_KEY})
+        self.assertEqual(code, 200)
+        self.assertRegex(json.loads(body)["stub"], r"^/api/bx/rejects\?date=\d{4}-\d{2}-\d{2}$")
+        for bad in ("../x", "2026-1-5", "20261005", "2026-10-05x"):
+            self.assertEqual(self.get(f"/api/bx/rejects?date={bad}", {"X-AI-Key": AI_KEY})[0], 400, bad)
 
 
 if __name__ == "__main__":

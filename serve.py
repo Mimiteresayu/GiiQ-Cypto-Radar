@@ -2377,6 +2377,16 @@ class Handler(SimpleHTTPRequestHandler):
                                       ("ts", "n_wallets", "n_manual", "errors", "wallets")} if snap else None,
                                       "coins": snap.get("coins") if snap else None, "watchlist": wl})
             return
+        if path == "/api/bx/rejects":
+            # keyed, read-only: one HKT day's BX rejection-reason log from bx-exec (only ?date= is forwarded)
+            if self._ai_key_ok():
+                day = (parse_qs(parsed.query).get("date") or [""])[0] or datetime.now(HKT).strftime("%Y-%m-%d")
+                if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
+                    self._send_json(400, {"ok": False, "error": "date must be YYYY-MM-DD"})
+                    return
+                code, d = _bx_service("/api/bx/rejects?" + urlencode({"date": day}))
+                self._send_json(code, d)
+            return
         if path in ("/api/bx/radar", "/api/bx/shadow", "/api/bx/review", "/api/bx/status", "/api/bx/day"):
             # keyed, read-only BX shadow data (Claude weekly review of unknown-class contracts, reports)
             if self._ai_key_ok():

@@ -17,6 +17,7 @@ Switches: BX_ENABLED=0 stops everything (no scans, no orders; exchange SL orders
 
 HTTP (PORT): GET /health (open, no secrets)  ·  X-BX-Key = BX_SERVICE_KEY for everything else:
   GET  /api/bx/status /api/bx/candidates /api/bx/day?date= /api/bx-ui /api/bx/radar?tf= /api/bx/review /api/bx/shadow
+       /api/bx/rejects?date=YYYY-MM-DD   (rejection-reason log, read only; also summarised in /api/bx/day)
   POST /api/bx/decision   {decisions:[{symbol|coin, decision|action, type, rule, reason}], source:"claude"}
   POST /api/bx/breaker/reset  (header X-BX-Admin-Key = BX_ADMIN_KEY; MMT only)
 """
@@ -25,6 +26,7 @@ from __future__ import annotations
 import hmac
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -41,6 +43,7 @@ import bx_egress  # noqa: E402
 import bx_live  # noqa: E402
 
 OUT_DIR = Path(os.environ.get("BX_OUT_DIR") or (ROOT / "out"))
+DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 STEP_TIMEOUT_S = int(os.environ.get("BX_TIMEOUT_S", "480"))
 _lock = threading.Lock()
 _jobs: Dict[str, dict] = {}
@@ -57,16 +60,35 @@ def _step(script: str, args: List[str]) -> Dict[str, Any]:
                           text=True, timeout=STEP_TIMEOUT_S, env=env)
     for line in (proc.stderr or "").strip().splitlines()[-40:]:
         bx_live._log(f"  [{script}] {line}")
+    stdout = split_reject_lines(proc.stdout or "")
     try:
-        res = json.loads((proc.stdout or "").strip() or "{}")
+        res = json.loads(stdout.strip() or "{}")
     except json.JSONDecodeError:
-        lines = (proc.stdout or "").strip().splitlines()
+        lines = stdout.strip().splitlines()
         try:
             res = json.loads(lines[-1]) if lines else {}
         except json.JSONDecodeError:
-            res = {"status": "error", "message": (proc.stdout or "")[-300:]}
+            res = {"status": "error", "message": stdout[-300:]}
     res["_rc"] = proc.returncode
     return res
+
+
+def split_reject_lines(stdout: str) -> str:
+    """Re-emit the step's [BX_REJECT] lines on our stdout (Railway logs); return the rest (the JSON result)."""
+    keep = []
+    for line in stdout.splitlines(keepends=True):
+        if line.startswith(bx_live.REJECT_PREFIX):
+            try:
+                sys.stdout.write(line if line.endswith("\n") else line + "\n")
+            except Exception:  # noqa: BLE001
+                pass
+        else:
+            keep.append(line)
+    try:
+        sys.stdout.flush()
+    except Exception:  # noqa: BLE001
+        pass
+    return "".join(keep)
 
 
 def run_job(job: str) -> Dict[str, Any]:
@@ -238,7 +260,16 @@ class Handler(BaseHTTPRequestHandler):
             elif u.path == "/api/bx/day":
                 d = (parse_qs(u.query).get("date") or [bx_live.hkt_date(datetime.now(timezone.utc))])[0]
                 r = _read_json(f"bx_day/bx_day_{d.replace('-', '')}.json")
+                if r and DATE_RE.fullmatch(d):
+                    r["rejects"] = bx_live.reject_summary(d)
                 self._send(200 if r else 404, r or {"ok": False, "error": f"no BX day report for {d}"})
+            elif u.path == "/api/bx/rejects":
+                d = (parse_qs(u.query).get("date") or [bx_live.hkt_date(datetime.now(timezone.utc))])[0]
+                if not DATE_RE.fullmatch(d):
+                    self._send(400, {"ok": False, "error": "date must be YYYY-MM-DD"})
+                    return
+                recs = bx_live.read_rejects(d)
+                self._send(200, {"ok": True, "date": d, "count": len(recs), "rejects": recs})
             elif u.path == "/api/bx/candidates":
                 d = _read_json("bx_candidates_latest.json")
                 self._send(200 if d else 404, d or {"ok": False, "error": "no BX candidates yet (08:02 HKT)"})
