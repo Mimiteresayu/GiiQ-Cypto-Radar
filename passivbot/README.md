@@ -15,6 +15,23 @@ It does not touch the cockpit/radar app (root `Dockerfile`, `bx_live`, entry des
 > mode for Hyperliquid; its `fake` exchange is an offline scripted replay harness, not a
 > live paper account. Fund a dedicated small HL wallet. Live or > HK$500 still needs MMT.
 
+## HL demo / testnet: not available in this PR
+
+MMT asked for a Hyperliquid demo/testnet run if possible. At the pinned upstream commit
+`4e15b572` it is **not** a supported path:
+
+- Passivbot's Hyperliquid adapter defaults to **mainnet `api.hyperliquid.xyz`** (ccxt default
+  hostname). Upstream never calls ccxt `set_sandbox_mode`, and ccxt signs Hyperliquid actions
+  as mainnet unless sandbox mode is on.
+- The `api-keys.json` hyperliquid entry has **no first-class `is_testnet` / sandbox flag**.
+  Its only fields are `wallet_address`, `private_key` and `is_vault`.
+- Upstream has a generic `live.custom_endpoints_path` (REST domain/URL overrides). PR #42
+  **does not wire HL testnet** through it. A URL rewrite alone would still sign as mainnet,
+  so it is **unproven for this pilot**.
+
+**Launch path:** a small-funds **mainnet** wallet with a non-withdraw HL **API wallet** key,
+**BTC only** (`live.approved_coins.long = ["BTC"]`, `short = []`), WE 0.02, leverage 2.
+
 ## Hard locks (Cove gate C48-1)
 
 | Lock | Value | Enforced by guard |
@@ -33,7 +50,8 @@ The guard also rejects extra CLI args and `PB_CONFIG_INLINE` / `PB_EXCHANGE` / `
 `PB_API_SECRET`, since those could bypass the baked config. Hard SL / kill switch are not relaxed.
 
 Small-wallet settings (Cove confirmed 2026-10-05 20:03 HKT): `bot.long.risk.n_positions = 1`
-and `live.filter_by_min_effective_cost = false`. Strategy parameters are otherwise the
+and `live.filter_by_min_effective_cost = false`. Coins narrowed at Cove's request:
+`live.approved_coins = {"long": ["BTC"], "short": []}`. Strategy parameters are otherwise the
 upstream template's.
 
 ## Stop conditions (ops — check every spot-check)
@@ -72,6 +90,10 @@ DOGE and LINK, with a $10 minimum cost.
 |---|---|---|---|---|
 | $2,500 | $10.02–$11.33 (0.40–0.45% NAV) | 4–5 | $50.02–$60.30 (**2.0–2.4% NAV**) | 8% → OK |
 | $5,000 | $10.02–$11.33 (0.20–0.23% NAV) | 5–6 | $99.97–$110.11 (**2.0–2.2% NAV**) | 8% → OK |
+
+**BTC (the only approved coin):** first order $10.31 at both NAVs. At $2.5k it takes 5
+entries to reach a max of **$60.30 (2.41% NAV)**. At $5k it takes 5 entries to reach
+**$100.34 (2.01% NAV)**. The other coins are kept in the table as a sizing cross-check only.
 
 So the $10 minimum is **not** skipped, and the worst case stays far below 8% NAV. The
 overshoot above 2% comes from the final $10-minimum entry; quantity-step rounding causes the
