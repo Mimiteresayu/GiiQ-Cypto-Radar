@@ -12,6 +12,19 @@ header, the executor / pending run reports, the preflight JSON and `[DESK_DATA]`
 
 ---
 
+## DRAFT, not SoT: paper-only sizing profile (SoT id unchanged)
+Waits for Prism validation and MMT approval. With no env set, sizing is exactly GIIQ-SoT-4
+(`test_fixtures/sizing_sot4_golden.json`, `test_sizing_profile.py`).
+- `SOT2_MIN_LEV` (env, int 1–5, default 3): leverage floor of the step-down band.
+- `SIZING_PROFILE=lev1x_4pct`: isolated 1x, margin 2–4% NAV (AI = maximum, missing → 4%), so
+  notional = margin ≤ 4% NAV per trade. Tiny stays ≤ 2%; an ADD_ON on a position above 1x is refused.
+- Both are honoured only in DRY_RUN / paper. LIVE ignores them (and notes it) unless
+  `SIZING_ALLOW_LIVE=1` is also set (default off).
+- Unchanged: Hard SL, 20% NAV coin notional, 70% NAV / 80% utilisation margin caps, 3 entries/day,
+  SL distance, liq-beyond-SL, BX sizing.
+
+---
+
 ## GIIQ-SoT-4 (2026-10-03, MMT decision 2026-10-03 13:35–13:45 HKT via Harbor; AIQ-0022)
 HL executor + pending worker (shared `exec_common`). Bitunix (`bx_live.py`) is not touched: it has its
 own sizing (1% NAV / 3x pilot) and its caps are AIQ-0003.

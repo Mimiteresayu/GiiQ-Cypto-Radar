@@ -33,6 +33,7 @@ from exec_common import (  # noqa: E402
     SOT_ID,
     SOT2_MAX_LEV,
     SOT2_MIN_LEV,
+    sizing_params,
     min_order_usd,
     nav_snapshot,
     radar_rowcount_ok,
@@ -161,17 +162,22 @@ def run_preflight(hl: Any = None, signed_probe: bool = True, now: Optional[datet
         add("candidates", fresh, why, blocking=False)
         try:
             meta = hl.meta()
+            band = sizing_params()
+            lo, hi = band["min_lev"], band["max_lev"]
+            if (lo, hi) != (SOT2_MIN_LEV, SOT2_MAX_LEV) or band["ignored"]:
+                add("sizing_profile", True, f"{band['profile']} {lo}-{hi}x (not SoT)"
+                    + "".join(f"; {x}" for x in band["ignored"]), blocking=False)
             for sym, rec in sorted(approved.items()):
                 cm = meta.get(sym)
                 if not cm:
                     add(f"lev:{sym}", False, "not in HL meta (delisted/unknown)", blocking=False)
                     continue
                 ml = cm.get("maxLeverage") or 0
-                add(f"lev:{sym}", ml >= SOT2_MIN_LEV,
-                    f"{SOT_ID}: isolated {SOT2_MIN_LEV}-{min(SOT2_MAX_LEV, int(ml)) if ml else '?'}x chosen by risk at order "
+                add(f"lev:{sym}", ml >= lo,
+                    f"{SOT_ID}: isolated {lo}-{min(hi, int(ml)) if ml else '?'}x chosen by risk at order "
                     f"time (AI max {rec.get('leverage')}x / {rec.get('size_pct')}%; coin maxLeverage {ml:g})"
                     + (" (already held -> executor will skip)" if sym in held else "")
-                    + ("" if ml >= SOT2_MIN_LEV else f" -> maxLeverage < {SOT2_MIN_LEV}x: executor will SKIP"),
+                    + ("" if ml >= lo else f" -> maxLeverage < {lo}x: executor will SKIP"),
                     blocking=False)
         except Exception as e:  # noqa: BLE001
             add("meta", False, f"HL meta failed: {e}", blocking=False)

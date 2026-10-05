@@ -76,6 +76,55 @@ TINY_MAX_LEV = 3
 TINY_MAX_MARGIN_PCT = 2.0
 NON_TINY_TIERS = ("mega", "large", "small")
 
+# ---------------------------------------------------------------- sizing profiles (DRAFT, paper only)
+# Not SoT. Default = SoT-4 bands above, unchanged. Overrides are honoured only in DRY_RUN / paper;
+# a LIVE executor ignores them unless SIZING_ALLOW_LIVE=1 is set as well (default off).
+# - SOT2_MIN_LEV (env, int 1..SOT2_MAX_LEV, default 3): leverage floor of the step-down band.
+# - SIZING_PROFILE (env): named band. "lev1x_4pct" = isolated 1x, margin 2-4% NAV (AI = maximum,
+#   missing -> 4%), i.e. notional = margin = up to 4% NAV per trade.
+# Profiles only replace the leverage band: every cap (Tiny, 20% coin notional, 70%/80% margin, daily
+# entries, SL distance, liq-beyond-SL) still applies on top.
+SIZING_PROFILE_DEFAULT = "sot4"
+SIZING_PROFILES: Dict[str, Dict[str, Any]] = {
+    "sot4": {"min_lev": SOT2_MIN_LEV, "max_lev": SOT2_MAX_LEV},
+    "lev1x_4pct": {"min_lev": 1, "max_lev": 1},
+}
+
+
+def sizing_params(env: Optional[Dict[str, str]] = None, live: Optional[bool] = None) -> Dict[str, Any]:
+    """Effective leverage band for size_by_margin, read at call time.
+
+    Returns {"profile", "min_lev", "max_lev", "overrides_allowed", "ignored": [..]}; with no env set
+    (or LIVE without SIZING_ALLOW_LIVE=1) this is exactly the SoT-4 band 3-5x."""
+    env = os.environ if env is None else env
+    live = is_live_mode() if live is None else live
+    allow_live = (env.get("SIZING_ALLOW_LIVE") or "").strip().lower() in ("1", "true", "yes")
+    allowed = (not live) or allow_live
+    ignored: list = []
+    name = (env.get("SIZING_PROFILE") or "").strip().lower() or SIZING_PROFILE_DEFAULT
+    if name not in SIZING_PROFILES:
+        ignored.append(f"SIZING_PROFILE={name} unknown -> {SIZING_PROFILE_DEFAULT}")
+        name = SIZING_PROFILE_DEFAULT
+    if name != SIZING_PROFILE_DEFAULT and not allowed:
+        ignored.append(f"SIZING_PROFILE={name} ignored in LIVE (needs SIZING_ALLOW_LIVE=1)")
+        name = SIZING_PROFILE_DEFAULT
+    band = SIZING_PROFILES[name]
+    min_lev, max_lev = int(band["min_lev"]), int(band["max_lev"])
+    raw = (env.get("SOT2_MIN_LEV") or "").strip()
+    if raw:
+        try:
+            v = int(raw)
+        except ValueError:
+            v = None
+        if v is None or not 1 <= v <= SOT2_MAX_LEV:
+            ignored.append(f"SOT2_MIN_LEV={raw} invalid (int 1-{SOT2_MAX_LEV})")
+        elif v != SOT2_MIN_LEV and not allowed:
+            ignored.append(f"SOT2_MIN_LEV={v} ignored in LIVE (needs SIZING_ALLOW_LIVE=1)")
+        elif allowed:
+            min_lev = min(v, max_lev)
+    return {"profile": name, "min_lev": min_lev, "max_lev": max_lev, "overrides_allowed": allowed,
+            "ignored": ignored}
+
 
 def is_tiny_tier(tier: Optional[str]) -> bool:
     """True for Tiny and for any unknown / empty tier (unknown mcap = Tiny)."""
@@ -404,7 +453,7 @@ def build_run_report(run: str, result: Dict[str, Any], nav: Optional[dict] = Non
 def size_by_margin(nav: float, entry_px: float, hard_sl: float, coin_max_leverage: Optional[float],
                    ai_size_pct: Any = None, ai_leverage: Any = None, fixed_leverage: Optional[int] = None,
                    max_margin_pct: Optional[float] = None, liq_ref_px: Optional[float] = None,
-                   tier: Optional[str] = None) -> Dict[str, Any]:
+                   tier: Optional[str] = None, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """GIIQ-SoT-2: choose (leverage, margin %) for a LONG entry. Risk = the isolated margin.
 
     - margin = AI size clamped to 2-4% NAV (AI value = maximum; missing -> the 4% cap; an AI value
@@ -416,8 +465,15 @@ def size_by_margin(nav: float, entry_px: float, hard_sl: float, coin_max_leverag
     - tier (MMT 2026-10-03, AIQ-0022): when given and Tiny (or unknown), leverage is capped at
       TINY_MAX_LEV (3x) and margin at TINY_MAX_MARGIN_PCT (2% NAV); a Tiny ADD_ON whose existing
       leverage is above 3x is refused. tier=None keeps the old (tier-blind) behaviour.
+    - params (default sizing_params()): leverage band min_lev..max_lev (SoT-4: 3-5x). A non-default
+      profile adds a note, and an ADD_ON whose existing leverage is above the band max is refused.
     Returns {"ok", "leverage", "margin_pct", "notional_usd", "liq", "reason", "notes"}."""
-    notes: list = []
+    p = sizing_params() if params is None else params
+    min_lev, max_lev = int(p["min_lev"]), int(p["max_lev"])
+    custom = p.get("profile", SIZING_PROFILE_DEFAULT) != SIZING_PROFILE_DEFAULT or min_lev != SOT2_MIN_LEV
+    notes: list = list(p.get("ignored") or [])
+    if custom:
+        notes.append(f"sizing profile {p.get('profile')} {min_lev}-{max_lev}x (not SoT, paper)")
     if not nav or nav <= 0 or not entry_px or entry_px <= 0 or not hard_sl or hard_sl <= 0 or hard_sl >= entry_px:
         return {"ok": False, "reason": "sizing inputs invalid (NAV / entry / Hard SL)", "notes": notes}
     m = SOT2_MAX_MARGIN_PCT
@@ -434,26 +490,29 @@ def size_by_margin(nav: float, entry_px: float, hard_sl: float, coin_max_leverag
         m = TINY_MAX_MARGIN_PCT
     if m < SOT2_MIN_MARGIN_PCT - 1e-9:
         return {"ok": False, "reason": f"margin room {m:.2f}% < {SOT2_MIN_MARGIN_PCT:g}% minimum", "notes": notes}
-    coin_cap = int(math.floor(float(coin_max_leverage))) if coin_max_leverage and coin_max_leverage > 0 else SOT2_MAX_LEV
+    coin_cap = int(math.floor(float(coin_max_leverage))) if coin_max_leverage and coin_max_leverage > 0 else max_lev
     if fixed_leverage:
         if tiny and int(fixed_leverage) > TINY_MAX_LEV:
             return {"ok": False, "reason": (f"Tiny tier: existing leverage {int(fixed_leverage)}x > "
                                             f"{TINY_MAX_LEV}x cap"), "notes": notes}
+        if custom and int(fixed_leverage) > max_lev:
+            return {"ok": False, "reason": (f"sizing profile {p.get('profile')}: existing leverage "
+                                            f"{int(fixed_leverage)}x > {max_lev}x"), "notes": notes}
         levs = [int(fixed_leverage)]
     else:
         a_lev = _f(ai_leverage)
-        l_max = SOT2_MAX_LEV
+        l_max = max_lev
         if a_lev is not None and a_lev > 0:
-            if a_lev < SOT2_MIN_LEV:
-                notes.append(f"AI leverage {a_lev:g}x < {SOT2_MIN_LEV}x floor -> {SOT2_MIN_LEV}x")
-            l_max = min(l_max, max(SOT2_MIN_LEV, int(math.floor(a_lev + 1e-9))))
+            if a_lev < min_lev:
+                notes.append(f"AI leverage {a_lev:g}x < {min_lev}x floor -> {min_lev}x")
+            l_max = min(l_max, max(min_lev, int(math.floor(a_lev + 1e-9))))
         l_max = min(l_max, coin_cap)
         if tiny and l_max > TINY_MAX_LEV:
             notes.append(f"Tiny tier: leverage {l_max}x -> {TINY_MAX_LEV}x cap")
             l_max = TINY_MAX_LEV
-        if l_max < SOT2_MIN_LEV:
-            return {"ok": False, "reason": f"coin maxLeverage {coin_max_leverage} < {SOT2_MIN_LEV}x minimum", "notes": notes}
-        levs = list(range(l_max, SOT2_MIN_LEV - 1, -1))
+        if l_max < min_lev:
+            return {"ok": False, "reason": f"coin maxLeverage {coin_max_leverage} < {min_lev}x minimum", "notes": notes}
+        levs = list(range(l_max, min_lev - 1, -1))
     fails = []
     for L in levs:
         liq = isolated_liq_price_long(liq_ref_px or entry_px, L, coin_max_leverage)
