@@ -103,6 +103,8 @@ except ImportError:
 from exec_common import (  # noqa: E402
     SOT_ID,
     clamp_leverage,
+    entry_rerun_blocked,
+    exec_rerun_cutoff_hkt,
     hard_sl_for_tier,
     hkt_date,
     isolated_liq_price_long,
@@ -1614,13 +1616,35 @@ def _scheduled_preflight(manual: bool = False) -> dict:
     return res
 
 
+def _hkt_now() -> datetime:
+    return datetime.now(HKT)
+
+
+def _block_entry_rerun(job_name: str, manual: bool, now_hkt: datetime, cutoff: str, why: str) -> dict:
+    hhmm = now_hkt.astimezone(HKT).strftime("%H:%M")
+    mode = "DRY_RUN" if manual else _exec_mode()["mode"]
+    _update_job_status(job_name, "skipped", why)
+    _record_run_report(job_name, {"status": "blocked_after_cutoff", "run_report": {
+        "sot": SOT_ID, "run": job_name, "mode": mode, "status": "blocked_after_cutoff", "message": why,
+        "cutoff": cutoff, "now_hkt": hhmm, "executed": [], "skipped": [], "downsized": [], "failed": []}})
+    sys.stderr.write(f"[EXEC_GUARD] blocked {job_name} at {hhmm} HKT (cutoff {cutoff})\n")
+    return {"status": "blocked_after_cutoff", "cutoff": cutoff, "now_hkt": hhmm, "message": why}
+
+
 def _scheduled_executor(manual: bool = False, live_api: bool = False) -> dict:
     """08:55 HKT: execute AI-approved candidates.
 
     manual=True (password /api/jobs/run) is always DRY_RUN. live_api=True is the keyed
     POST /api/exec/run re-run: same executor.py, same env (LIVE iff EXEC_DRY_RUN=0), same
-    fail-closed checks; idempotent because executor skips coins already held."""
+    fail-closed checks; idempotent because executor skips coins already held.
+    Both non-scheduled paths are refused from EXEC_RERUN_CUTOFF_HKT (default 08:55) until midnight HKT;
+    the scheduled run (manual=False, live_api=False) is never blocked."""
     job_name = "api_exec_run" if live_api else ("manual_executor" if manual else "executor")
+    if manual or live_api:
+        now_hkt, cutoff = _hkt_now(), exec_rerun_cutoff_hkt()
+        blocked, why = entry_rerun_blocked(now_hkt, cutoff)
+        if blocked:
+            return _block_entry_rerun(job_name, manual and not live_api, now_hkt, cutoff, why)
     res: dict = {}
     if not _exec_lock.acquire(timeout=5):
         _update_job_status(job_name, "skipped", "another executor pass is running")
@@ -2353,6 +2377,16 @@ class Handler(SimpleHTTPRequestHandler):
                                       ("ts", "n_wallets", "n_manual", "errors", "wallets")} if snap else None,
                                       "coins": snap.get("coins") if snap else None, "watchlist": wl})
             return
+        if path == "/api/bx/rejects":
+            # keyed, read-only: one HKT day's BX rejection-reason log from bx-exec (only ?date= is forwarded)
+            if self._ai_key_ok():
+                day = (parse_qs(parsed.query).get("date") or [""])[0] or datetime.now(HKT).strftime("%Y-%m-%d")
+                if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
+                    self._send_json(400, {"ok": False, "error": "date must be YYYY-MM-DD"})
+                    return
+                code, d = _bx_service("/api/bx/rejects?" + urlencode({"date": day}))
+                self._send_json(code, d)
+            return
         if path in ("/api/bx/radar", "/api/bx/shadow", "/api/bx/review", "/api/bx/status", "/api/bx/day"):
             # keyed, read-only BX shadow data (Claude weekly review of unknown-class contracts, reports)
             if self._ai_key_ok():
@@ -2829,7 +2863,8 @@ class Handler(SimpleHTTPRequestHandler):
         """POST /api/exec/run (keyed, X-AI-Key): run executor.py ONCE for today's (HKT) stored
         decisions with the service env (LIVE iff EXEC_DRY_RUN=0). Same fail-closed checks as the
         08:55 cron (fresh candidates, liq beyond Hard SL, 80% margin cap, SoT bands); idempotent
-        (coins already held are skipped). Optional body {"date": "YYYY-MM-DD"} must equal today HKT."""
+        (coins already held are skipped). Optional body {"date": "YYYY-MM-DD"} must equal today HKT.
+        From EXEC_RERUN_CUTOFF_HKT (default 08:55) until midnight HKT -> 409 blocked_after_cutoff."""
         if not self._ai_key_ok():
             return
         length = int(self.headers.get("Content-Length") or 0)
@@ -2844,6 +2879,9 @@ class Handler(SimpleHTTPRequestHandler):
             self._send_json(400, {"ok": False, "error": f"only today's decisions can run (today HKT={today})"})
             return
         res = _scheduled_executor(live_api=True)
+        if res.get("status") == "blocked_after_cutoff":
+            self._send_json(409, {"ok": False, **res})
+            return
         if res.get("status") == "busy":
             self._send_json(409, {"ok": False, **res})
             return

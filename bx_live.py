@@ -261,6 +261,107 @@ def bx_equity(account: dict) -> float:
 
 
 # ---------------------------------------------------------------------------------------------
+# rejection-reason log (W40): one [BX_REJECT] stdout line + one JSON line per rejected candidate
+# ---------------------------------------------------------------------------------------------
+# Stable codes next to the free-text reasons (the text is unchanged). COLOR_1D / COLOR_4H are reserved:
+# no 1D/4H colour check rejects a candidate in this module today (colours only shape the signal upstream).
+REJECT_CODES = ("LIQ_TIER", "SPREAD", "VOL24H", "COLOR_1D", "COLOR_4H", "BREAKER", "GATE", "NO_APPROVAL",
+                "MAX_OPEN", "DAILY_CAP", "ALREADY_HELD", "PENDING", "PRICE_SANITY", "NO_SL", "SL_DIST", "NAV",
+                "MARGIN_AVAILABLE", "MIN_QTY", "LIQ_VS_SL", "MARKET_DATA", "ORDER_ERROR", "NOT_ELIGIBLE_OTHER")
+REJECT_PREFIX = "[BX_REJECT] "
+REJECT_KEEP_DAYS = 14
+
+
+def reject_path(day: str) -> Path:
+    return OUT_DIR / "bx_reject" / f"bx_reject_{day}.jsonl"
+
+
+def _redact(text: str) -> str:
+    try:
+        from bx_trade import redact
+        return redact(text)
+    except Exception:  # pragma: no cover
+        return text
+
+
+def gate_code(why: List[str]) -> str:
+    return "BREAKER" if any(str(w).startswith("circuit breaker") for w in why or []) else "GATE"
+
+
+def reject_values(cand: Optional[dict] = None, meta: Optional[dict] = None, live: Optional[dict] = None,
+                  **extra: Any) -> Dict[str, Any]:
+    c, m, lv = cand or {}, meta or {}, live or {}
+    spread = _f(lv.get("spread_bp")) if lv.get("spread_bp") is not None else _f(m.get("spread_bp", c.get("spread_bp")))
+    vol = _f(lv.get("vol24h")) if lv.get("vol24h") is not None else _f(m.get("vol24h_usd", c.get("vol24h_usd")))
+    price, sl = _f(lv.get("price")), _f(c.get("hard_sl"))
+    v = {"spread_bp": spread, "vol24h": vol, "tier": c.get("tier") or m.get("tier"), "liq_tier": m.get("liq_tier"),
+         "gc_tf": c.get("gc_tf") or m.get("gc_tf"), "trend_1d": c.get("trend_1d"), "trend_4h": c.get("trend_4h"),
+         "sl_dist_pct": (round((price - sl) / price * 100, 3) if price and sl else c.get("sl_dist_pct")),
+         "price": price, **extra}
+    return {k: x for k, x in v.items() if x is not None}
+
+
+def log_reject(job: str, stage: str, cand: dict, code: str, reason: str, now: datetime,
+               values: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Never raises: a log or file failure must not change a trading decision."""
+    rec = {"date": hkt_date(now), "ts": now.isoformat(), "job": job, "symbol": (cand or {}).get("symbol"),
+           "type": (cand or {}).get("type"), "stage": stage, "code": code, "reason": reason, "values": values or {}}
+    try:
+        line = _redact(json.dumps(rec, default=str, separators=(",", ":")))
+    except Exception as e:  # noqa: BLE001
+        _log(f"[BX_REJECT] encode failed: {str(e)[:120]}")
+        return rec
+    try:
+        sys.stdout.write(REJECT_PREFIX + line + "\n")
+        sys.stdout.flush()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        p = reject_path(rec["date"])
+        new = not p.exists()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+        if new:
+            prune_rejects(now)
+    except Exception as e:  # noqa: BLE001
+        _log(f"[BX_REJECT] write failed: {str(e)[:120]}")
+    return rec
+
+
+def prune_rejects(now: datetime, keep_days: int = REJECT_KEEP_DAYS) -> None:
+    oldest = (now.astimezone(HKT) - timedelta(days=keep_days - 1)).strftime("%Y-%m-%d")
+    try:
+        for p in (OUT_DIR / "bx_reject").glob("bx_reject_*.jsonl"):
+            if p.stem[len("bx_reject_"):] < oldest:
+                p.unlink()
+    except Exception as e:  # noqa: BLE001
+        _log(f"[BX_REJECT] prune failed: {str(e)[:120]}")
+
+
+def read_rejects(day: str) -> List[dict]:
+    out = []
+    try:
+        with open(reject_path(day), encoding="utf-8") as f:
+            for line in f:
+                try:
+                    out.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except OSError:
+        pass
+    return out
+
+
+def reject_summary(day: str) -> Dict[str, Any]:
+    by: Dict[str, int] = {}
+    recs = read_rejects(day)
+    for r in recs:
+        by[str(r.get("code"))] = by.get(str(r.get("code")), 0) + 1
+    return {"count": len(recs), "by_code": by, "link": f"/api/bx/rejects?date={day}"}
+
+
+# ---------------------------------------------------------------------------------------------
 # candidates for ENTRY_DESK + decisions
 # ---------------------------------------------------------------------------------------------
 def candidates_path() -> Path:
@@ -271,25 +372,31 @@ def decisions_path(day: str) -> Path:
     return OUT_DIR / "bx_decisions" / f"bx_decisions_{day.replace('-', '')}.json"
 
 
-def pilot_eligible(meta: dict) -> Tuple[bool, str]:
+def pilot_eligible_coded(meta: dict) -> Tuple[bool, str, str]:
+    """-> (ok, reject code, reason text)."""
     if meta.get("ex") != "BX":
-        return False, "listed on HL (HL path only)"
+        return False, "NOT_ELIGIBLE_OTHER", "listed on HL (HL path only)"
     if meta.get("asset_class") != "crypto":
-        return False, f"asset class {meta.get('asset_class')} (no stocks / commodities / indices)"
+        return False, "NOT_ELIGIBLE_OTHER", f"asset class {meta.get('asset_class')} (no stocks / commodities / indices)"
     if meta.get("liq_tier") != "tradeable":
-        return False, f"tier {meta.get('liq_tier')} (entry tier only)"
+        return False, "LIQ_TIER", f"tier {meta.get('liq_tier')} (entry tier only)"
     if (meta.get("vol24h_usd") or 0) < VOL_MIN:
-        return False, "24h volume < $2M"
+        return False, "VOL24H", "24h volume < $2M"
     sp = _f(meta.get("spread_bp"))
     if sp is None or sp >= SPREAD_MAX_BP:
-        return False, f"spread {sp} bp not < {SPREAD_MAX_BP:g}"
+        return False, "SPREAD", f"spread {sp} bp not < {SPREAD_MAX_BP:g}"
     if meta.get("gc_tf") not in LIVE_GC_TFS:
-        return False, f"GC timeframe {meta.get('gc_tf')} (no 1H signals)"
+        return False, "NOT_ELIGIBLE_OTHER", f"GC timeframe {meta.get('gc_tf')} (no 1H signals)"
     if meta.get("api_supported") is False:
-        return False, "API trading not supported on this contract"
+        return False, "NOT_ELIGIBLE_OTHER", "API trading not supported on this contract"
     if meta.get("max_leverage") is not None and (_f(meta.get("max_leverage")) or 0) < LEVERAGE:
-        return False, "max leverage < 3x"
-    return True, ""
+        return False, "NOT_ELIGIBLE_OTHER", "max leverage < 3x"
+    return True, "", ""
+
+
+def pilot_eligible(meta: dict) -> Tuple[bool, str]:
+    ok, _, why = pilot_eligible_coded(meta)
+    return ok, why
 
 
 def build_candidates(now: Optional[datetime] = None) -> dict:
@@ -304,11 +411,14 @@ def build_candidates(now: Optional[datetime] = None) -> dict:
         s = S.classify_signal(m, r1d.get(sym), r4h.get(sym), None)
         if not s or s["gc_tf"] not in LIVE_GC_TFS:
             continue
-        ok, why = pilot_eligible(m)
-        if not ok:
-            skipped.append({"symbol": sym, "type": s["type"], "reason": why})
-            continue
+        ok, code, why = pilot_eligible_coded(m)
         row1, row4 = r1d.get(sym) or {}, r4h.get(sym) or {}
+        if not ok:
+            skipped.append({"symbol": sym, "type": s["type"], "reason": why, "code": code})
+            log_reject("candidates", "eligibility", {"symbol": sym, "type": s["type"]}, code, why, now,
+                       reject_values({"gc_tf": s["gc_tf"], "trend_1d": row1.get("trend"),
+                                      "trend_4h": row4.get("trend")}, m))
+            continue
         sl, sl_rule = S.hard_sl(m.get("tier") or "tiny", s["type"], s["gc_tf"], row4, None)
         close = _f(m.get("price")) or _f(s["row"].get("close"))
         last_cross = row1.get("last_cross_up_at")
@@ -410,38 +520,38 @@ def check_entry(cand: dict, meta: dict, live: dict, nav: Optional[float], availa
     """Pure pilot checks for one entry. live = {price, ask, bid, spread_bp, vol24h}. -> {ok, reason, plan}."""
     sym = cand["symbol"]
 
-    def no(reason: str) -> Dict[str, Any]:
-        return {"ok": False, "symbol": sym, "reason": reason}
+    def no(reason: str, code: str) -> Dict[str, Any]:
+        return {"ok": False, "symbol": sym, "reason": reason, "code": code}
     if not approval:
-        return no("no ENTRY_DESK approval today (no approval -> no order)")
-    ok, why = pilot_eligible(meta)
+        return no("no ENTRY_DESK approval today (no approval -> no order)", "NO_APPROVAL")
+    ok, code, why = pilot_eligible_coded(meta)
     if not ok:
-        return no(why)
+        return no(why, code)
     if len(open_live) >= MAX_OPEN:
-        return no(f"{len(open_live)} BX positions open (max {MAX_OPEN})")
+        return no(f"{len(open_live)} BX positions open (max {MAX_OPEN})", "MAX_OPEN")
     if any(t.get("bx_symbol") == sym for t in open_live):
-        return no("already holding this contract")
+        return no("already holding this contract", "ALREADY_HELD")
     if entries_today >= MAX_NEW_PER_DAY:
-        return no(f"{entries_today} new BX entry already today (max {MAX_NEW_PER_DAY})")
+        return no(f"{entries_today} new BX entry already today (max {MAX_NEW_PER_DAY})", "DAILY_CAP")
     price, ask = _f(live.get("price")), _f(live.get("ask")) or _f(live.get("price"))
     if not price or not ask:
-        return no("no live price")
+        return no("no live price", "MARKET_DATA")
     if (live.get("vol24h") or 0) < VOL_MIN:
-        return no(f"live 24h vol {live.get('vol24h')} < $2M")
+        return no(f"live 24h vol {live.get('vol24h')} < $2M", "VOL24H")
     sp = _f(live.get("spread_bp"))
     if sp is None or sp >= SPREAD_MAX_BP:
-        return no(f"live spread {sp} bp not < {SPREAD_MAX_BP:g}")
+        return no(f"live spread {sp} bp not < {SPREAD_MAX_BP:g}", "SPREAD")
     ref = _f(cand.get("close"))
     if ref and abs(price / ref - 1) > PRICE_SANITY:
-        return no(f"price {price} vs radar {ref}: > 50% apart")
+        return no(f"price {price} vs radar {ref}: > 50% apart", "PRICE_SANITY")
     sl = _f(cand.get("hard_sl"))
     if not sl or sl >= price:
-        return no(f"no valid Hard SL ({cand.get('hard_sl_rule')}={sl})")
+        return no(f"no valid Hard SL ({cand.get('hard_sl_rule')}={sl})", "NO_SL")
     dist = (price - sl) / price * 100
     if dist < MIN_SL_DIST_PCT:
-        return no(f"Hard SL only {dist:.2f}% below price (< {MIN_SL_DIST_PCT}%)")
+        return no(f"Hard SL only {dist:.2f}% below price (< {MIN_SL_DIST_PCT}%)", "SL_DIST")
     if not nav or nav <= 0:
-        return no("NAV unavailable (HL NAV + BX equity)")
+        return no("NAV unavailable (HL NAV + BX equity)", "NAV")
     margin = MARGIN_PCT_NAV / 100.0 * nav
     notional = margin * LEVERAGE
     note = ""
@@ -449,18 +559,18 @@ def check_entry(cand: dict, meta: dict, live: dict, nav: Optional[float], availa
     if notional > cap:
         notional, margin, note = cap, cap / LEVERAGE, f"downsized to 0.5% of 24h vol (${cap:,.0f})"
     if available is not None and margin > available:
-        return no(f"BX available {available:.2f} USDT < margin {margin:.2f}")
+        return no(f"BX available {available:.2f} USDT < margin {margin:.2f}", "MARGIN_AVAILABLE")
     bp = int(meta.get("base_precision") or 0)
     qp = int(meta.get("quote_precision") or 8)
     qty = floor_to(notional / ask, bp)
     min_qty = _f(meta.get("min_qty")) or 0.0
     if qty <= 0 or qty < min_qty:
-        return no(f"qty {qty} below the minimum {min_qty}")
+        return no(f"qty {qty} below the minimum {min_qty}", "MIN_QTY")
     mmr = mmr_for(tiers, qty * ask)
     limit_px = floor_to(ask * (1 + IOC_SLIP), qp)
     liq = liq_price_long(limit_px, LEVERAGE, mmr)
     if liq >= sl:
-        return no(f"estimated liq {liq:.6g} not below Hard SL {sl:.6g} at {LEVERAGE}x")
+        return no(f"estimated liq {liq:.6g} not below Hard SL {sl:.6g} at {LEVERAGE}x", "LIQ_VS_SL")
     sl_px = floor_to(sl, qp)
     return {"ok": True, "symbol": sym, "reason": note or "ok",
             "plan": {"qty": fmt(qty, bp), "limit_price": fmt(limit_px, qp), "sl_price": fmt(sl_px, qp),
@@ -689,7 +799,10 @@ def run_entries(now: Optional[datetime] = None, trade_api=None, egress: Optional
     cand_doc = _read(candidates_path()) or {}
     cands = cand_doc.get("candidates") or [] if cand_doc.get("date") == hkt_date(now) else []
     if not ok:
-        rep["skipped"] = [{"symbol": c["symbol"], "reason": "; ".join(why)} for c in cands]
+        code = gate_code(why)
+        rep["skipped"] = [{"symbol": c["symbol"], "reason": "; ".join(why), "code": code} for c in cands]
+        for c in cands:
+            log_reject("entries", "gate", c, code, "; ".join(why), now, reject_values(c))
         _log(f"[BX_LIVE] entries not sent: {'; '.join(why)}")
         return rep
     own = conn is None
@@ -701,6 +814,8 @@ def run_entries(now: Optional[datetime] = None, trade_api=None, egress: Optional
         except Exception as e:  # noqa: BLE001  bad key / IP not whitelisted / down -> refuse
             rep["live"] = False
             rep["gate"] = [f"signed account read failed: {str(e)[:160]}"]
+            for c in cands:
+                log_reject("entries", "gate", c, "GATE", rep["gate"][0], now, reject_values(c))
             return rep
         hl = nav_fn()
         nav = (hl + bx_equity(acct)) if hl else None
@@ -711,10 +826,16 @@ def run_entries(now: Optional[datetime] = None, trade_api=None, egress: Optional
         for c in cands:
             appr = approval_for(c["symbol"], now)
             if not appr:
-                rep["skipped"].append({"symbol": c["symbol"], "reason": "no ENTRY_DESK approval"})
+                rep["skipped"].append({"symbol": c["symbol"], "reason": "no ENTRY_DESK approval", "code": "NO_APPROVAL"})
+                log_reject("entries", "approval", c, "NO_APPROVAL", "no ENTRY_DESK approval", now,
+                           reject_values(c, meta_all.get(c["symbol"])))
                 continue
             if c["type"] == "Chase":
-                rep["pending"].append(create_live_pending(pend, c, appr, now))
+                p = create_live_pending(pend, c, appr, now)
+                rep["pending"].append(p)
+                log_reject("entries", "pending_create", c, "PENDING",
+                           "Chase -> live pending (enters only on a confirmed 1D pullback)", now,
+                           reject_values(c, meta_all.get(c["symbol"]), created=p.get("created")))
                 continue
             _try_enter(api, conn, c, meta_all, acct, nav, now, market, tiers_fn, rep)
         save_live_pending(pend)
@@ -724,23 +845,30 @@ def run_entries(now: Optional[datetime] = None, trade_api=None, egress: Optional
     return rep
 
 
+def _skip(rep: Dict[str, Any], c: dict, code: str, reason: str, job: str, stage: str, now: datetime,
+          meta: Optional[dict] = None, live: Optional[dict] = None, with_code: bool = True) -> None:
+    rep["skipped"].append({"symbol": c["symbol"], "reason": reason, **({"code": code} if with_code else {})})
+    log_reject(job, stage, c, code, reason, now, reject_values(c, meta, live))
+
+
 def _try_enter(api, conn, c, meta_all, acct, nav, now, market, tiers_fn, rep, kind=None) -> bool:
     meta = meta_all.get(c["symbol"]) or {}
+    job = rep.get("job") or "entries"
     try:
         live = market(c["symbol"])
         tiers = tiers_fn(c["symbol"])
     except Exception as e:  # noqa: BLE001
-        rep["skipped"].append({"symbol": c["symbol"], "reason": f"market data failed: {str(e)[:120]}"})
+        _skip(rep, c, "MARKET_DATA", f"market data failed: {str(e)[:120]}", job, "market_data", now, meta)
         return False
     chk = check_entry(c, meta, live, nav, _f(acct.get("available")), open_live_trades(conn),
                       live_entries_today(conn, now), approval_for(c["symbol"], now), tiers)
     if not chk["ok"]:
-        rep["skipped"].append({"symbol": c["symbol"], "reason": chk["reason"]})
+        _skip(rep, c, chk["code"], chk["reason"], job, "check_entry", now, meta, live)
         return False
     try:
         res = execute_entry(api, c, meta, chk["plan"], now, conn, counted=True, kind=kind)
     except Exception as e:  # noqa: BLE001
-        rep["skipped"].append({"symbol": c["symbol"], "reason": f"order error: {str(e)[:160]}"})
+        _skip(rep, c, "ORDER_ERROR", f"order error: {str(e)[:160]}", job, "order", now, meta, live)
         _log(f"[BX_ALERT] {c['symbol']} order error: {str(e)[:160]}")
         return False
     rep["entered"].append(res)
@@ -814,14 +942,15 @@ def run_manage(job: str, now: Optional[datetime] = None, trade_api=None, egress:
             egress = egress if egress is not None else bx_egress.check()
             ok, why = live_gate(egress, bx_trade.keys_present(), breaker_state())
             rep["pending"] = run_live_pending(api, conn, now, ok, why, meta_all, acct, nav, market,
-                                              tiers_fn or bx_trade.position_tiers)
+                                              tiers_fn or bx_trade.position_tiers, job=job)
     finally:
         if own:
             conn.close()
     return rep
 
 
-def run_live_pending(api, conn, now, gate_ok, gate_why, meta_all, acct, nav, market, tiers_fn) -> List[dict]:
+def run_live_pending(api, conn, now, gate_ok, gate_why, meta_all, acct, nav, market, tiers_fn,
+                     job: str = "4h") -> List[dict]:
     import bx_radar
     import bx_shadow as S
     from pending_entries import evaluate
@@ -839,36 +968,43 @@ def run_live_pending(api, conn, now, gate_ok, gate_why, meta_all, acct, nav, mar
         action, reason, upd = evaluate(rec, bnd, mid, now, held, bar)
         rec.update(upd)
         rec["last_check"] = now.isoformat()
+        c = dict(rec.get("cand") or {"symbol": sym})
+        c.setdefault("symbol", sym)
         if action in ("expire", "cancel"):
             rec["status"] = "expired" if action == "expire" else "cancelled"
         elif action == "trigger":
             if not gate_ok:
                 reason += f" | not sent: {'; '.join(gate_why)}"
+                log_reject(job, "gate", c, gate_code(gate_why), "; ".join(gate_why), now,
+                           reject_values(c, meta_all.get(sym), action=action))
             else:
-                c = dict(rec.get("cand") or {"symbol": sym})
                 sub: Dict[str, Any] = {"skipped": [], "entered": []}
                 # the approval is the one given when the pending was created
-                if _try_enter_pending(api, conn, c, meta_all, acct, nav, now, market, tiers_fn, sub, rec):
+                if _try_enter_pending(api, conn, c, meta_all, acct, nav, now, market, tiers_fn, sub, rec, job=job):
                     rec["status"] = "filled"
                 reason += f" | {sub}"
+        if action != "trigger":
+            log_reject(job, "pending_eval", c, "PENDING", reason, now,
+                       reject_values(c, meta_all.get(sym), action=action, pending_id=rec.get("id")))
         out.append({"symbol": sym, "action": action, "reason": reason[:300]})
     save_live_pending(pend)
     return out
 
 
-def _try_enter_pending(api, conn, c, meta_all, acct, nav, now, market, tiers_fn, rep, rec) -> bool:
+def _try_enter_pending(api, conn, c, meta_all, acct, nav, now, market, tiers_fn, rep, rec, job: str = "4h") -> bool:
     meta = meta_all.get(c["symbol"]) or {}
     try:
         live = market(c["symbol"])
         tiers = tiers_fn(c["symbol"])
     except Exception as e:  # noqa: BLE001
-        rep["skipped"].append({"symbol": c["symbol"], "reason": f"market data failed: {str(e)[:120]}"})
+        _skip(rep, c, "MARKET_DATA", f"market data failed: {str(e)[:120]}", job, "market_data", now, meta,
+              with_code=False)
         return False
     approval = {"decision": "approve", "source": "claude", "ts": rec.get("approved_at")} if rec.get("approved_at") else None
     chk = check_entry(c, meta, live, nav, _f(acct.get("available")), open_live_trades(conn),
                       live_entries_today(conn, now), approval, tiers)
     if not chk["ok"]:
-        rep["skipped"].append({"symbol": c["symbol"], "reason": chk["reason"]})
+        _skip(rep, c, chk["code"], chk["reason"], job, "check_entry", now, meta, live, with_code=False)
         return False
     res = execute_entry(api, c, meta, chk["plan"], now, conn, counted=True, kind="Chase")
     rep["entered"].append(res)

@@ -718,7 +718,9 @@ class TestSchedulerStatus(unittest.TestCase):
         def fake_run(script, args, timeout, force_dry_run=False):
             seen["force"] = force_dry_run
             return 0, json.dumps({"status": "fail_closed"}), ""
-        with patch.object(self.serve, "_run_worker", side_effect=fake_run):
+        before_cutoff = datetime(2026, 10, 5, 8, 0, tzinfo=self.serve.HKT)
+        with patch.object(self.serve, "_run_worker", side_effect=fake_run), \
+                patch.object(self.serve, "_hkt_now", return_value=before_cutoff):
             self.serve._scheduled_executor(manual=True)
         self.assertTrue(seen["force"])
         self.assertIn("manual_executor", self.serve._get_scheduler_status())
