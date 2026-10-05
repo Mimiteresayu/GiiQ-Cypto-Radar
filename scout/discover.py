@@ -489,8 +489,14 @@ def generate_summary(data):
         lines.append('')
         for c in passes[:3]:  # limit to top 3
             s = c['screen_result']
+            beta_share = s.get('beta_share_of_pnl')
+            net_long = s.get('net_long_time')
+            mdd_alltime = s.get('mdd_alltime')
+            beta_str = f"{beta_share*100:.0f}%" if beta_share is not None else 'n/a'
+            net_long_str = f"{net_long*100:.0f}%" if net_long is not None else 'n/a'
+            mdd_alltime_str = f"{mdd_alltime*100:.0f}%" if mdd_alltime is not None else 'n/a'
             lines.append(f"**{c['name']}** (`{c['address'][:10]}...`)")
-            lines.append(f"- Copy PF: {s.get('pf_copy_full', 'n/a')}, Beta share: {s.get('beta_share_of_pnl', 0)*100:.0f}%, Net long: {s.get('net_long_time', 0)*100:.0f}%, MDD: {s.get('mdd_alltime', 0)*100:.0f}%")
+            lines.append(f"- Copy PF: {s.get('pf_copy_full', 'n/a')}, Beta share: {beta_str}, Net long: {net_long_str}, MDD: {mdd_alltime_str}")
             mdd_str = 'n/a (sparse data)' if c.get('mdd_sparse') else f"{c['mdd']*100:.1f}%"
             lines.append(f"- TVL: ${c['tvl']:,.0f}, 90d return: {c['return_90d']*100:.1f}%, MDD: {mdd_str}")
             lines.append('')
@@ -507,7 +513,13 @@ def generate_summary(data):
             lines.append(f"**{c['name']}** (`{c['address'][:10]}...`)")
             lines.append(f"- {c['suspect_reason']}")
             if s:
-                lines.append(f"- Copy PF: {s.get('pf_copy_full', 'n/a')}, Beta share: {s.get('beta_share_of_pnl', 0)*100:.0f}%, Net long: {s.get('net_long_time', 0)*100:.0f}%, MDD: {s.get('mdd_alltime', 0)*100:.0f}%")
+                beta_share = s.get('beta_share_of_pnl')
+                net_long = s.get('net_long_time')
+                mdd_alltime = s.get('mdd_alltime')
+                beta_str = f"{beta_share*100:.0f}%" if beta_share is not None else 'n/a'
+                net_long_str = f"{net_long*100:.0f}%" if net_long is not None else 'n/a'
+                mdd_alltime_str = f"{mdd_alltime*100:.0f}%" if mdd_alltime is not None else 'n/a'
+                lines.append(f"- Copy PF: {s.get('pf_copy_full', 'n/a')}, Beta share: {beta_str}, Net long: {net_long_str}, MDD: {mdd_alltime_str}")
             mdd_str = 'n/a (sparse data)' if c.get('mdd_sparse') else f"{c.get('mdd', 0)*100:.1f}%"
             lines.append(f"- TVL: ${c['tvl']:,.0f}, 90d return: {c['return_90d']*100:.1f}%, MDD: {mdd_str}")
             lines.append('')
