@@ -9,6 +9,7 @@ entry_candidates.py or hl_exec.py (enforced by test_bx_isolation.py).
   asset_class()       crypto | stock | commodity | index_etf | unknown (fail-closed: unknown never counts)
   listing_age()       contract_age_days, new_contract, asset_first_seen, asset_age
   liq_tier()          tradeable | watch | exclude
+  trial_config()      BX_TRIAL_* live-pilot trial tier (watch tier, $0.3M-$2M; off by default)
   ignition()          24h USD volume / mean of the 7 prior closed 1D bars
   gc_tf_for()         longest GC timeframe the bar history supports (1d > 4h > 1h > none)
   shadow_slippage_bp  max(5 bp, spread / 2)
@@ -16,6 +17,7 @@ entry_candidates.py or hl_exec.py (enforced by test_bx_isolation.py).
 """
 from __future__ import annotations
 
+import os
 import re
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -38,6 +40,15 @@ CG_PX_TOL = 0.05               # BX vs CoinGecko price agreement for a CoinGecko
 GC_PERIOD = {"1d": 144, "4h": 72, "1h": 48}
 GC_WARMUP = 20
 COUNTED_GC_TFS = ("1d", "4h")  # Harbor: gc_tf=1h signals are watch-only, excluded from the 30-signal test
+
+# Live-pilot 'trial' tier (sized-risk trial, needs MMT): watch-tier coins with $0.3M-$2M 24h volume.
+# Off unless BX_TRIAL_TIER_ENABLED=1; a missing or out-of-range variable falls back to its default.
+# 20 bp default spread: of the 11 BX-only contracts >= $2M on 10/5, 9 were <= 20 bp (12.17 and 20.46 failed the
+# 10 bp rule, 36.13 was the outlier), and it leaves 10 bp below the 30 bp live liquidity exit so a trial entry
+# is not closed by ordinary spread noise. Half-spread cost at 20 bp is 10 bp a side against a >= 1.5% Hard SL.
+TRIAL_DEFAULTS = {"enabled": False, "min_vol_usd": 300_000.0, "max_spread_bp": 20.0, "size_mult": 0.5,
+                  "max_per_day": 1}
+TRIAL_SPREAD_CAP_BP = 30.0     # = bx_live.LIQ_EXIT_SPREAD_BP: a wider entry would be a liquidity exit at once
 
 ASSET_CLASSES = ("crypto", "stock", "commodity", "index_etf", "unknown")
 TRADFI = ("stock", "commodity", "index_etf")
@@ -224,6 +235,59 @@ def liq_tier(vol24h: Optional[float], status: str, delist_ms: Optional[int], cls
     if v >= VOL_WATCH_MIN or ign:
         return "watch"
     return "exclude"
+
+
+def trial_config(env: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    """BX_TRIAL_* variables -> {enabled, min_vol_usd, max_spread_bp, size_mult, max_per_day, invalid}."""
+    env = env if env is not None else dict(os.environ)
+    cfg: Dict[str, Any] = dict(TRIAL_DEFAULTS)
+    invalid: List[str] = []
+    cfg["enabled"] = (env.get("BX_TRIAL_TIER_ENABLED") or "").strip().lower() in ("1", "true", "yes", "on")
+
+    def num(name: str, key: str, ok, cast=float) -> None:
+        raw = (env.get(name) or "").strip()
+        if not raw:
+            return
+        try:
+            v = cast(float(raw)) if cast is int else cast(raw)
+            if cast is int and float(raw) != v:
+                raise ValueError
+        except (TypeError, ValueError):
+            invalid.append(name)
+            return
+        if v != v or not ok(v):
+            invalid.append(name)
+            return
+        cfg[key] = v
+    num("BX_TRIAL_MIN_VOL_USD", "min_vol_usd", lambda v: VOL_WATCH_MIN <= v < VOL_TRADEABLE)
+    num("BX_TRIAL_MAX_SPREAD_BP", "max_spread_bp", lambda v: 0 < v <= TRIAL_SPREAD_CAP_BP)
+    num("BX_TRIAL_SIZE_MULT", "size_mult", lambda v: 0 <= v <= 1)
+    num("BX_TRIAL_MAX_PER_DAY", "max_per_day", lambda v: v >= 0, cast=int)
+    cfg["invalid"] = invalid
+    return cfg
+
+
+def trial_fail(meta: dict, cfg: Optional[Dict[str, Any]]) -> Optional[str]:
+    """None when a watch-tier contract qualifies for the trial tier, else why not."""
+    if not cfg or not cfg.get("enabled"):
+        return "trial tier off"
+    if meta.get("liq_tier") != "watch":
+        return f"tier {meta.get('liq_tier')}"
+    v = _f(meta.get("vol24h_usd")) or 0.0
+    if v < cfg["min_vol_usd"]:
+        return f"24h volume < ${cfg['min_vol_usd'] / 1e6:g}M"
+    if v >= VOL_TRADEABLE:
+        return "24h volume >= $2M (tradeable rules apply)"
+    sp = _f(meta.get("spread_bp"))
+    if sp is None or sp >= cfg["max_spread_bp"]:
+        return f"spread {sp} bp not < {cfg['max_spread_bp']:g}"
+    return None
+
+
+def spread_fetch_min_vol(cfg: Optional[Dict[str, Any]] = None) -> float:
+    """Daily radar measures the spread from this 24h volume up ($2M; the trial floor when the trial is on)."""
+    cfg = cfg if cfg is not None else trial_config()
+    return min(VOL_TRADEABLE, cfg["min_vol_usd"]) if cfg.get("enabled") else VOL_TRADEABLE
 
 
 def max_notional_usd(vol24h: Optional[float]) -> Optional[float]:

@@ -77,7 +77,8 @@ def db_path() -> str:
 
 
 LIVE_COLS = {"mode": "TEXT DEFAULT 'shadow'", "order_id": "TEXT", "client_id": "TEXT", "position_id": "TEXT",
-             "qty": "REAL", "pnl_usd": "REAL", "fees_usd": "REAL", "funding_usd": "REAL", "sl_order_id": "TEXT"}
+             "qty": "REAL", "pnl_usd": "REAL", "fees_usd": "REAL", "funding_usd": "REAL", "sl_order_id": "TEXT",
+             "liq_tier": "TEXT"}
 SHADOW = "COALESCE(mode,'shadow')='shadow'"
 
 

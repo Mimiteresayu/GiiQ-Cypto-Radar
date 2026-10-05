@@ -364,8 +364,9 @@ def run_daily(now_ms: Optional[int] = None, client=None, hl_mids_fn=None, cg=Non
     r4h = refresh_candles("4h", syms, client, now_ms, _log)
     bars_1d = load_candles("1d")
     spreads: Dict[str, Optional[float]] = {}
+    spread_min_vol = U.spread_fetch_min_vol()
     for m in todo:
-        if (m.get("vol24h_usd") or 0) >= U.VOL_TRADEABLE:
+        if (m.get("vol24h_usd") or 0) >= spread_min_vol:
             try:
                 spreads[m["bx_symbol"]] = client.spread_bp(client.depth(m["bx_symbol"], 5))
             except Exception:  # noqa: BLE001
