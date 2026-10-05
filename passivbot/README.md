@@ -112,7 +112,7 @@ Tests: `python3 -m pytest passivbot/`.
 Upstream's monitor publisher writes JSON to the volume under
 `/data/monitor/hyperliquid/hyperliquid_01/`:
 
-- `state.latest.json` — latest snapshot (balance, equity, positions, open orders)
+- `state.latest.json` — latest snapshot (`account` balance/equity, `positions`, `open_orders`, `hsl` state)
 - `history/fills.current.ndjson` (+ rotated segments) — fills, retained 7 days
 - `events/current.ndjson` — live events, including HSL state changes
 - `/data/logs/hyperliquid_01.log` — rotating bot log (5 × 10 MB)
