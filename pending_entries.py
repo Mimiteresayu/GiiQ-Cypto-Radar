@@ -22,6 +22,10 @@ Rules (MMT, 2026-09-28):
   level this % below that line), CHASE_PENDING_TTL_DAYS, CHASE_MAX_CHASE_PCT (unset = no cap: N+1 waits if the
   live mid is more than this % above the 1D Upper), CHASE_FILL_SLIPPAGE_PCT (HL pending IOC slippage; unset =
   EXEC_ENTRY_SLIPPAGE_PCT).
+- CHASE_MODE=live (default) | log_only. log_only: an approved Chase creates NO pending and NO order (HL, BX live,
+  BX shadow book); a shadow record is appended to a jsonl log instead (chase_shadow_record / log_chase_shadow) and
+  its M1 outcome resolved by the 4H jobs (resolve_chase_m1). CHASE_LOG_ONLY_EXISTING=keep (default: existing
+  pendings processed as before) | freeze (evaluate() returns wait: no fill, no cancel/expire, record kept).
 - Idempotent: one record per (symbol, kind, HKT decision date); filled/cancelled records are
   never re-armed; a CONTINUATION whose coin is already held is cancelled; an ADD_ON whose base
   position is gone is cancelled.
@@ -50,6 +54,8 @@ BAND_TF = {ADD_ON: "4h", CONTINUATION: "1d"}
 ACTIVE = "pending"
 
 CHASE_PENDING_MODES = {"filter": "Filter", "lower": "Lower", "upper": "Upper"}
+CHASE_MODES = ("live", "log_only")
+CHASE_LOG_ONLY_EXISTING = ("keep", "freeze")
 # name -> (default, low, high, low_inclusive); default None = feature off / inherit
 _CHASE_NUM = {
     "CHASE_PENDING_OFFSET_PCT": (0.0, 0.0, 50.0, True),
@@ -83,19 +89,32 @@ def _env_num(env: Any, name: str) -> Optional[float]:
     return v
 
 
+def _env_choice(env: Any, name: str, choices: Any, default: str) -> str:
+    v = (env.get(name) or "").strip().lower() or default
+    if v not in choices:
+        _cfg_warn(f"{name}={v[:32]!r} invalid (need one of {'|'.join(choices)}) -> default {default!r}")
+        return default
+    return v
+
+
 def chase_params(env: Any = None) -> Dict[str, Any]:
     """Chase pending placement settings from env. Defaults reproduce the MMT 2026-09-28 rules exactly."""
     env = os.environ if env is None else env
-    mode = (env.get("CHASE_PENDING_MODE") or "").strip().lower() or "filter"
-    if mode not in CHASE_PENDING_MODES:
-        _cfg_warn(f"CHASE_PENDING_MODE={mode[:32]!r} invalid (need one of {'|'.join(CHASE_PENDING_MODES)}) "
-                  f"-> default 'filter'")
-        mode = "filter"
-    return {"mode": mode,
+    return {"mode": _env_choice(env, "CHASE_PENDING_MODE", CHASE_PENDING_MODES, "filter"),
             "offset_pct": _env_num(env, "CHASE_PENDING_OFFSET_PCT"),
             "ttl_days": _env_num(env, "CHASE_PENDING_TTL_DAYS"),
             "max_chase_pct": _env_num(env, "CHASE_MAX_CHASE_PCT"),
-            "fill_slippage_pct": _env_num(env, "CHASE_FILL_SLIPPAGE_PCT")}
+            "fill_slippage_pct": _env_num(env, "CHASE_FILL_SLIPPAGE_PCT"),
+            "chase_mode": _env_choice(env, "CHASE_MODE", CHASE_MODES, "live"),
+            "log_only_existing": _env_choice(env, "CHASE_LOG_ONLY_EXISTING", CHASE_LOG_ONLY_EXISTING, "keep")}
+
+
+def log_only(params: Dict[str, Any]) -> bool:
+    return params.get("chase_mode") == "log_only"
+
+
+def frozen(params: Dict[str, Any]) -> bool:
+    return log_only(params) and params.get("log_only_existing") == "freeze"
 
 
 def touch_level(bnd: Dict[str, Any], params: Dict[str, Any]) -> Tuple[Optional[float], str]:
@@ -194,6 +213,8 @@ def evaluate(rec: dict, bnd: Dict[str, Any], mid: Optional[float], now: datetime
     fields (setup / last_bar_t) the caller persists in LIVE mode. Missing/misaligned data -> wait
     without consuming the bar (fail-closed, retried next 4H run)."""
     p = params or chase_params()
+    if frozen(p):
+        return "wait", "frozen: CHASE_MODE=log_only + CHASE_LOG_ONLY_EXISTING=freeze (no fill, no cancel/expire)", {}
     exp = parse_ts(rec.get("expires_at"))
     if exp and now >= exp:
         c_at = parse_ts(rec.get("created_at"))
@@ -283,4 +304,123 @@ def summary(entries: List[dict], rows_1d: Dict[str, dict], rows_4h: Dict[str, di
                     "mid": mid, "in_zone": in_zone, "size_pct": e.get("size_pct"), "leverage": e.get("leverage"),
                     "created_at": e.get("created_at"), "expires_at": e.get("expires_at"),
                     "last_check": e.get("last_check")})
+    return out
+
+
+# ---------------------------------------------------------------------------------------------
+# CHASE_MODE=log_only shadow log (append-only jsonl: one "decision" line, later one "m1" line per id)
+# ---------------------------------------------------------------------------------------------
+M1_RULE = ("M1 = first 4H bar closing after the approval; close > its 4H Upper -> shadow entry at that close, "
+           "else no_trigger")
+
+
+def chase_shadow_path(out_dir: Optional[Path] = None, name: str = "chase_shadow.jsonl") -> Path:
+    if out_dir is not None:
+        return Path(out_dir) / name
+    return Path(os.environ.get("CHASE_SHADOW_PATH") or str(ROOT / "out" / name))
+
+
+def _shadow_log(msg: str) -> None:
+    sys.stderr.write(f"[CHASE_SHADOW] {msg}\n")
+    sys.stderr.flush()
+
+
+def read_chase_shadow(path: Path) -> List[dict]:
+    try:
+        lines = Path(path).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    out = []
+    for ln in lines:
+        try:
+            out.append(json.loads(ln))
+        except json.JSONDecodeError:
+            continue
+    return out
+
+
+def _append(path: Path, rec: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(rec, default=str, sort_keys=True) + "\n")
+
+
+def chase_shadow_record(venue: str, symbol: str, kind: str, decision: dict, row_1d: Optional[dict],
+                        row_4h: Optional[dict], now: datetime, params: Dict[str, Any]) -> dict:
+    """Shadow record for one approved Chase under CHASE_MODE=log_only, including what the pending
+    logic would have armed (zone / touch level / expiry) for a later comparison."""
+    r1, r4 = row_1d or {}, row_4h or {}
+    bnd = band(kind, r1, r4)
+    touch, t_label = touch_level(bnd, params)
+    bms = BAR_MS["4h"]
+    m1_t = int(now.timestamp() * 1000) // bms * bms
+    return {
+        "event": "decision", "id": f"{venue}_{symbol}_{now.astimezone(HKT).strftime('%Y%m%d')}",
+        "venue": venue, "symbol": symbol, "kind": kind, "chase_mode": "log_only",
+        "decision_time": now.isoformat(), "decision_date": now.astimezone(HKT).strftime("%Y-%m-%d"),
+        "approved_at": decision.get("ts"), "size_pct": decision.get("size_pct"), "leverage": decision.get("leverage"),
+        "reason": str(decision.get("reason") or "")[:300],
+        "upper_1d": _f(r1.get("upper")), "filter_1d": _f(r1.get("filter")), "lower_1d": _f(r1.get("lower")),
+        "upper_4h": _f(r4.get("upper")), "close_4h": _f(r4.get("close")),
+        "would_be_pending": {
+            "kind": kind, "band_tf": bnd["tf"], "zone": [bnd["lower"], bnd["filter"]],
+            "touch_level": touch, "touch_label": t_label, "pending_mode": params["mode"],
+            "offset_pct": params["offset_pct"], "ttl_days": params["ttl_days"],
+            "expires_at": (now + timedelta(days=params["ttl_days"])).isoformat(),
+            "max_chase_pct": params["max_chase_pct"]},
+        "m1": {"rule": M1_RULE, "bar_t": m1_t, "bar_close_at": datetime.fromtimestamp(
+            (m1_t + bms) / 1000, tz=timezone.utc).isoformat(), "status": "pending_eval"},
+    }
+
+
+def log_chase_shadow(path: Path, rec: dict) -> bool:
+    """Append once per id (idempotent across re-runs). -> True if written."""
+    path = Path(path)
+    if any(r.get("event") == "decision" and r.get("id") == rec["id"] for r in read_chase_shadow(path)):
+        return False
+    _append(path, rec)
+    w = rec.get("would_be_pending") or {}
+    _shadow_log(f"{rec['venue']} {rec['symbol']} {rec['kind']} approved Chase logged (no pending, no order): "
+                f"1D Upper {rec.get('upper_1d')} Filter {rec.get('filter_1d')}; would-be pending "
+                f"{w.get('band_tf')} touch {w.get('touch_label')} {w.get('touch_level')} until {w.get('expires_at')}; "
+                f"M1 on 4H bar closing {rec['m1']['bar_close_at']}")
+    return True
+
+
+def resolve_chase_m1(path: Path, venue: str, rows_4h: Dict[str, dict], now: datetime) -> List[dict]:
+    """Resolve open M1 evaluations from the latest CLOSED 4H radar rows (keyed like the record symbol).
+    triggered / no_trigger when the radar row is the M1 bar; no_data when that bar was missed or never
+    arrived within 3 bars. Appends one "m1" line per resolved id."""
+    path = Path(path)
+    recs = read_chase_shadow(path)
+    done = {r.get("id") for r in recs if r.get("event") == "m1"}
+    bms = BAR_MS["4h"]
+    now_ms = int(now.timestamp() * 1000)
+    out = []
+    for r in recs:
+        if r.get("event") != "decision" or r.get("venue") != venue or r.get("id") in done:
+            continue
+        t = int((r.get("m1") or {}).get("bar_t") or 0)
+        row = rows_4h.get(r.get("symbol")) or {}
+        bt = row.get("bar_time")
+        close, upper = _f(row.get("close")), _f(row.get("upper"))
+        if bt is None or int(bt) < t:
+            if now_ms < t + 3 * bms:
+                continue
+            status = "no_data"
+        elif int(bt) > t:
+            status = "no_data"
+        elif close and upper:
+            status = "triggered" if close > upper else "no_trigger"
+        else:
+            status = "no_data"
+        ev = {"event": "m1", "id": r["id"], "venue": venue, "symbol": r.get("symbol"), "status": status,
+              "bar_t": t, "close_4h": close if bt is not None and int(bt) == t else None,
+              "upper_4h": upper if bt is not None and int(bt) == t else None,
+              "entry_px": close if status == "triggered" else None, "evaluated_at": now.isoformat()}
+        _append(path, ev)
+        done.add(r["id"])
+        out.append(ev)
+        _shadow_log(f"{venue} {r.get('symbol')} M1 {status}"
+                    + (f": 4H close {close} > Upper {upper} -> shadow entry {close}" if status == "triggered" else ""))
     return out

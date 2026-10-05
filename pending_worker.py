@@ -66,7 +66,8 @@ from exec_common import (  # noqa: E402
     round_price,
 )
 from pending_entries import (  # noqa: E402
-    ACTIVE, ADD_ON, band, chase_params, evaluate, load_pending, save_pending, summary,
+    ACTIVE, ADD_ON, band, chase_params, chase_shadow_path, evaluate, load_pending, resolve_chase_m1, save_pending,
+    summary,
 )
 
 # SoT size bands (margin % of equity). CONTINUATION = SoT "Continuation" 2-4%.
@@ -138,6 +139,12 @@ def _run_pending(hl: Any = None, radar_1d: Optional[dict] = None, radar_4h: Opti
     if after_exits:
         res["sequence"] = f"exits (done {after_exits}) -> positions re-fetched -> pending entries"
     persist = entries is None
+    shadow = chase_shadow_path()
+    if live and shadow.is_file():
+        radar_4h = _load_json("gc_radar_4h.json") if radar_4h is None else radar_4h
+        m1 = resolve_chase_m1(shadow, "HL", {r.get("symbol"): r for r in radar_4h.get("rows", []) or []}, now)
+        if m1:
+            res["chase_shadow_m1"] = m1
     entries = load_pending() if entries is None else entries
     act = [e for e in entries if e.get("status") == ACTIVE]
     if not act:

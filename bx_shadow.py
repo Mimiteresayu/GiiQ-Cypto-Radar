@@ -97,6 +97,10 @@ def pending_path() -> Path:
     return OUT_DIR / "bx_shadow_pending.json"   # never the HL out/pending_entries.json
 
 
+def chase_shadow_path() -> Path:
+    return OUT_DIR / "bx_shadow_chase_shadow.jsonl"
+
+
 def load_pending() -> List[dict]:
     try:
         d = json.loads(pending_path().read_text(encoding="utf-8"))
@@ -260,8 +264,10 @@ def run(job: str, now: Optional[datetime] = None, nav_usd: Optional[float] = Non
     out/bx_shadow_pending.json. Returns a report dict."""
     import bx_radar
     import dim_ledger
-    from pending_entries import ADD_ON, CONTINUATION, create_pending, evaluate
+    from pending_entries import (ADD_ON, CONTINUATION, chase_params, chase_shadow_record, create_pending, evaluate,
+                                 log_chase_shadow, log_only, resolve_chase_m1)
     now = now or datetime.now(timezone.utc)
+    cp = chase_params()
     own = conn is None
     conn = conn or connect()
     rep: Dict[str, Any] = {"job": job, "ts": now.isoformat(), "signals": [], "opened": [], "closed": [],
@@ -351,6 +357,10 @@ def run(job: str, now: Optional[datetime] = None, nav_usd: Optional[float] = Non
             rec["status"] = "filled"
             open_trade(meta, "Chase", "1d", rec.get("signal_id"), bool(rec.get("counted")), note=rec["kind"])
         rep["pending"].append({"symbol": sym, "kind": rec["kind"], "action": action, "reason": reason[:160]})
+    if chase_shadow_path().is_file():
+        m1 = resolve_chase_m1(chase_shadow_path(), "BX_SHADOW", r4h, now)
+        if m1:
+            rep["chase_shadow_m1"] = m1
 
     # 3) new signals (daily: 1D rows + 4H Chase; 4h: new tokens on 4H; 1h: new tokens on 1H, watch-only)
     for sym, meta in meta_all.items():
@@ -380,7 +390,15 @@ def run(job: str, now: Optional[datetime] = None, nav_usd: Optional[float] = Non
                       meta.get("asset_age"), meta.get("spread_bp"), U.shadow_slippage_bp(meta.get("spread_bp"))))
         rep["signals"].append({"symbol": meta["symbol"], "type": s["type"], "gc_tf": s["gc_tf"],
                                "tier": meta.get("liq_tier"), "counted": counted})
-        if s["type"] == "Chase":
+        if s["type"] == "Chase" and log_only(cp):
+            kind = ADD_ON if sym in held else CONTINUATION
+            srec = chase_shadow_record("BX_SHADOW", sym, kind, {"size_pct": SIZE_PCT, "leverage": LEVERAGE,
+                                                                 "reason": "BX shadow Chase"},
+                                       r1d.get(sym), r4h.get(sym), now, cp)
+            srec["signal_id"], srec["counted"] = sid, counted
+            log_chase_shadow(chase_shadow_path(), srec)
+            rep.setdefault("chase_shadow", []).append({"symbol": sym, "kind": kind, "id": srec["id"]})
+        elif s["type"] == "Chase":
             kind = ADD_ON if sym in held else CONTINUATION
             rec, created = create_pending(pend, sym, kind, {"size_pct": SIZE_PCT, "leverage": LEVERAGE,
                                                             "reason": "BX shadow Chase"},

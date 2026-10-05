@@ -42,6 +42,7 @@ from exec_common import (  # noqa: E402
     entry_upper_ref,
     is_live_mode,
 )
+from pending_entries import chase_params, log_only as chase_log_only  # noqa: E402
 
 
 def _load(name: str) -> dict:
@@ -192,6 +193,11 @@ def run_preflight(hl: Any = None, signed_probe: bool = True, now: Optional[datet
                 if c.get("type") == "Chase" and not c.get("is_base"):
                     kind = "ADD_ON" if sym in held else "CONTINUATION"
                     guard[sym] = {"type": "Chase", "pending_kind": kind}
+                    if chase_log_only(chase_params()):
+                        guard[sym]["chase_mode"] = "log_only"
+                        add(f"guard:{sym}", True, f"Chase -> CHASE_MODE=log_only: no pending, no order; "
+                            f"shadow log only ({kind} would-be pending)", blocking=False)
+                        continue
                     add(f"guard:{sym}", True, f"Chase -> no 08:55 entry; becomes pending {kind} "
                         f"({'4H' if kind == 'ADD_ON' else '1D'} pullback zone, N+1 confirmation)", blocking=False)
                     continue

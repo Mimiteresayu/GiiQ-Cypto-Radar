@@ -22,7 +22,8 @@ import pending_worker as pw  # noqa: E402
 
 D = 86_400_000
 CHASE_VARS = ("CHASE_PENDING_MODE", "CHASE_PENDING_OFFSET_PCT", "CHASE_PENDING_TTL_DAYS",
-              "CHASE_MAX_CHASE_PCT", "CHASE_FILL_SLIPPAGE_PCT")
+              "CHASE_MAX_CHASE_PCT", "CHASE_FILL_SLIPPAGE_PCT", "CHASE_MODE", "CHASE_LOG_ONLY_EXISTING",
+              "CHASE_SHADOW_PATH")
 
 
 def clean_env(**kw):
@@ -121,7 +122,7 @@ class TestDefaultsReproduceCurrent(unittest.TestCase):
         with clean_env():
             p = pe.chase_params()
         self.assertEqual(p, {"mode": "filter", "offset_pct": 0.0, "ttl_days": 7, "max_chase_pct": None,
-                             "fill_slippage_pct": None})
+                             "fill_slippage_pct": None, "chase_mode": "live", "log_only_existing": "keep"})
 
     def test_randomized_evaluate_equals_frozen_reference(self):
         rnd = random.Random(20261005)
@@ -341,7 +342,7 @@ class TestInvalidFallBack(unittest.TestCase):
         p, err = self.params(CHASE_PENDING_MODE="UPPER", CHASE_PENDING_OFFSET_PCT="0", CHASE_PENDING_TTL_DAYS="30",
                              CHASE_MAX_CHASE_PCT="0", CHASE_FILL_SLIPPAGE_PCT="2")
         self.assertEqual(p, {"mode": "upper", "offset_pct": 0.0, "ttl_days": 30.0, "max_chase_pct": 0.0,
-                             "fill_slippage_pct": 2.0})
+                             "fill_slippage_pct": 2.0, "chase_mode": "live", "log_only_existing": "keep"})
         self.assertEqual(err, "")
 
     def test_warning_logged_once(self):

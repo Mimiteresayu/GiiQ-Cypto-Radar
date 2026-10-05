@@ -89,6 +89,9 @@ from exec_common import (  # noqa: E402
 
 from pending_entries import band as pending_band  # noqa: E402
 from pending_entries import classify_chase, create_pending, load_pending, save_pending  # noqa: E402
+from pending_entries import (  # noqa: E402
+    chase_params, chase_shadow_path, chase_shadow_record, log_chase_shadow, log_only as chase_log_only,
+)
 from pending_entries import summary as pending_summary  # noqa: E402
 
 try:
@@ -360,6 +363,7 @@ def _execute(
             return result
 
     slip = _entry_slippage_pct()
+    chase_cfg = chase_params()
     try:  # GIIQ-SoT-3 daily cap counts real fills already made today (08:55 + pending fills)
         entries_today = count_entries_today(now, dry_run=False)
     except Exception:  # noqa: BLE001
@@ -391,6 +395,18 @@ def _execute(
             kind = classify_chase(symbol, held_long)
             r1d_p = next((r for r in radar_1d.get("rows", []) if r.get("symbol") == symbol), None)
             r4h_p = next((r for r in radar_4h.get("rows", []) if r.get("symbol") == symbol), None)
+            if chase_log_only(chase_cfg):
+                srec = chase_shadow_record("HL", symbol, kind, decision, r1d_p, r4h_p, now, chase_cfg)
+                sinfo = {"symbol": symbol, "kind": kind, "id": srec["id"], "chase_mode": "log_only",
+                         "m1_bar_close_at": srec["m1"]["bar_close_at"]}
+                if live:
+                    sinfo["logged"] = log_chase_shadow(chase_shadow_path(), srec)
+                else:
+                    sinfo["would_log"] = True
+                result.setdefault("chase_shadow", []).append(sinfo)
+                _log(f"{mode} CHASE log_only {kind} {symbol}: no pending, no order"
+                     f"{'' if live else ' (DRY_RUN: not logged)'}")
+                continue
             bnd = pending_band(kind, r1d_p, r4h_p)
             info = {"symbol": symbol, "kind": kind, "band_tf": bnd["tf"], "zone_lower": bnd["lower"],
                     "zone_filter": bnd["filter"], "size_pct": decision.get("size_pct"),
