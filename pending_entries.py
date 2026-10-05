@@ -17,6 +17,15 @@ Rules (MMT, 2026-09-28):
 - Created only from AI-approved decisions (approved size_pct / leverage kept, re-clamped to
   SoT bands at fill time). Cancelled when any band-TF close (ADD_ON 4H / CONTINUATION 1D) is
   below its Lower, or after PENDING_TTL_DAYS (7).
+- Tunable via env (chase_params; defaults = the rules above, invalid values -> default + [PENDING_CFG] warning):
+  CHASE_PENDING_MODE (filter|lower|upper: band line bar N's low must touch), CHASE_PENDING_OFFSET_PCT (touch
+  level this % below that line), CHASE_PENDING_TTL_DAYS, CHASE_MAX_CHASE_PCT (unset = no cap: N+1 waits if the
+  live mid is more than this % above the 1D Upper), CHASE_FILL_SLIPPAGE_PCT (HL pending IOC slippage; unset =
+  EXEC_ENTRY_SLIPPAGE_PCT).
+- CHASE_MODE=live (default) | log_only. log_only: an approved Chase creates NO pending and NO order (HL, BX live,
+  BX shadow book); a shadow record is appended to a jsonl log instead (chase_shadow_record / log_chase_shadow) and
+  its M1 outcome resolved by the 4H jobs (resolve_chase_m1). CHASE_LOG_ONLY_EXISTING=keep (default: existing
+  pendings processed as before) | freeze (evaluate() returns wait: no fill, no cancel/expire, record kept).
 - Idempotent: one record per (symbol, kind, HKT decision date); filled/cancelled records are
   never re-armed; a CONTINUATION whose coin is already held is cancelled; an ADD_ON whose base
   position is gone is cancelled.
@@ -26,8 +35,10 @@ Storage: JSON list at out/pending_entries.json (Railway volume), override with P
 from __future__ import annotations
 
 import json
+import math
 import os
 import secrets
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -41,6 +52,79 @@ ADD_ON = "ADD_ON"
 CONTINUATION = "CONTINUATION"
 BAND_TF = {ADD_ON: "4h", CONTINUATION: "1d"}
 ACTIVE = "pending"
+
+CHASE_PENDING_MODES = {"filter": "Filter", "lower": "Lower", "upper": "Upper"}
+CHASE_MODES = ("live", "log_only")
+CHASE_LOG_ONLY_EXISTING = ("keep", "freeze")
+# name -> (default, low, high, low_inclusive); default None = feature off / inherit
+_CHASE_NUM = {
+    "CHASE_PENDING_OFFSET_PCT": (0.0, 0.0, 50.0, True),
+    "CHASE_PENDING_TTL_DAYS": (PENDING_TTL_DAYS, 0.0, 30.0, False),
+    "CHASE_MAX_CHASE_PCT": (None, 0.0, 100.0, True),
+    "CHASE_FILL_SLIPPAGE_PCT": (None, 0.0, 2.0, True),
+}
+_warned: set = set()
+
+
+def _cfg_warn(msg: str) -> None:
+    if msg not in _warned:
+        _warned.add(msg)
+        sys.stderr.write(f"[PENDING_CFG] {msg}\n")
+        sys.stderr.flush()
+
+
+def _env_num(env: Any, name: str) -> Optional[float]:
+    default, lo, hi, lo_incl = _CHASE_NUM[name]
+    raw = (env.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        v = float(raw)
+    except ValueError:
+        v = math.nan
+    if not math.isfinite(v) or v > hi or v < lo or (v == lo and not lo_incl):
+        rng = f"{'[' if lo_incl else '('}{lo:g}, {hi:g}]"
+        _cfg_warn(f"{name}={raw[:32]!r} invalid (need a number in {rng}) -> default {default}")
+        return default
+    return v
+
+
+def _env_choice(env: Any, name: str, choices: Any, default: str) -> str:
+    v = (env.get(name) or "").strip().lower() or default
+    if v not in choices:
+        _cfg_warn(f"{name}={v[:32]!r} invalid (need one of {'|'.join(choices)}) -> default {default!r}")
+        return default
+    return v
+
+
+def chase_params(env: Any = None) -> Dict[str, Any]:
+    """Chase pending placement settings from env. Defaults reproduce the MMT 2026-09-28 rules exactly."""
+    env = os.environ if env is None else env
+    return {"mode": _env_choice(env, "CHASE_PENDING_MODE", CHASE_PENDING_MODES, "filter"),
+            "offset_pct": _env_num(env, "CHASE_PENDING_OFFSET_PCT"),
+            "ttl_days": _env_num(env, "CHASE_PENDING_TTL_DAYS"),
+            "max_chase_pct": _env_num(env, "CHASE_MAX_CHASE_PCT"),
+            "fill_slippage_pct": _env_num(env, "CHASE_FILL_SLIPPAGE_PCT"),
+            "chase_mode": _env_choice(env, "CHASE_MODE", CHASE_MODES, "live"),
+            "log_only_existing": _env_choice(env, "CHASE_LOG_ONLY_EXISTING", CHASE_LOG_ONLY_EXISTING, "keep")}
+
+
+def log_only(params: Dict[str, Any]) -> bool:
+    return params.get("chase_mode") == "log_only"
+
+
+def frozen(params: Dict[str, Any]) -> bool:
+    return log_only(params) and params.get("log_only_existing") == "freeze"
+
+
+def touch_level(bnd: Dict[str, Any], params: Dict[str, Any]) -> Tuple[Optional[float], str]:
+    """Level bar N's low must reach (<=) -> (level, label). Default: the band Filter, label 'Filter'."""
+    ref = _f(bnd.get(params["mode"]))
+    label = CHASE_PENDING_MODES[params["mode"]]
+    off = params["offset_pct"] or 0.0
+    if not off or ref is None:
+        return ref, label
+    return ref * (1 - off / 100.0), f"{label} -{off:g}%"
 
 
 def pending_path() -> Path:
@@ -87,7 +171,8 @@ def band(kind: str, row_1d: Optional[dict], row_4h: Optional[dict]) -> Dict[str,
     tf = BAND_TF[kind]
     row = (row_4h if tf == "4h" else row_1d) or {}
     return {"tf": tf, "lower": _f(row.get("lower")), "filter": _f(row.get("filter")),
-            "close": _f(row.get("close")), "trend": row.get("trend"), "bar_time": row.get("bar_time")}
+            "close": _f(row.get("close")), "trend": row.get("trend"), "bar_time": row.get("bar_time"),
+            "upper": _f(row.get("upper")), "upper_1d": _f((row_1d or {}).get("upper"))}
 
 
 def create_pending(entries: List[dict], symbol: str, kind: str, decision: dict, cand: dict,
@@ -103,7 +188,7 @@ def create_pending(entries: List[dict], symbol: str, kind: str, decision: dict, 
     rec = {
         "id": pid, "symbol": symbol, "kind": kind, "status": ACTIVE,
         "created_at": now.isoformat(),
-        "expires_at": (now + timedelta(days=PENDING_TTL_DAYS)).isoformat(),
+        "expires_at": (now + timedelta(days=chase_params()["ttl_days"])).isoformat(),
         "decision_date": now.astimezone(HKT).strftime("%Y-%m-%d"),
         "size_pct": decision.get("size_pct"), "leverage": decision.get("leverage"),
         "reason": decision.get("reason", ""),
@@ -116,17 +201,25 @@ def create_pending(entries: List[dict], symbol: str, kind: str, decision: dict, 
 
 
 def evaluate(rec: dict, bnd: Dict[str, Any], mid: Optional[float], now: datetime,
-             held_long: set, bar: Optional[dict] = None) -> Tuple[str, str, Dict[str, Any]]:
+             held_long: set, bar: Optional[dict] = None,
+             params: Optional[Dict[str, Any]] = None) -> Tuple[str, str, Dict[str, Any]]:
     """N / N+1 pullback state machine for one pending record.
 
-    bnd = band-TF radar values of the latest CLOSED bar (lower/filter/close/trend/bar_time).
+    bnd = band-TF radar values of the latest CLOSED bar (lower/filter/close/trend/bar_time; upper and
+    upper_1d for CHASE_PENDING_MODE=upper / CHASE_MAX_CHASE_PCT).
     bar = latest CLOSED band-TF candle from HL {"t","l","c"}.
+    params = chase_params() (read from env when None).
     -> (action, reason, updates); action in expire|cancel|wait|trigger; `updates` are record
     fields (setup / last_bar_t) the caller persists in LIVE mode. Missing/misaligned data -> wait
     without consuming the bar (fail-closed, retried next 4H run)."""
+    p = params or chase_params()
+    if frozen(p):
+        return "wait", "frozen: CHASE_MODE=log_only + CHASE_LOG_ONLY_EXISTING=freeze (no fill, no cancel/expire)", {}
     exp = parse_ts(rec.get("expires_at"))
     if exp and now >= exp:
-        return "expire", f"expired after {PENDING_TTL_DAYS} days", {}
+        c_at = parse_ts(rec.get("created_at"))
+        ttl = (exp - c_at).total_seconds() / 86400.0 if c_at else p["ttl_days"]
+        return "expire", f"expired after {ttl:g} days", {}
     sym, kind = rec.get("symbol"), rec.get("kind")
     if kind == CONTINUATION and sym in held_long:
         return "cancel", "coin already held (idempotent: not adding a CONTINUATION)", {}
@@ -144,7 +237,8 @@ def evaluate(rec: dict, bnd: Dict[str, Any], mid: Optional[float], now: datetime
     created = parse_ts(rec.get("created_at"))
     if created and b_t + BAR_MS[tfk] <= int(created.timestamp() * 1000):
         return "wait", f"latest {tf} bar closed before the pending was created", {}
-    if not lo or not fi:
+    touch, t_label = touch_level(bnd, p)
+    if not lo or not fi or not touch:
         return "wait", f"missing {tf} band values", {}
     if bnd.get("bar_time") is not None and int(bnd["bar_time"]) != b_t:
         return "wait", f"{tf} radar band not yet for the latest closed bar", {}
@@ -160,6 +254,15 @@ def evaluate(rec: dict, bnd: Dict[str, Any], mid: Optional[float], now: datetime
                 upd["setup"] = None
                 return "wait", f"N+1 confirmed but live mid {mid} not above {tf} Lower {lo:.6g}", upd
             upd["setup"] = None
+            cap = p["max_chase_pct"]
+            if cap is not None:
+                up1 = _f(bnd.get("upper_1d"))
+                if not up1:
+                    return "wait", f"N+1 confirmed but no 1D Upper for the max-chase check ({cap:g}%)", upd
+                ext = (mid / up1 - 1) * 100.0
+                if ext > cap:
+                    return "wait", (f"N+1 confirmed but live mid {mid:.6g} is {ext:.2f}% above 1D Upper "
+                                    f"{up1:.6g} (max chase {cap:g}%)"), upd
             return "trigger", (f"N+1 confirmed: {tf} close {b_close:.6g} > Lower {lo:.6g} and > N close "
                                f"{n_close:.6g}; enter at live mid {mid:.6g}"), upd
         why_n1 = (f"N+1 not confirmed ({tf} close {b_close:.6g} vs N close {n_close:.6g}, Lower {lo:.6g}, "
@@ -167,20 +270,23 @@ def evaluate(rec: dict, bnd: Dict[str, Any], mid: Optional[float], now: datetime
     else:
         why_n1 = ""
     # evaluate this bar as a (new) bar N
-    if b_low <= fi and b_close > lo:
+    if b_low <= touch and b_close > lo:
         upd["setup"] = {"t": b_t, "l": b_low, "c": b_close, "filter": fi, "lower": lo}
+        if touch != fi:
+            upd["setup"]["touch"] = touch
         return "wait", ((why_n1 + "; ") if why_n1 else "") + (
-            f"bar N set: {tf} low {b_low:.6g} <= Filter {fi:.6g}, close {b_close:.6g} > Lower {lo:.6g}; "
+            f"bar N set: {tf} low {b_low:.6g} <= {t_label} {touch:.6g}, close {b_close:.6g} > Lower {lo:.6g}; "
             f"awaiting N+1 close > {max(lo, b_close):.6g}"), upd
     upd["setup"] = None
     return "wait", ((why_n1 + "; ") if why_n1 else "") + (
-        f"no pullback: {tf} low {b_low:.6g} > Filter {fi:.6g}"), upd
+        f"no pullback: {tf} low {b_low:.6g} > {t_label} {touch:.6g}"), upd
 
 
 def summary(entries: List[dict], rows_1d: Dict[str, dict], rows_4h: Dict[str, dict],
             mids: Dict[str, float]) -> List[dict]:
     """Active pendings with live trigger zone (for cockpit / preflight / results)."""
     out = []
+    p = chase_params()
     for e in active(entries):
         b = band(e["kind"], rows_1d.get(e["symbol"]), rows_4h.get(e["symbol"]))
         mid = mids.get(e["symbol"]) if mids else None
@@ -190,11 +296,131 @@ def summary(entries: List[dict], rows_1d: Dict[str, dict], rows_4h: Dict[str, di
         if st:
             trig = f"bar N set ({tf} low {st.get('l')}, close {st.get('c')}): enter if next {tf} close > {max(float(st.get('c') or 0), float(b['lower'] or 0)):.6g}"
         else:
-            trig = f"waiting for {tf} bar N: low <= Filter {b['filter']} and close > Lower {b['lower']}; then N+1 close > Lower and > N close"
+            touch, t_label = touch_level(b, p)
+            trig = f"waiting for {tf} bar N: low <= {t_label} {touch} and close > Lower {b['lower']}; then N+1 close > Lower and > N close"
         out.append({"id": e["id"], "symbol": e["symbol"], "kind": e["kind"], "band_tf": b["tf"],
                     "zone_lower": b["lower"], "zone_filter": b["filter"], "trend": b["trend"],
                     "setup": st, "trigger": trig,
                     "mid": mid, "in_zone": in_zone, "size_pct": e.get("size_pct"), "leverage": e.get("leverage"),
                     "created_at": e.get("created_at"), "expires_at": e.get("expires_at"),
                     "last_check": e.get("last_check")})
+    return out
+
+
+# ---------------------------------------------------------------------------------------------
+# CHASE_MODE=log_only shadow log (append-only jsonl: one "decision" line, later one "m1" line per id)
+# ---------------------------------------------------------------------------------------------
+M1_RULE = ("M1 = first 4H bar closing after the approval; close > its 4H Upper -> shadow entry at that close, "
+           "else no_trigger")
+
+
+def chase_shadow_path(out_dir: Optional[Path] = None, name: str = "chase_shadow.jsonl") -> Path:
+    if out_dir is not None:
+        return Path(out_dir) / name
+    return Path(os.environ.get("CHASE_SHADOW_PATH") or str(ROOT / "out" / name))
+
+
+def _shadow_log(msg: str) -> None:
+    sys.stderr.write(f"[CHASE_SHADOW] {msg}\n")
+    sys.stderr.flush()
+
+
+def read_chase_shadow(path: Path) -> List[dict]:
+    try:
+        lines = Path(path).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    out = []
+    for ln in lines:
+        try:
+            out.append(json.loads(ln))
+        except json.JSONDecodeError:
+            continue
+    return out
+
+
+def _append(path: Path, rec: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(rec, default=str, sort_keys=True) + "\n")
+
+
+def chase_shadow_record(venue: str, symbol: str, kind: str, decision: dict, row_1d: Optional[dict],
+                        row_4h: Optional[dict], now: datetime, params: Dict[str, Any]) -> dict:
+    """Shadow record for one approved Chase under CHASE_MODE=log_only, including what the pending
+    logic would have armed (zone / touch level / expiry) for a later comparison."""
+    r1, r4 = row_1d or {}, row_4h or {}
+    bnd = band(kind, r1, r4)
+    touch, t_label = touch_level(bnd, params)
+    bms = BAR_MS["4h"]
+    m1_t = int(now.timestamp() * 1000) // bms * bms
+    return {
+        "event": "decision", "id": f"{venue}_{symbol}_{now.astimezone(HKT).strftime('%Y%m%d')}",
+        "venue": venue, "symbol": symbol, "kind": kind, "chase_mode": "log_only",
+        "decision_time": now.isoformat(), "decision_date": now.astimezone(HKT).strftime("%Y-%m-%d"),
+        "approved_at": decision.get("ts"), "size_pct": decision.get("size_pct"), "leverage": decision.get("leverage"),
+        "reason": str(decision.get("reason") or "")[:300],
+        "upper_1d": _f(r1.get("upper")), "filter_1d": _f(r1.get("filter")), "lower_1d": _f(r1.get("lower")),
+        "upper_4h": _f(r4.get("upper")), "close_4h": _f(r4.get("close")),
+        "would_be_pending": {
+            "kind": kind, "band_tf": bnd["tf"], "zone": [bnd["lower"], bnd["filter"]],
+            "touch_level": touch, "touch_label": t_label, "pending_mode": params["mode"],
+            "offset_pct": params["offset_pct"], "ttl_days": params["ttl_days"],
+            "expires_at": (now + timedelta(days=params["ttl_days"])).isoformat(),
+            "max_chase_pct": params["max_chase_pct"]},
+        "m1": {"rule": M1_RULE, "bar_t": m1_t, "bar_close_at": datetime.fromtimestamp(
+            (m1_t + bms) / 1000, tz=timezone.utc).isoformat(), "status": "pending_eval"},
+    }
+
+
+def log_chase_shadow(path: Path, rec: dict) -> bool:
+    """Append once per id (idempotent across re-runs). -> True if written."""
+    path = Path(path)
+    if any(r.get("event") == "decision" and r.get("id") == rec["id"] for r in read_chase_shadow(path)):
+        return False
+    _append(path, rec)
+    w = rec.get("would_be_pending") or {}
+    _shadow_log(f"{rec['venue']} {rec['symbol']} {rec['kind']} approved Chase logged (no pending, no order): "
+                f"1D Upper {rec.get('upper_1d')} Filter {rec.get('filter_1d')}; would-be pending "
+                f"{w.get('band_tf')} touch {w.get('touch_label')} {w.get('touch_level')} until {w.get('expires_at')}; "
+                f"M1 on 4H bar closing {rec['m1']['bar_close_at']}")
+    return True
+
+
+def resolve_chase_m1(path: Path, venue: str, rows_4h: Dict[str, dict], now: datetime) -> List[dict]:
+    """Resolve open M1 evaluations from the latest CLOSED 4H radar rows (keyed like the record symbol).
+    triggered / no_trigger when the radar row is the M1 bar; no_data when that bar was missed or never
+    arrived within 3 bars. Appends one "m1" line per resolved id."""
+    path = Path(path)
+    recs = read_chase_shadow(path)
+    done = {r.get("id") for r in recs if r.get("event") == "m1"}
+    bms = BAR_MS["4h"]
+    now_ms = int(now.timestamp() * 1000)
+    out = []
+    for r in recs:
+        if r.get("event") != "decision" or r.get("venue") != venue or r.get("id") in done:
+            continue
+        t = int((r.get("m1") or {}).get("bar_t") or 0)
+        row = rows_4h.get(r.get("symbol")) or {}
+        bt = row.get("bar_time")
+        close, upper = _f(row.get("close")), _f(row.get("upper"))
+        if bt is None or int(bt) < t:
+            if now_ms < t + 3 * bms:
+                continue
+            status = "no_data"
+        elif int(bt) > t:
+            status = "no_data"
+        elif close and upper:
+            status = "triggered" if close > upper else "no_trigger"
+        else:
+            status = "no_data"
+        ev = {"event": "m1", "id": r["id"], "venue": venue, "symbol": r.get("symbol"), "status": status,
+              "bar_t": t, "close_4h": close if bt is not None and int(bt) == t else None,
+              "upper_4h": upper if bt is not None and int(bt) == t else None,
+              "entry_px": close if status == "triggered" else None, "evaluated_at": now.isoformat()}
+        _append(path, ev)
+        done.add(r["id"])
+        out.append(ev)
+        _shadow_log(f"{venue} {r.get('symbol')} M1 {status}"
+                    + (f": 4H close {close} > Upper {upper} -> shadow entry {close}" if status == "triggered" else ""))
     return out

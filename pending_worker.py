@@ -65,7 +65,10 @@ from exec_common import (  # noqa: E402
     parse_ts,
     round_price,
 )
-from pending_entries import ACTIVE, ADD_ON, band, evaluate, load_pending, save_pending, summary  # noqa: E402
+from pending_entries import (  # noqa: E402
+    ACTIVE, ADD_ON, band, chase_params, chase_shadow_path, evaluate, load_pending, resolve_chase_m1, save_pending,
+    summary,
+)
 
 # SoT size bands (margin % of equity). CONTINUATION = SoT "Continuation" 2-4%.
 # ADD_ON has no explicit SoT band yet -> same conservative 2-4% (confirm with MMT).
@@ -136,6 +139,12 @@ def _run_pending(hl: Any = None, radar_1d: Optional[dict] = None, radar_4h: Opti
     if after_exits:
         res["sequence"] = f"exits (done {after_exits}) -> positions re-fetched -> pending entries"
     persist = entries is None
+    shadow = chase_shadow_path()
+    if live and shadow.is_file():
+        radar_4h = _load_json("gc_radar_4h.json") if radar_4h is None else radar_4h
+        m1 = resolve_chase_m1(shadow, "HL", {r.get("symbol"): r for r in radar_4h.get("rows", []) or []}, now)
+        if m1:
+            res["chase_shadow_m1"] = m1
     entries = load_pending() if entries is None else entries
     act = [e for e in entries if e.get("status") == ACTIVE]
     if not act:
@@ -186,6 +195,10 @@ def _run_pending(hl: Any = None, radar_1d: Optional[dict] = None, radar_4h: Opti
         slip = max(0.0, min(2.0, float(os.environ.get("EXEC_ENTRY_SLIPPAGE_PCT") or 0.5)))
     except ValueError:
         pass
+    cp = chase_params()
+    res["chase_params"] = cp
+    if cp["fill_slippage_pct"] is not None:
+        slip = cp["fill_slippage_pct"]
     dirty = False
     try:  # GIIQ-SoT-3 daily cap: real fills already made today (08:55 executor + earlier pending fills)
         from trade_log import count_entries_today
@@ -202,7 +215,7 @@ def _run_pending(hl: Any = None, radar_1d: Optional[dict] = None, radar_4h: Opti
             mid = (hl.all_mids() or mids).get(sym)
         except Exception:  # noqa: BLE001
             mid = None
-        action, why, upd = evaluate(rec, bnd, mid, now, held_long, bar)
+        action, why, upd = evaluate(rec, bnd, mid, now, held_long, bar, cp)
         if live and upd:
             rec.update(upd)
             dirty = True

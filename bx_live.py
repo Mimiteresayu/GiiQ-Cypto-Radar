@@ -751,6 +751,20 @@ def live_pending_path() -> Path:
     return OUT_DIR / "bx_live_pending.json"
 
 
+def chase_shadow_path() -> Path:
+    return OUT_DIR / "bx_chase_shadow.jsonl"
+
+
+def resolve_chase_shadow(now: datetime) -> List[dict]:
+    """CHASE_MODE=log_only: resolve M1 for logged BX Chase approvals from the closed 4H radar."""
+    if not chase_shadow_path().is_file():
+        return []
+    import bx_radar
+    import bx_shadow as S
+    from pending_entries import resolve_chase_m1
+    return resolve_chase_m1(chase_shadow_path(), "BX", S._rows_by_symbol(bx_radar.load_radar("4h")), now)
+
+
 def load_live_pending() -> List[dict]:
     return list((_read(live_pending_path()) or {}).get("entries") or [])
 
@@ -760,7 +774,18 @@ def save_live_pending(entries: List[dict]) -> None:
 
 
 def create_live_pending(entries: List[dict], cand: dict, approval: dict, now: datetime) -> dict:
-    from pending_entries import CONTINUATION, create_pending
+    from pending_entries import CONTINUATION, chase_params, chase_shadow_record, create_pending, log_chase_shadow
+    p = chase_params()
+    if p["chase_mode"] == "log_only":
+        row1 = {"upper": cand.get("upper_1d"), "filter": cand.get("filter_1d"), "lower": cand.get("lower_1d"),
+                "trend": cand.get("trend_1d")}
+        row4 = {"upper": cand.get("upper_4h"), "filter": cand.get("filter_4h"), "lower": cand.get("lower_4h"),
+                "trend": cand.get("trend_4h")}
+        srec = chase_shadow_record("BX", cand["symbol"], CONTINUATION,
+                                   {"size_pct": MARGIN_PCT_NAV, "leverage": LEVERAGE, "reason": approval.get("reason"),
+                                    "ts": approval.get("ts")}, row1, row4, now, p)
+        return {"symbol": cand["symbol"], "created": False, "log_only": True, "id": srec["id"],
+                "logged": log_chase_shadow(chase_shadow_path(), srec)}
     rec, created = create_pending(entries, cand["symbol"], CONTINUATION,
                                   {"size_pct": MARGIN_PCT_NAV, "leverage": LEVERAGE, "reason": approval.get("reason")},
                                   {"tier": cand.get("tier"), "type": "Chase"}, {"tf": "1d"}, now)
@@ -780,6 +805,10 @@ def run_manage(job: str, now: Optional[datetime] = None, trade_api=None, egress:
     import bx_trade
     now = now or _now()
     rep: Dict[str, Any] = {"job": job, "ts": now.isoformat()}
+    if job == "4h":
+        m1 = resolve_chase_shadow(now)
+        if m1:
+            rep["chase_shadow_m1"] = m1
     cok, cwhy = close_gate(bx_trade.keys_present())
     own = conn is None
     conn = conn or connect()
@@ -833,7 +862,8 @@ def run_live_pending(api, conn, now, gate_ok, gate_why, meta_all, acct, nav, mar
         sym = rec["symbol"]
         row = r1d.get(sym) or {}
         bnd = {"tf": "1d", "lower": _f(row.get("lower")), "filter": _f(row.get("filter")), "close": _f(row.get("close")),
-               "trend": row.get("trend"), "bar_time": row.get("bar_time")}
+               "trend": row.get("trend"), "bar_time": row.get("bar_time"),
+               "upper": _f(row.get("upper")), "upper_1d": _f(row.get("upper"))}
         bar = {"t": row.get("bar_time"), "l": row.get("low"), "c": row.get("close")} if row else None
         mid = _f((meta_all.get(sym) or {}).get("price"))
         action, reason, upd = evaluate(rec, bnd, mid, now, held, bar)
