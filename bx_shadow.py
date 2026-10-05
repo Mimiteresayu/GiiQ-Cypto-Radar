@@ -329,7 +329,8 @@ def run(job: str, now: Optional[datetime] = None, nav_usd: Optional[float] = Non
         tf = "4h" if rec["kind"] == ADD_ON else "1d"
         row = (r4h if tf == "4h" else r1d).get(sym) or {}
         bnd = {"tf": tf, "lower": _f(row.get("lower")), "filter": _f(row.get("filter")), "close": _f(row.get("close")),
-               "trend": row.get("trend"), "bar_time": row.get("bar_time")}
+               "trend": row.get("trend"), "bar_time": row.get("bar_time"),
+               "upper": _f(row.get("upper")), "upper_1d": _f((r1d.get(sym) or {}).get("upper"))}
         bar = {"t": row.get("bar_time"), "l": row.get("low"), "c": row.get("close")} if row else None
         meta = meta_all.get(sym) or {}
         action, reason, upd = evaluate(rec, bnd, _f(meta.get("price")), now, held, bar)

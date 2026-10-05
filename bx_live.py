@@ -833,7 +833,8 @@ def run_live_pending(api, conn, now, gate_ok, gate_why, meta_all, acct, nav, mar
         sym = rec["symbol"]
         row = r1d.get(sym) or {}
         bnd = {"tf": "1d", "lower": _f(row.get("lower")), "filter": _f(row.get("filter")), "close": _f(row.get("close")),
-               "trend": row.get("trend"), "bar_time": row.get("bar_time")}
+               "trend": row.get("trend"), "bar_time": row.get("bar_time"),
+               "upper": _f(row.get("upper")), "upper_1d": _f(row.get("upper"))}
         bar = {"t": row.get("bar_time"), "l": row.get("low"), "c": row.get("close")} if row else None
         mid = _f((meta_all.get(sym) or {}).get("price"))
         action, reason, upd = evaluate(rec, bnd, mid, now, held, bar)
