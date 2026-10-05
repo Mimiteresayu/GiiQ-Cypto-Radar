@@ -518,6 +518,40 @@ def daily_entry_cap_ok(entries_today: int, entries_this_run: int) -> Tuple[bool,
     return True, f"{n}/{MAX_NEW_ENTRIES_PER_DAY} entries today"
 
 
+# ---------------------------------------------------------------- entry re-run guard (W40)
+# Non-scheduled executor runs (keyed POST /api/exec/run, password POST /api/jobs/run executor) are
+# refused from the cutoff until midnight HKT; before the cutoff they stay allowed. The scheduled
+# 08:55 run (incl. APScheduler misfire grace) never goes through this guard.
+EXEC_RERUN_CUTOFF_DEFAULT = "08:55"
+
+
+def _parse_hhmm(s: Any) -> Optional[Tuple[int, int]]:
+    try:
+        h, m = str(s).strip().split(":")
+        h, m = int(h), int(m)
+    except (TypeError, ValueError):
+        return None
+    return (h, m) if 0 <= h <= 23 and 0 <= m <= 59 else None
+
+
+def exec_rerun_cutoff_hkt(env: Optional[Dict[str, str]] = None) -> str:
+    """EXEC_RERUN_CUTOFF_HKT (HH:MM, HKT); missing or malformed -> the 08:55 default."""
+    raw = (env if env is not None else os.environ).get("EXEC_RERUN_CUTOFF_HKT") or ""
+    hm = _parse_hhmm(raw)
+    return f"{hm[0]:02d}:{hm[1]:02d}" if hm else EXEC_RERUN_CUTOFF_DEFAULT
+
+
+def entry_rerun_blocked(now_hkt: datetime, cutoff: str = EXEC_RERUN_CUTOFF_DEFAULT) -> Tuple[bool, str]:
+    """True iff the HKT wall-clock time is >= cutoff on that day (naive datetimes are taken as HKT)."""
+    hm = _parse_hhmm(cutoff) or _parse_hhmm(EXEC_RERUN_CUTOFF_DEFAULT)
+    now = now_hkt.astimezone(HKT) if now_hkt.tzinfo else now_hkt.replace(tzinfo=HKT)
+    cut = f"{hm[0]:02d}:{hm[1]:02d}"
+    if (now.hour, now.minute) >= hm:
+        return True, (f"entry re-run blocked: {now:%H:%M} HKT is at/after the {cut} HKT cutoff "
+                      f"(only the scheduled 08:55 run enters after the cutoff)")
+    return False, f"{now:%H:%M} HKT is before the {cut} HKT cutoff"
+
+
 # ---------------------------------------------------------------- misc
 def sig(x: Any, n: int = 6) -> Any:
     """Round floats to n significant figures (compact logs); pass through others."""
