@@ -42,7 +42,7 @@ jobs:
       - name: Run backtests
         run: |
           cd scout/diversify
-          python3 backtest.py --output out/backtest_results.json --days 730
+          python3 backtest_v2.py --output out/backtest_results_v2.json --days 1825
         continue-on-error: true
       
       - name: Generate report
@@ -57,7 +57,7 @@ jobs:
           cp diversify_latest.md "diversify_${timestamp}.md"
           
           # Combine search and backtest results into one JSON
-          jq -s '.[0] * .[1]' search_results.json backtest_results.json > "diversify_${timestamp}.json" || echo '{}' > "diversify_${timestamp}.json"
+          jq -s '.[0] * .[1]' search_results.json backtest_results_v2.json > "diversify_${timestamp}.json" || echo '{}' > "diversify_${timestamp}.json"
       
       - name: Upload artifacts (PR only)
         if: github.event_name == 'pull_request'

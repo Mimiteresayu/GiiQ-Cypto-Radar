@@ -1,248 +1,220 @@
 #!/usr/bin/env python3
-"""Generate markdown summary report from search and backtest results."""
+"""Generate diversify_latest.md from backtest results v2"""
 
 import json
 import sys
 from datetime import datetime
 
 
-def load_json(path):
-    """Load JSON file."""
-    try:
-        with open(path, 'r') as f:
-            return json.load(f)
-    except Exception as e:
-        print(f"Error loading {path}: {e}", file=sys.stderr)
-        return None
-
-
-def generate_report(search_results, backtest_results, output_path):
-    """Generate markdown report."""
-    
-    lines = []
-    lines.append("# GiiQ Diversification Strategy Report")
-    lines.append("")
-    lines.append(f"**Generated:** {datetime.now().astimezone().strftime('%Y-%m-%d %H:%M %Z')}")
-    lines.append("")
-    lines.append("**Objective:** Identify 1–2 non-trend crypto strategies with low correlation to GiiQ BO (daily channel-breakout trend strategy).")
-    lines.append("")
-    
-    # Data limitations
-    if backtest_results and 'meta' in backtest_results:
-        meta = backtest_results['meta']
-        lines.append("## Data Limitations")
-        lines.append("")
-        lines.append(f"- **Source:** {meta.get('data_source', 'Unknown')}")
-        lines.append(f"- **Lookback:** {meta.get('lookback_days', 'Unknown')} days")
-        lines.append(f"- **Universe:** {meta.get('universe_size', 'Unknown')} liquid perpetuals")
-        lines.append(f"- **Limitations:** {meta.get('data_limitations', 'None noted')}")
-        lines.append("")
-    
-    # Backtest results
-    lines.append("## Backtest Results")
-    lines.append("")
-    
-    if backtest_results and 'strategies' in backtest_results:
-        strategies = backtest_results['strategies']
-        
-        # Summary table
-        lines.append("| Strategy | PF | CAGR | Sharpe | MDD | Trades | Corr(GiiQ BO) | Corr(BTC) | IS Return | OOS Return |")
-        lines.append("|----------|-----|------|--------|-----|--------|---------------|-----------|-----------|------------|")
-        
-        strategy_names = {
-            'cross_sectional_reversal': '1. Cross-Sectional Reversal',
-            'funding_cross_section': '2. Funding Cross-Section',
-            'pairs_mean_reversion': '3. Pairs Mean Reversion'
-        }
-        
-        for key, name in strategy_names.items():
-            if key in strategies:
-                s = strategies[key]
-                if 'error' in s:
-                    lines.append(f"| {name} | ERROR | - | - | - | - | - | - | - | - |")
-                else:
-                    underpowered = ' ⚠️ UNDERPOWERED' if s.get('underpowered', False) else ''
-                    corr_giiq = s.get('correlations', {}).get('giiq_bo', 'N/A')
-                    corr_btc = s.get('correlations', {}).get('btc', 'N/A')
-                    is_ret = s.get('is_summary', {}).get('return', 'N/A')
-                    oos_ret = s.get('oos_summary', {}).get('return', 'N/A')
-                    lines.append(f"| {name}{underpowered} | {s.get('profit_factor', 'N/A')} | {s.get('cagr', 'N/A')} | {s.get('sharpe', 'N/A')} | {s.get('max_drawdown', 'N/A')} | {s.get('num_trades', 0)} | {corr_giiq} | {corr_btc} | {is_ret} | {oos_ret} |")
-        
-        lines.append("")
-        lines.append("**Costs:** 0.045% taker fee + 0.05% slippage per side; funding included for strategy 2.")
-        lines.append("")
-        
-        # Detailed results for each strategy
-        for key, name in strategy_names.items():
-            if key in strategies:
-                s = strategies[key]
-                lines.append(f"### {name}")
-                lines.append("")
-                
-                if 'error' in s:
-                    lines.append(f"**Error:** {s['error']}")
-                    lines.append("")
-                    continue
-                
-                # Spec
-                if key == 'cross_sectional_reversal':
-                    lines.append("**Spec:** Weekly rebalance, long bottom quintile / short top quintile of 7-day return, top-50 liquid perps, 7-day hold.")
-                elif key == 'funding_cross_section':
-                    lines.append("**Spec:** Weekly rebalance, long lowest-funding / short highest-funding quintile (30-day avg), market-neutral, 7-day hold.")
-                elif key == 'pairs_mean_reversion':
-                    lines.append("**Spec:** BTC/ETH, BTC/SOL, ETH/SOL, SOL/ARB pairs, 30-day z-score lookback, enter |z|>2, exit z=0, stop |z|>4.")
-                
-                lines.append("")
-                
-                # Metrics
-                lines.append(f"- **Total Return:** {s.get('total_return', 'N/A')}")
-                lines.append(f"- **CAGR:** {s.get('cagr', 'N/A')}")
-                lines.append(f"- **Sharpe Ratio:** {s.get('sharpe', 'N/A')}")
-                lines.append(f"- **Max Drawdown:** {s.get('max_drawdown', 'N/A')}")
-                lines.append(f"- **Profit Factor:** {s.get('profit_factor', 'N/A')}")
-                lines.append(f"- **Number of Trades:** {s.get('num_trades', 0)}")
-                
-                if s.get('underpowered', False):
-                    lines.append(f"- **⚠️ UNDERPOWERED:** <50 trades, results may not be statistically significant")
-                
-                lines.append(f"- **Days Traded:** {s.get('num_days', 0)}")
-                lines.append("")
-                
-                # Correlations
-                corr = s.get('correlations', {})
-                lines.append("**Correlations:**")
-                lines.append("")
-                lines.append(f"- vs GiiQ BO (20d Donchian): {corr.get('giiq_bo', 'N/A')}")
-                lines.append(f"- vs BTC: {corr.get('btc', 'N/A')}")
-                lines.append("")
-                
-                # Year-by-year table
-                if 'yearly_summary' in s and s['yearly_summary']:
-                    lines.append("**Year-by-Year Performance:**")
-                    lines.append("")
-                    lines.append("| Year | Return | Sharpe | MDD | Trades |")
-                    lines.append("|------|--------|--------|-----|--------|")
-                    for year, data in sorted(s['yearly_summary'].items()):
-                        lines.append(f"| {year} | {data.get('return', 'N/A')} | {data.get('sharpe', 'N/A')} | {data.get('mdd', 'N/A')} | {data.get('trades', 0)} |")
-                    lines.append("")
-                
-                # IS/OOS
-                lines.append("**In-Sample (≤2023) vs Out-of-Sample (2024-2026):**")
-                lines.append("")
-                is_summary = s.get('is_summary', {})
-                oos_summary = s.get('oos_summary', {})
-                lines.append(f"- **IS:** Return {is_summary.get('return', 'N/A')}, Sharpe {is_summary.get('sharpe', 'N/A')}, {is_summary.get('days', 0)} days")
-                lines.append(f"- **OOS:** Return {oos_summary.get('return', 'N/A')}, Sharpe {oos_summary.get('sharpe', 'N/A')}, {oos_summary.get('days', 0)} days")
-                lines.append("")
-                
-                # Per-pair for pairs strategy
-                if key == 'pairs_mean_reversion' and 'per_pair' in s:
-                    lines.append("**Per-Pair Breakdown:**")
-                    lines.append("")
-                    lines.append("| Pair | Trades | Entries | Exits |")
-                    lines.append("|------|--------|---------|-------|")
-                    for pair, data in sorted(s['per_pair'].items()):
-                        lines.append(f"| {pair} | {data.get('trades', 0)} | {data.get('entries', 0)} | {data.get('exits', 0)} |")
-                    lines.append("")
-    
-    else:
-        lines.append("**No backtest results available.**")
-        lines.append("")
-    
-    # Search results
-    lines.append("## Strategy Discovery")
-    lines.append("")
-    
-    if search_results:
-        # GitHub
-        if 'github' in search_results and search_results['github']:
-            lines.append("### Top GitHub Repositories")
-            lines.append("")
-            
-            for i, repo in enumerate(search_results['github'][:10], 1):
-                lines.append(f"**{i}. [{repo['repo']}]({repo['url']})** ({repo['stars']} ⭐)")
-                lines.append(f"   - Last push: {repo['last_push']}")
-                
-                backtest_status = '✓ Backtest + metrics' if repo.get('has_metrics') else ('✓ Backtest mentioned' if repo.get('has_backtest_mention') else '✗ No backtest')
-                lines.append(f"   - {backtest_status}")
-                
-                if repo.get('description'):
-                    lines.append(f"   - {repo['description'][:150]}")
-                
-                lines.append("")
-        
-        # arXiv
-        if 'arxiv' in search_results and search_results['arxiv']:
-            lines.append("### arXiv Papers")
-            lines.append("")
-            
-            for paper in search_results['arxiv'][:5]:
-                lines.append(f"- **[{paper['title']}]({paper['url']})**")
-                lines.append(f"  - Published: {paper['published']} | ID: {paper['id']}")
-                if paper.get('summary'):
-                    lines.append(f"  - {paper['summary'][:150]}...")
-                lines.append("")
-        
-        # SSRN
-        if 'ssrn' in search_results and search_results['ssrn']:
-            lines.append("### SSRN Papers")
-            lines.append("")
-            
-            for paper in search_results['ssrn']:
-                lines.append(f"- [{paper['title']}]({paper['url']})")
-                if paper.get('note'):
-                    lines.append(f"  - {paper['note']}")
-                lines.append("")
-    
-    else:
-        lines.append("**No search results available.**")
-        lines.append("")
-    
-    # Footer
-    lines.append("---")
-    lines.append("")
-    lines.append("**Next Steps:**")
-    lines.append("")
-    lines.append("1. Review top strategies for low correlation with GiiQ BO")
-    lines.append("2. Extend backtests with Binance data archive for longer history + delisted coins")
-    lines.append("3. Compute actual correlation with GiiQ BO daily returns")
-    lines.append("4. Select 1–2 candidates for Railway deployment")
-    lines.append("")
-    
-    # Write report
-    report_text = '\n'.join(lines)
-    
-    with open(output_path, 'w') as f:
-        f.write(report_text)
-    
-    print(f"Report generated: {output_path}")
-    return report_text
-
-
 def main():
-    import os
+    try:
+        with open('scout/diversify/out/backtest_results_v2.json', 'r') as f:
+            results = json.load(f)
+    except FileNotFoundError:
+        print("ERROR: backtest_results_v2.json not found", file=sys.stderr)
+        sys.exit(1)
     
-    # Use absolute paths or paths relative to the script
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    out_dir = os.path.join(script_dir, 'out')
+    meta = results.get('meta', {})
+    strategies = results.get('strategies', {})
     
-    # Create out directory if it doesn't exist
-    os.makedirs(out_dir, exist_ok=True)
+    lines = [
+        "# GiiQ Crypto Diversification: Backtest v2 Results",
+        "",
+        f"**Generated:** {meta.get('timestamp', 'N/A')}  ",
+        f"**Version:** {meta.get('version', 'N/A')}  ",
+        f"**Earliest Data:** {meta.get('earliest_data', 'N/A')}  ",
+        f"**Avg Days per Coin:** {meta.get('avg_days', 'N/A')}  ",
+        "",
+        "---",
+        "",
+        "## Sanity Test: Buy & Hold BTC",
+        ""
+    ]
     
-    search_path = os.path.join(out_dir, 'search_results.json')
-    backtest_path = os.path.join(out_dir, 'backtest_results.json')
-    output_path = os.path.join(out_dir, 'diversify_latest.md')
+    sanity = meta.get('sanity_test', {})
+    if sanity.get('pass'):
+        lines.append(f"✅ **PASS** (error: {sanity.get('error', 'N/A')})")
+    else:
+        lines.append(f"❌ **FAIL** (error: {sanity.get('error', 'N/A')})")
     
-    search_results = load_json(search_path)
-    backtest_results = load_json(backtest_path)
+    lines.extend([
+        f"- Calculated return: {sanity.get('calculated_return', 'N/A')}",
+        f"- Expected return: {sanity.get('expected_return', 'N/A')}",
+        f"- Days: {sanity.get('days', 'N/A')}",
+        "",
+        "---",
+        "",
+        "## Strategy Comparison",
+        "",
+        "| Strategy | Total Ret | CAGR | Sharpe | MDD | PF | Trades | Underpowered | Corr GiiQ BO | Corr BTC |",
+        "|----------|-----------|------|--------|-----|----|----|--------------|-------------|----------|"
+    ])
     
-    report = generate_report(search_results, backtest_results, output_path)
+    for strat_key, strat_data in strategies.items():
+        if isinstance(strat_data, dict) and 'error' in strat_data:
+            lines.append(f"| {strat_key} | ERROR | {strat_data['error'][:30]} | - | - | - | - | - | - | - |")
+        elif isinstance(strat_data, dict):
+            under = "⚠️ <50" if strat_data.get('underpowered', False) else "✅"
+            corrs = strat_data.get('correlations', {})
+            lines.append(
+                f"| {strat_key} | "
+                f"{strat_data.get('total_return', 'N/A')} | "
+                f"{strat_data.get('cagr', 'N/A')} | "
+                f"{strat_data.get('sharpe', 'N/A')} | "
+                f"{strat_data.get('max_drawdown', 'N/A')} | "
+                f"{strat_data.get('profit_factor', 'N/A')} | "
+                f"{strat_data.get('num_trades', 0)} | "
+                f"{under} | "
+                f"{corrs.get('giiq_bo', 'N/A')} | "
+                f"{corrs.get('btc', 'N/A')} |"
+            )
     
-    print("\n" + "=" * 80)
-    print("REPORT PREVIEW")
-    print("=" * 80)
-    print(report[:1000])
-    print("...")
+    lines.extend([
+        "",
+        "---",
+        "",
+        "## IS/OOS Breakdown",
+        "",
+        "| Strategy | IS Return (≤2023) | IS Sharpe | OOS Return (2024+) | OOS Sharpe |",
+        "|----------|------------------|-----------|-------------------|------------|"
+    ])
+    
+    for strat_key, strat_data in strategies.items():
+        if isinstance(strat_data, dict) and 'error' not in strat_data:
+            is_sum = strat_data.get('is_summary', {})
+            oos_sum = strat_data.get('oos_summary', {})
+            lines.append(
+                f"| {strat_key} | "
+                f"{is_sum.get('return', 'N/A')} | "
+                f"{is_sum.get('sharpe', 'N/A')} | "
+                f"{oos_sum.get('return', 'N/A')} | "
+                f"{oos_sum.get('sharpe', 'N/A')} |"
+            )
+    
+    lines.extend([
+        "",
+        "---",
+        "",
+        "## Strategy Details",
+        ""
+    ])
+    
+    for strat_key, strat_data in strategies.items():
+        if isinstance(strat_data, dict) and 'error' in strat_data:
+            lines.extend([
+                f"### {strat_key}",
+                "",
+                f"**ERROR:** {strat_data['error']}",
+                ""
+            ])
+            continue
+        
+        if not isinstance(strat_data, dict):
+            continue
+        
+        lines.extend([
+            f"### {strat_key}",
+            "",
+            f"**Strategy:** {strat_data.get('strategy', 'N/A')}  ",
+            f"**Total Return:** {strat_data.get('total_return', 'N/A')}  ",
+            f"**CAGR:** {strat_data.get('cagr', 'N/A')}  ",
+            f"**Sharpe:** {strat_data.get('sharpe', 'N/A')}  ",
+            f"**Max Drawdown:** {strat_data.get('max_drawdown', 'N/A')}  ",
+            f"**Profit Factor:** {strat_data.get('profit_factor', 'N/A')}  ",
+            f"**Trades:** {strat_data.get('num_trades', 0)}  ",
+            f"**Days:** {strat_data.get('num_days', 0)}  ",
+            ""
+        ])
+        
+        if strat_data.get('underpowered'):
+            lines.extend([
+                "⚠️ **UNDERPOWERED (<50 trades)** - Results are statistically unreliable.",
+                ""
+            ])
+        
+        if 'per_pair' in strat_data:
+            lines.extend([
+                "#### Per-Pair Trade Counts",
+                ""
+            ])
+            for pair, counts in strat_data['per_pair'].items():
+                lines.append(f"- **{pair}**: {counts.get('entries', 0)} entries, {counts.get('exits', 0)} exits")
+            lines.append("")
+        
+        yearly = strat_data.get('yearly_summary', {})
+        if yearly:
+            lines.extend([
+                "#### Year-by-Year Performance",
+                "",
+                "| Year | Return | Sharpe | MDD | Trades |",
+                "|------|--------|--------|-----|--------|"
+            ])
+            for year in sorted(yearly.keys()):
+                y = yearly[year]
+                lines.append(
+                    f"| {year} | {y.get('return', 'N/A')} | "
+                    f"{y.get('sharpe', 'N/A')} | {y.get('mdd', 'N/A')} | "
+                    f"{y.get('trades', 0)} |"
+                )
+            lines.append("")
+        
+        detailed = strat_data.get('detailed_trades', [])
+        if detailed:
+            lines.extend([
+                "#### Sample Trades (first 10)",
+                "",
+                "| Entry Date | Exit Date | Pair/Assets | Direction | Entry Z/Signal | Exit Z/Signal | PnL Gross | PnL Net | Reason |",
+                "|------------|-----------|-------------|-----------|----------------|--------------|-----------|---------|--------|"
+            ])
+            for t in detailed[:10]:
+                if 'pair' in t:
+                    lines.append(
+                        f"| {t.get('entry_date', 'N/A')} | {t.get('exit_date', 'N/A')} | "
+                        f"{t.get('pair', 'N/A')} | {t.get('direction', 'N/A')} | "
+                        f"{t.get('entry_z', 'N/A')} | {t.get('exit_z', 'N/A')} | "
+                        f"{t.get('gross_pnl_pct', 'N/A')}% | {t.get('net_pnl_pct', 'N/A')}% | "
+                        f"{t.get('reason', 'N/A')} |"
+                    )
+                else:
+                    date = t.get('date', 'N/A')
+                    long_c = t.get('long_coins', 'N/A')
+                    short_c = t.get('short_coins', 'N/A')
+                    turn = t.get('turnover', 'N/A')
+                    cost = t.get('cost_pct', 'N/A')
+                    lines.append(
+                        f"| {date} | - | Long: {long_c}, Short: {short_c} | Rebalance | "
+                        f"- | - | - | - | Turnover: {turn}, Cost: {cost} |"
+                    )
+            lines.append("")
+    
+    lines.extend([
+        "---",
+        "",
+        "## Specification Summary",
+        "",
+        "1. **Cross-Sectional Reversal**: Weekly rebalance, point-in-time top-50 perps by trailing 30d volume, long bottom quintile (0.5 weight) / short top quintile (0.5 weight) of 7-day return, 7-day hold.",
+        "",
+        "2. **Funding Cross-Section**: Weekly, long lowest-funding quintile / short highest-funding quintile (market-neutral), 7-day hold, paginated HL `fundingHistory`. ⚠️ Insufficient historical data (HL API limitation).",
+        "",
+        "3. **Pairs Mean Reversion**: BTC/ETH, BTC/SOL, ETH/SOL, SOL/ARB log-spread z-score (30d lookback, enter |z|>2, exit z=0, stop |z|>4), 25% capital per pair (12.5% per leg, dollar neutral, 1:1 log hedge ratio, short spread when z>2, long spread when z<-2).",
+        "",
+        "4. **GiiQ BO Proxy**: Long-only 20-day Donchian breakout, exit at 10-day low.",
+        "",
+        "5. **Costs**: Taker 0.045% + slippage 0.05% per side per leg when applicable.",
+        "",
+        "6. **Data**: Hyperliquid Public API `candleSnapshot` (up to 5000 candles per coin, startTime: 0).",
+        "",
+        "---",
+        "",
+        f"*Report generated {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}*"
+    ])
+    
+    report = '\n'.join(lines)
+    
+    with open('scout/diversify/out/diversify_latest.md', 'w') as f:
+        f.write(report)
+    
+    print("Report generated: scout/diversify/out/diversify_latest.md")
 
 
 if __name__ == '__main__':
