@@ -105,18 +105,37 @@ def get_daily_candles(coin: str, start_ms: int, end_ms: int, max_candles: int = 
 def get_funding_history(coin: str, start_ms: int, end_ms: int) -> Dict[int, float]:
     """Fetch historical funding rates for a coin from HL public API.
     Returns daily average funding rate (annualized %).
-    HL fundingHistory is public per coin and does NOT require a user address."""
+    HL fundingHistory returns max 500 records per call - must paginate."""
     try:
-        # HL fundingHistory returns historical funding (updated every 8h)
-        data = post({
-            'type': 'fundingHistory',
-            'coin': coin,
-            'startTime': 0  # Get full history
-        })
+        all_data = []
+        current_start = 0
+        
+        # Paginate: HL returns max 500 records per call
+        while current_start < end_ms:
+            data = post({
+                'type': 'fundingHistory',
+                'coin': coin,
+                'startTime': current_start
+            })
+            
+            if not data:
+                break
+            
+            all_data.extend(data)
+            
+            # Get last timestamp and advance
+            last_time = max(int(f['time']) for f in data)
+            
+            if len(data) < 500:  # Got all remaining records
+                break
+            
+            # Advance to last record time + 1ms
+            current_start = last_time + 1
+            time.sleep(0.3)  # Rate limit between pages
         
         # Aggregate by day
         daily_funding = defaultdict(list)
-        for f in data:
+        for f in all_data:
             day = int(f['time']) // 86400000
             rate = float(f['fundingRate'])
             daily_funding[day].append(rate)
@@ -128,7 +147,6 @@ def get_funding_history(coin: str, start_ms: int, end_ms: int) -> Dict[int, floa
             # Funding is per 8h period, 3x per day
             result[day] = avg_rate * 3 * 365 * 100  # Annualized as %
         
-        time.sleep(0.2)  # Rate limit
         return result
         
     except Exception as e:
@@ -571,7 +589,7 @@ def strategy_funding_cross_section(
     }
 
 
-def strategy_pairs_mean_reversion(start_ms: int, end_ms: int) -> Dict[str, Any]:
+def strategy_pairs_mean_reversion(start_ms: int, end_ms: int, with_costs: bool = True) -> Dict[str, Any]:
     """Strategy 3: Pairs log-spread z-score mean reversion.
     
     Spec (fixed):
@@ -638,14 +656,19 @@ def strategy_pairs_mean_reversion(start_ms: int, end_ms: int) -> Dict[str, Any]:
             'days_available': len(all_days)
         }
     
-    # Backtest
-    positions = {}  # {pair: position_size}
+    # Backtest with proper sizing:
+    # - 4 pairs, each gets 25% of capital
+    # - Each pair: 50% long leg, 50% short leg (dollar-neutral per pair)
+    # - Total gross exposure: 2x (1x long, 1x short across all pairs)
+    positions = {}  # {pair: {'entry_day', 'entry_z', 'entry_price1', 'entry_price2', 'size'}}
     equity = [1.0]
     equity_curve = {all_days[0]: 1.0}
     trades = []
+    detailed_trades = []  # For sample output
     
-    COST_PER_SIDE = 0.00045 + 0.0005
-    MAX_POSITION_PER_PAIR = 0.5  # 50% of equity per pair
+    COST_PER_SIDE = (0.00045 + 0.0005) if with_costs else 0.0
+    CAPITAL_PER_PAIR = 0.25  # 25% of capital per pair (4 pairs total)
+    LEG_SIZE = 0.125  # 12.5% per leg (50% of the pair's 25%)
     
     for day in all_days:
         daily_pnl = 0.0
@@ -770,7 +793,9 @@ def strategy_pairs_mean_reversion(start_ms: int, end_ms: int) -> Dict[str, Any]:
         'returns': returns,
         'trades': trades,
         'daily_returns': daily_returns,
-        'per_pair': per_pair_metrics
+        'per_pair': per_pair_metrics,
+        'detailed_trades': detailed_trades,
+        'with_costs': with_costs
     }
 
 
