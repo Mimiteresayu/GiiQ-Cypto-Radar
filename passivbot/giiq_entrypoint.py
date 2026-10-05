@@ -16,6 +16,7 @@ RENDERED_KEYS_PATH = "/run/passivbot/giiq-api-keys.json"
 
 MAX_LEVERAGE = 3
 MAX_TWEL = 0.08
+MAX_SINGLE_COIN_WE = 0.08
 MAX_HSL_RED_THRESHOLD = 0.08
 ALLOWED_EXCHANGES = {"hyperliquid"}
 
@@ -31,6 +32,28 @@ def _truthy(value) -> bool:
     if isinstance(value, str):
         return value.strip().lower() not in ("", "0", "false", "no", "off")
     return bool(value)
+
+
+def worst_case_single_coin_we(risk: dict) -> float:
+    """Upstream per-position cap: TWEL / n_positions * (1 + effective allowance).
+
+    Mirrors passivbot-rust entries::effective_we_excess_allowance_pct: "bounded" (upstream
+    default) caps the allowance so one coin cannot exceed TWEL; "legacy_raw" applies it uncapped.
+    """
+    twel = float(risk["total_wallet_exposure_limit"])
+    n_positions = float(risk["n_positions"])
+    if not n_positions >= 1:
+        raise ValueError(f"n_positions={n_positions!r} must be >= 1")
+    wel = twel / n_positions
+    raw = max(0.0, float(risk.get("we_excess_allowance_pct", 0.0)))
+    mode = risk.get("we_excess_allowance_mode") or "bounded"
+    if mode == "legacy_raw":
+        allowance = raw
+    elif mode == "bounded":
+        allowance = min(raw, max(0.0, twel / wel - 1.0)) if wel > 0 else 0.0
+    else:
+        raise ValueError(f"unknown we_excess_allowance_mode {mode!r}")
+    return wel * (1.0 + allowance)
 
 
 def check_config(config: dict, pb_user: str | None = None) -> list[str]:
@@ -49,6 +72,14 @@ def check_config(config: dict, pb_user: str | None = None) -> list[str]:
     twel = long_.get("risk", {}).get("total_wallet_exposure_limit")
     if not isinstance(twel, (int, float)) or not 0 <= twel <= MAX_TWEL:
         errors.append(f"bot.long.risk.total_wallet_exposure_limit={twel!r} must be in [0, {MAX_TWEL}]")
+    try:
+        single = worst_case_single_coin_we(long_.get("risk", {}))
+        if not single <= MAX_SINGLE_COIN_WE:
+            errors.append(
+                f"worst-case single-coin wallet exposure {single:.4f} exceeds {MAX_SINGLE_COIN_WE}"
+            )
+    except (KeyError, TypeError, ValueError) as e:
+        errors.append(f"cannot compute worst-case single-coin exposure: {e}")
 
     short_twel = short.get("risk", {}).get("total_wallet_exposure_limit")
     if short_twel != 0:

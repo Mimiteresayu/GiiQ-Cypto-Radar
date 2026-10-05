@@ -23,6 +23,9 @@ class TestLockedConfig(unittest.TestCase):
         self.assertEqual(ge.check_config(c, "hyperliquid_01"), [])
         self.assertEqual(c["live"]["leverage"], 2)
         self.assertEqual(c["bot"]["long"]["risk"]["total_wallet_exposure_limit"], 0.02)
+        self.assertEqual(c["bot"]["long"]["risk"]["n_positions"], 1)
+        self.assertIs(c["live"]["filter_by_min_effective_cost"], False)
+        self.assertAlmostEqual(ge.worst_case_single_coin_we(c["bot"]["long"]["risk"]), 0.02)
         self.assertIs(c["bot"]["long"]["hsl"]["enabled"], True)
         self.assertEqual(c["bot"]["long"]["hsl"]["red_threshold"], 0.08)
         self.assertEqual(c["bot"]["long"]["hsl"]["restart_after_red_policy"], "always")
@@ -50,6 +53,29 @@ class TestLockedConfig(unittest.TestCase):
             node[path[-1]] = value
             with self.subTest(path=path, value=value):
                 self.assertTrue(ge.check_config(c))
+
+    def test_worst_case_single_coin_exposure(self):
+        def risk(twel, n, pct, mode):
+            return {"total_wallet_exposure_limit": twel, "n_positions": n,
+                    "we_excess_allowance_pct": pct, "we_excess_allowance_mode": mode}
+
+        self.assertAlmostEqual(ge.worst_case_single_coin_we(risk(0.02, 1, 0.37, "bounded")), 0.02)
+        self.assertAlmostEqual(ge.worst_case_single_coin_we(risk(0.02, 3, 0.37, "bounded")), 0.02 / 3 * 1.37)
+        self.assertAlmostEqual(ge.worst_case_single_coin_we(risk(0.08, 1, 0.37, "bounded")), 0.08)
+        self.assertAlmostEqual(ge.worst_case_single_coin_we(risk(0.07, 1, 0.37, "legacy_raw")), 0.07 * 1.37)
+        self.assertAlmostEqual(ge.worst_case_single_coin_we(risk(0.02, 1, 0.37, None)), 0.02)
+
+        for bad in (risk(0.07, 1, 0.37, "legacy_raw"), risk(0.06, 2, 3.0, "legacy_raw"),
+                    risk(0.02, 1, 0.0, "mystery"), risk(0.02, 0, 0.0, "bounded")):
+            c = copy.deepcopy(locked_config())
+            c["bot"]["long"]["risk"].update(bad)
+            with self.subTest(risk=bad):
+                errors = ge.check_config(c)
+                self.assertTrue(any("single-coin" in e for e in errors), errors)
+
+        c = copy.deepcopy(locked_config())
+        c["bot"]["long"]["risk"].update(risk(0.08, 1, 0.37, "bounded"))
+        self.assertEqual(ge.check_config(c), [])
 
     def test_user_must_match(self):
         self.assertTrue(ge.check_config(locked_config(), "bitunix_01"))
