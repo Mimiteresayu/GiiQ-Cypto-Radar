@@ -162,11 +162,18 @@ def calculate_giiq_bo_proxy(price_data: Dict[str, Dict[int, float]]) -> Tuple[Di
     
     # Calculate 20-day high and 10-day low for each coin
     positions = {}  # {coin: entry_price}
-    equity_curve = {all_days[0]: 1.0}
+    equity_curve = {}
     daily_returns = {}
     
+    # Initialize equity curve
     for i, day in enumerate(all_days):
-        if i < 20:  # Need 20 days of history
+        if i == 0:
+            equity_curve[day] = 1.0
+            continue
+        
+        if i < 20:  # Need 20 days of history for first entry
+            equity_curve[day] = equity_curve[all_days[i-1]]
+            daily_returns[day] = 0.0
             continue
         
         daily_pnl = 0.0
