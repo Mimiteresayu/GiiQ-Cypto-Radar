@@ -289,6 +289,153 @@ class TestEntriesFailClosed(Tmp):
         self.assertTrue(L.approval_for("FOOUSDT", T0))
 
 
+class TestNothingToDecide(Tmp):
+    """10/2: an empty BX list or an empty bx_decisions list is a 200 (stored 0 + reason), not a 422."""
+
+    def test_empty_decisions_list_ok(self):
+        self.seed([cand()], [meta()])
+        res = L.store_decisions([], "claude", now=T0)
+        self.assertEqual((res["ok"], res["stored"]), (True, 0))
+        self.assertIn("nothing to decide", res["reason"])
+        self.assertFalse(L.decisions_path(L.hkt_date(T0)).exists())
+
+    def test_no_candidates_today_ok(self):
+        self.seed([], [])
+        res = L.store_decisions([{"coin": "FOO", "action": "VETO"}], "claude", now=T0)
+        self.assertEqual((res["ok"], res["stored"], len(res["rejected"])), (True, 0, 1))
+        self.assertEqual(res["reason"], "no BX candidates today; nothing stored")
+        self.assertIsNone(L.approval_for("FOOUSDT", T0))
+
+    def test_stale_candidate_file_counts_as_no_candidates(self):
+        self.seed([cand()], [meta()], now=T0 - timedelta(days=1))
+        res = L.store_decisions([{"symbol": "FOOUSDT", "decision": "approve"}], "claude", now=T0)
+        self.assertTrue(res["ok"])
+        self.assertIsNone(L.approval_for("FOOUSDT", T0))
+
+    def test_unknown_symbol_with_candidates_still_fails(self):
+        self.seed([cand()], [meta()])
+        res = L.store_decisions([{"symbol": "ZZZUSDT", "decision": "approve"}], "claude", now=T0)
+        self.assertFalse(res["ok"])
+        self.assertNotIn("reason", res)
+
+    def test_schema_error_still_fails_even_without_candidates(self):
+        self.seed([], [])
+        res = L.store_decisions([{"foo": "bar"}], "claude", now=T0)
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["rejected"][0]["why"], "need symbol + approve|veto")
+
+    def test_fallback_still_fails_on_empty_list(self):
+        self.seed([], [])
+        self.assertFalse(L.store_decisions([], "fallback", now=T0)["ok"])
+
+
+class TestDecisionHTTP(Tmp):
+    """bx-exec POST /api/bx/decision: 200 on nothing-to-decide, 422 (logged, no secrets) on real errors."""
+
+    def post(self, body):
+        import bx_service
+        from http.server import ThreadingHTTPServer
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), bx_service.Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        req = urllib.request.Request(f"http://127.0.0.1:{srv.server_port}/api/bx/decision", data=json.dumps(body).encode(),
+                                     method="POST", headers={"Content-Type": "application/json", "X-BX-Key": "svc"})
+        buf = io.StringIO()
+        try:
+            with patch.dict(os.environ, {"BX_SERVICE_KEY": "svc"}), patch("sys.stderr", buf), \
+                    patch.object(L, "hkt_date", return_value=L.hkt_date(T0)), patch.object(L, "_now", return_value=T0):
+                try:
+                    with urllib.request.urlopen(req, timeout=10) as r:
+                        return r.status, json.loads(r.read()), buf.getvalue()
+                except urllib.error.HTTPError as e:
+                    return e.code, json.loads(e.read()), buf.getvalue()
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_empty_list_200(self):
+        self.seed([], [])
+        code, res, log = self.post({"decisions": [], "source": "claude"})
+        self.assertEqual((code, res["ok"], res["stored"]), (200, True, 0))
+        self.assertNotIn("[BX_DECISION] 422", log)
+
+    def test_no_candidates_200(self):
+        self.seed([], [])
+        code, res, _ = self.post({"decisions": [{"coin": "FOO", "action": "VETO"}], "source": "claude"})
+        self.assertEqual((code, res["stored"]), (200, 0))
+        self.assertIn("reason", res)
+
+    def test_unknown_symbol_422_logged(self):
+        self.seed([cand()], [meta()])
+        code, res, log = self.post({"decisions": [{"symbol": "ZZZUSDT", "decision": "approve"}], "source": "claude"})
+        self.assertEqual(code, 422)
+        self.assertIn("[BX_DECISION] 422", log)
+        self.assertIn("not in today's BX candidate list", log)
+        self.assertNotIn("svc", log.replace("[BX_DECISION]", ""))
+        self.assertNotIn(LIVE_ENV["BX_API_KEY"], log)
+        self.assertNotIn(LIVE_ENV["BX_API_SECRET"], log)
+
+
+class TestCandidateFunnel(Tmp):
+    """Fix B: per-filter funnel in bx_candidates_latest.json and the [BX_DATA] daily line."""
+
+    def build(self, metas, r1d=()):
+        (self.tmp / "bx_meta.json").write_text(json.dumps({"scanned": metas}))
+        (self.tmp / "bx_radar_1d.json").write_text(json.dumps({"rows": list(r1d)}))
+        (self.tmp / "bx_radar_4h.json").write_text(json.dumps({"rows": []}))
+        sig = {"type": "Base", "gc_tf": "1d", "row": {"close": 2.0}}
+        signal_syms = {r["symbol"] for r in r1d}
+        with patch.object(bx_shadow, "classify_signal",
+                          side_effect=lambda m, *a: dict(sig) if m["bx_symbol"] in signal_syms else None), \
+                patch.object(bx_shadow, "hard_sl", return_value=(1.86, "4h_filter")):
+            return L.build_candidates(now=T0)
+
+    def test_funnel_counts_and_drop_reasons(self):
+        metas = ([meta("AUSDT"), meta("BUSDT", liq_tier="watch", vol24h_usd=4e5),
+                  meta("CUSDT", liq_tier="watch", vol24h_usd=6e5), meta("DUSDT", spread_bp=12.17)]
+                 + [meta(f"X{i}USDT", liq_tier="exclude") for i in range(3)])
+        rows = [{"symbol": s} for s in ("AUSDT", "BUSDT", "CUSDT", "DUSDT")]
+        doc = self.build(metas, rows)
+        f = doc["funnel"]
+        self.assertEqual((f["scanned"], f["tier_tradeable"], f["tier_watch"], f["tier_exclude"]), (7, 2, 2, 3))
+        self.assertEqual((f["signals"], f["candidates"]), (4, 1))
+        self.assertEqual(f["dropped"], {"tier watch": 2, "spread >= 10 bp": 1})
+        self.assertEqual(doc["n"], 1)
+        self.assertEqual(json.loads(doc["note"]), f)
+        on_disk = json.loads((self.tmp / "bx_candidates_latest.json").read_text())
+        self.assertEqual(on_disk["funnel"], f)
+
+    def test_short_scan_warns(self):
+        buf = io.StringIO()
+        with patch("sys.stderr", buf):
+            doc = self.build([meta(f"X{i}USDT", liq_tier="watch") for i in range(44)])
+        self.assertIn("short scan (44 < 100", doc["funnel"]["warn"])
+        self.assertIn("warn", json.loads(doc["note"]))
+        self.assertIn("[BX_ALERT] short scan", buf.getvalue())
+
+    def test_full_scan_no_warn(self):
+        doc = self.build([meta(f"X{i}USDT", liq_tier="exclude") for i in range(120)])
+        self.assertNotIn("warn", doc["funnel"])
+        self.assertEqual((doc["n"], doc["funnel"]["tier_exclude"]), (0, 120))
+
+    def test_bx_data_line_carries_funnel(self):
+        import bx_service
+        doc = self.build([meta(f"X{i}USDT", liq_tier="watch") for i in range(5)])
+        step = {**json.loads(json.dumps(doc, default=str)), "_rc": 0}
+        buf = io.StringIO()
+        steps = [{"status": "ok", "_rc": 0, "n_scanned": 5}, {"status": "ok", "_rc": 0}, step]
+        with patch.object(bx_service, "_step", side_effect=steps), patch.object(L, "hl_nav", return_value=None), \
+                patch.object(bx_service, "OUT_DIR", self.tmp), patch("sys.stderr", buf), \
+                patch.dict(os.environ, {"BX_ENABLED": "1"}):
+            bx_service.run_job("daily")
+        line = next(x for x in buf.getvalue().splitlines() if x.startswith("[BX_DATA] daily"))
+        data = json.loads(line.split(" ", 3)[3])
+        self.assertEqual(data["candidates"]["n"], 0)
+        self.assertEqual(json.loads(data["candidates"]["note"])["tier_watch"], 5)
+
+    def test_thresholds_unchanged(self):
+        self.assertEqual((L.VOL_MIN, L.SPREAD_MAX_BP, L.LIVE_GC_TFS), (2_000_000.0, 10.0, ("1d", "4h")))
+
+
 class TestProtection(Tmp):
     def go(self, api):
         self.seed([cand()], [meta()], [{"symbol": "FOOUSDT", "decision": "approve"}])
