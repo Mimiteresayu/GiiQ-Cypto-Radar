@@ -7,11 +7,23 @@ from datetime import datetime
 
 
 def main():
-    try:
-        with open('scout/diversify/out/backtest_results_v2.json', 'r') as f:
-            results = json.load(f)
-    except FileNotFoundError:
-        print("ERROR: backtest_results_v2.json not found", file=sys.stderr)
+    # Try both absolute and relative paths
+    paths = [
+        'scout/diversify/out/backtest_results_v2.json',
+        'out/backtest_results_v2.json'
+    ]
+    
+    results = None
+    for path in paths:
+        try:
+            with open(path, 'r') as f:
+                results = json.load(f)
+            break
+        except FileNotFoundError:
+            continue
+    
+    if results is None:
+        print("ERROR: backtest_results_v2.json not found in any expected location", file=sys.stderr)
         sys.exit(1)
     
     meta = results.get('meta', {})
@@ -211,10 +223,22 @@ def main():
     
     report = '\n'.join(lines)
     
-    with open('scout/diversify/out/diversify_latest.md', 'w') as f:
-        f.write(report)
+    # Try both paths
+    output_paths = ['scout/diversify/out/diversify_latest.md', 'out/diversify_latest.md']
+    output_path = None
     
-    print("Report generated: scout/diversify/out/diversify_latest.md")
+    for path in output_paths:
+        try:
+            import os
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, 'w') as f:
+                f.write(report)
+            output_path = path
+            break
+        except:
+            continue
+    
+    print(f"Report generated: {output_path}")
 
 
 if __name__ == '__main__':
