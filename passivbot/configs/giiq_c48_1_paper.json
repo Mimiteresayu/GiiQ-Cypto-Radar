@@ -201,7 +201,7 @@
                 }
             },
             "risk": {
-                "n_positions": 3.0,
+                "n_positions": 1.0,
                 "position_exposure_enforcer_enabled": false,
                 "position_exposure_enforcer_threshold": 1.0,
                 "total_exposure_enforcer_enabled": false,
@@ -446,7 +446,7 @@
         "fee_pct_sanity_abs_max": 0.001,
         "fills_confirmation_overlap_minutes": 60,
         "fills_recent_overlap_minutes": 10,
-        "filter_by_min_effective_cost": true,
+        "filter_by_min_effective_cost": false,
         "forager_score_hysteresis_pct": 0.02,
         "force_cold_startup": false,
         "forced_mode_long": "",

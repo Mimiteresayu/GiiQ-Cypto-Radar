@@ -22,6 +22,7 @@ It does not touch the cockpit/radar app (root `Dockerfile`, `bx_live`, entry des
 | `live.leverage` | **2** (ceiling ≤ 3) | yes |
 | `bot.long.risk.total_wallet_exposure_limit` | **0.02** (≈ NAV 2% notional; ceiling ≤ 0.08) | yes |
 | `bot.long.hsl.enabled` / `red_threshold` | **true / 0.08** (`restart_after_red_policy=always`) | yes |
+| Worst-case single-coin WE = `TWEL / n_positions × (1 + allowance)` | **≤ 0.08** (now 0.02); allowance per `we_excess_allowance_mode` (`bounded` caps at TWEL, `legacy_raw` uncapped, unknown modes rejected) | yes |
 | `live.market_orders_allowed` | **false** | yes |
 | `live.user` | **hyperliquid_01** (must equal `PB_USER`) | yes |
 | Vault mode | **off** — `is_vault=false`, ordinary wallet only, no vault leader deposits | yes |
@@ -31,7 +32,9 @@ It does not touch the cockpit/radar app (root `Dockerfile`, `bx_live`, entry des
 The guard also rejects extra CLI args and `PB_CONFIG_INLINE` / `PB_EXCHANGE` / `PB_API_KEY` /
 `PB_API_SECRET`, since those could bypass the baked config. Hard SL / kill switch are not relaxed.
 
-`n_positions = 3` and the canonical strategy parameters are unchanged from upstream.
+Small-wallet settings (Cove confirmed 2026-10-05 20:03 HKT): `bot.long.risk.n_positions = 1`
+and `live.filter_by_min_effective_cost = false`. Strategy parameters are otherwise the
+upstream template's.
 
 ## Stop conditions (ops — check every spot-check)
 
@@ -48,25 +51,32 @@ To stop: Railway → service → **Remove deployment** (or scale to 0). Then clo
 positions and cancel resting orders in the HL UI. Stopping the container alone leaves
 resting limit orders and positions on the exchange.
 
-## Known issue: min order size vs. 0.02 exposure
+## Sizing on a small wallet ($2.5k–$5k NAV)
 
-Passivbot sizes the first entry as `balance × WEL × (1 + allowance) × initial_qty_pct`. With the
-locked config this is ≈ **0.0074% of NAV**. Hyperliquid's minimum order is $10, so with
-`live.filter_by_min_effective_cost=true` (upstream default) every coin is filtered out unless
-NAV ≳ **$135k**. The bot then logs `No long symbols are approved due to min effective cost too high`
-and places no orders.
+Passivbot's raw first entry is `balance × WEL × initial_qty_pct` = NAV × 0.02 × 0.0081 ≈
+**0.016% of NAV**, i.e. $0.41 at $2.5k and $0.81 at $5k. That is below Hyperliquid's $10
+minimum. With upstream's default `filter_by_min_effective_cost=true`, every coin would be
+skipped until NAV reaches about $62k, so that filter is now **off**. Upstream then raises the
+entry to the exchange minimum: `calc_initial_entry_qty = max(min_entry_qty, raw)`.
 
-| n_positions | TWEL | NAV needed for a $10 first entry |
-|---|---|---|
-| 3 | 0.02 | ~$135k |
-| 3 | 0.04 | ~$68k |
-| 1 | 0.02 | ~$62k |
-| 1 | 0.08 | ~$15k |
+Re-entries stop once WE ≥ 0.999 × WEL. An entry that would overshoot is cropped to WEL, but
+never below the $10 minimum (`calc_cropped_reentry_qty`). The worst-case position is therefore
+about `WEL × NAV` plus at most one minimum order.
 
-This needs a Cove/MMT decision. It was not changed here because it is outside the lock list.
-The upstream option is `live.filter_by_min_effective_cost=false`, which bumps each entry up to
-the $10 minimum. Initial entries are then larger than the template intends, so check the
-single-coin 8% rule more often.
+These figures come from simulating upstream's own `passivbot_rust.calc_next_entry_long_py`
+(pinned SHA) on a falling-price ladder until no entry is returned. It used the locked entry
+params and live HL `szDecimals` and mark prices from 2026-10-05 for BTC, ETH, SOL, HYPE, XRP,
+DOGE and LINK, with a $10 minimum cost.
+
+| NAV | First order | Entries until capped | Max position notional (cost basis) | Single-coin limit |
+|---|---|---|---|---|
+| $2,500 | $10.02–$11.33 (0.40–0.45% NAV) | 4–5 | $50.02–$60.30 (**2.0–2.4% NAV**) | 8% → OK |
+| $5,000 | $10.02–$11.33 (0.20–0.23% NAV) | 5–6 | $99.97–$110.11 (**2.0–2.2% NAV**) | 8% → OK |
+
+So the $10 minimum is **not** skipped, and the worst case stays far below 8% NAV. The
+overshoot above 2% comes from the final $10-minimum entry; quantity-step rounding causes the
+spread in first-order size. Margin used at 2x is about half the notional. These are sizing
+figures, not a performance estimate.
 
 ## Run locally (analogue of upstream `docker compose --profile live`)
 
