@@ -22,7 +22,7 @@ def generate_report(search_results, backtest_results, output_path):
     lines = []
     lines.append("# GiiQ Diversification Strategy Report")
     lines.append("")
-    lines.append(f"**Generated:** {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
+    lines.append(f"**Generated:** {datetime.now().astimezone().strftime('%Y-%m-%d %H:%M %Z')}")
     lines.append("")
     lines.append("**Objective:** Identify 1–2 non-trend crypto strategies with low correlation to GiiQ BO (daily channel-breakout trend strategy).")
     lines.append("")
