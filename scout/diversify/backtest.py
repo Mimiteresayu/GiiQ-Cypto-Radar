@@ -68,22 +68,24 @@ def get_universe() -> List[str]:
         return ['BTC', 'ETH', 'SOL', 'ARB', 'AVAX', 'MATIC', 'OP', 'DOGE', 'XRP', 'ADA']
 
 
-def get_daily_candles(coin: str, start_ms: int, end_ms: int) -> Dict[int, Dict[str, float]]:
-    """Fetch daily candles for a coin."""
+def get_daily_candles(coin: str, start_ms: int, end_ms: int, max_candles: int = 5000) -> Dict[int, Dict[str, float]]:
+    """Fetch daily candles for a coin. HL returns up to 5000 candles per request."""
     try:
+        # HL candleSnapshot returns up to 5000 candles
+        # For daily candles, that's ~13.7 years of history
         data = post({
             'type': 'candleSnapshot',
             'req': {
                 'coin': coin,
                 'interval': '1d',
-                'startTime': start_ms,
+                'startTime': 0,  # Request from beginning
                 'endTime': end_ms
             }
         })
         
         candles = {}
         for c in data:
-            day = int(c['t']) // 86400000  # Convert to day index
+            day = int(c['t']) // 86400000
             candles[day] = {
                 'open': float(c['o']),
                 'high': float(c['h']),
@@ -96,48 +98,41 @@ def get_daily_candles(coin: str, start_ms: int, end_ms: int) -> Dict[int, Dict[s
         return candles
         
     except Exception as e:
-        print(f"Error fetching candles for {coin}: {e}", file=sys.stderr)
+        print(f"Error fetching HL candles for {coin}: {e}", file=sys.stderr)
         return {}
 
 
 def get_funding_history(coin: str, start_ms: int, end_ms: int) -> Dict[int, float]:
-    """Fetch predicted funding rates for a coin (returns annualized funding rate %).
-    Note: Uses predictedFundings from metaAndAssetCtxs (current rates), not historical rates.
-    Historical funding rates require user-specific userFunding endpoint."""
+    """Fetch historical funding rates for a coin from HL public API.
+    Returns daily average funding rate (annualized %).
+    HL fundingHistory is public per coin and does NOT require a user address."""
     try:
-        # Get current predicted funding from meta
-        # Historical funding would require a user address (userFunding endpoint)
-        # For now, use predictedFundings as a proxy
-        data = post({'type': 'metaAndAssetCtxs'})
-        universe = data[0]['universe']
-        asset_ctx = data[1]
+        # HL fundingHistory returns historical funding (updated every 8h)
+        data = post({
+            'type': 'fundingHistory',
+            'coin': coin,
+            'startTime': 0  # Get full history
+        })
         
-        # Find coin index
-        coin_idx = None
-        for i, u in enumerate(universe):
-            if u['name'] == coin:
-                coin_idx = i
-                break
+        # Aggregate by day
+        daily_funding = defaultdict(list)
+        for f in data:
+            day = int(f['time']) // 86400000
+            rate = float(f['fundingRate'])
+            daily_funding[day].append(rate)
         
-        if coin_idx is None:
-            return {}
-        
-        # Get predicted funding and assume it's constant over the period
-        # This is a simplification - real historical rates would be better
-        funding_rate = float(asset_ctx[coin_idx].get('funding', 0))
-        annualized = funding_rate * 3 * 365 * 100  # 3x daily, annualized as %
-        
-        # Return constant rate for all days (simplified)
-        days_in_range = (end_ms - start_ms) // 86400000
-        start_day = start_ms // 86400000
-        
-        result = {start_day + i: annualized for i in range(int(days_in_range) + 1)}
+        # Average funding per day, annualized to %
+        result = {}
+        for day, rates in daily_funding.items():
+            avg_rate = sum(rates) / len(rates)
+            # Funding is per 8h period, 3x per day
+            result[day] = avg_rate * 3 * 365 * 100  # Annualized as %
         
         time.sleep(0.2)  # Rate limit
         return result
         
     except Exception as e:
-        print(f"Error fetching funding for {coin}: {e}", file=sys.stderr)
+        print(f"Error fetching funding history for {coin}: {e}", file=sys.stderr)
         return {}
 
 
@@ -153,6 +148,113 @@ def calculate_returns(prices: Dict[int, float], window: int) -> Dict[int, float]
             returns[day] = (prices[day] / prices[past_day]) - 1
     
     return returns
+
+
+def calculate_giiq_bo_proxy(price_data: Dict[str, Dict[int, float]]) -> Tuple[Dict[int, float], Dict[int, float]]:
+    """Calculate GiiQ BO proxy: long-only 20-day Donchian breakout, exit at 10-day low.
+    Returns (daily_returns, equity_curve) for the same universe."""
+    
+    # Get common trading days
+    all_days = sorted(set(day for coin_prices in price_data.values() for day in coin_prices.keys()))
+    
+    if len(all_days) < 30:
+        return {}, {}
+    
+    # Calculate 20-day high and 10-day low for each coin
+    positions = {}  # {coin: entry_price}
+    equity_curve = {all_days[0]: 1.0}
+    daily_returns = {}
+    
+    for i, day in enumerate(all_days):
+        if i < 20:  # Need 20 days of history
+            continue
+        
+        daily_pnl = 0.0
+        
+        # Check existing positions for exit
+        for coin in list(positions.keys()):
+            if coin not in price_data or day not in price_data[coin]:
+                continue
+            
+            # Calculate 10-day low
+            low_10d = min(price_data[coin][all_days[j]] 
+                         for j in range(max(0, i-10), i) 
+                         if all_days[j] in price_data[coin])
+            
+            current_price = price_data[coin][day]
+            
+            # Exit if price hits 10-day low
+            if current_price <= low_10d:
+                entry_price = positions[coin]
+                pnl = (current_price / entry_price) - 1
+                daily_pnl += pnl
+                del positions[coin]
+        
+        # Check for new entries (20-day breakout)
+        for coin, prices in price_data.items():
+            if coin in positions:  # Already in position
+                continue
+            
+            if day not in prices:
+                continue
+            
+            # Calculate 20-day high (excluding today)
+            high_20d = max(prices[all_days[j]] 
+                          for j in range(max(0, i-20), i) 
+                          if all_days[j] in prices)
+            
+            current_price = prices[day]
+            
+            # Enter if price breaks above 20-day high
+            if current_price > high_20d:
+                positions[coin] = current_price
+        
+        # Mark-to-market existing positions
+        for coin, entry_price in positions.items():
+            if coin in price_data and day in price_data[coin]:
+                prev_day = all_days[i-1] if i > 0 else day
+                if prev_day in price_data[coin]:
+                    prev_price = price_data[coin][prev_day]
+                    current_price = price_data[coin][day]
+                    if prev_price > 0:
+                        daily_ret = (current_price / prev_price) - 1
+                        daily_pnl += daily_ret
+        
+        # Equal weight across all positions
+        if len(positions) > 0:
+            daily_pnl /= len(positions)
+        
+        prev_equity = equity_curve[all_days[i-1]]
+        equity_curve[day] = prev_equity * (1 + daily_pnl)
+        daily_returns[day] = daily_pnl
+    
+    return daily_returns, equity_curve
+
+
+def calculate_correlation(returns1: Dict[int, float], returns2: Dict[int, float]) -> float:
+    """Calculate correlation between two return series."""
+    # Get common days
+    common_days = sorted(set(returns1.keys()) & set(returns2.keys()))
+    
+    if len(common_days) < 10:
+        return 0.0
+    
+    r1 = [returns1[d] for d in common_days]
+    r2 = [returns2[d] for d in common_days]
+    
+    # Calculate correlation
+    n = len(r1)
+    mean1 = sum(r1) / n
+    mean2 = sum(r2) / n
+    
+    cov = sum((r1[i] - mean1) * (r2[i] - mean2) for i in range(n)) / n
+    std1 = (sum((r1[i] - mean1) ** 2 for i in range(n)) / n) ** 0.5
+    std2 = (sum((r2[i] - mean2) ** 2 for i in range(n)) / n) ** 0.5
+    
+    if std1 == 0 or std2 == 0:
+        return 0.0
+    
+    return cov / (std1 * std2)
 
 
 def strategy_cross_sectional_reversal(
@@ -277,17 +379,23 @@ def strategy_cross_sectional_reversal(
             equity.append(equity[-1] * (1 + pnl))
             equity_curve[day] = equity[-1]
     
+    # Build daily returns dictionary
+    daily_returns = {}
+    for i in range(1, len(list(equity_curve.keys()))):
+        days_sorted = sorted(equity_curve.keys())
+        day = days_sorted[i]
+        prev_day = days_sorted[i-1]
+        daily_returns[day] = (equity_curve[day] / equity_curve[prev_day]) - 1
+    
     # Calculate metrics
     returns = [equity[i] / equity[i-1] - 1 for i in range(1, len(equity))]
     
-    metrics = calculate_metrics(
-        equity_curve,
-        returns,
-        'Cross-Sectional Reversal',
-        trades
-    )
-    
-    return metrics
+    return {
+        'equity_curve': equity_curve,
+        'returns': returns,
+        'trades': trades,
+        'daily_returns': daily_returns
+    }
 
 
 def strategy_funding_cross_section(
@@ -428,16 +536,22 @@ def strategy_funding_cross_section(
             equity.append(equity[-1] * (1 + total_pnl))
             equity_curve[day] = equity[-1]
     
+    # Build daily returns dictionary
+    daily_returns = {}
+    for i in range(1, len(list(equity_curve.keys()))):
+        days_sorted = sorted(equity_curve.keys())
+        day = days_sorted[i]
+        prev_day = days_sorted[i-1]
+        daily_returns[day] = (equity_curve[day] / equity_curve[prev_day]) - 1
+    
     returns = [equity[i] / equity[i-1] - 1 for i in range(1, len(equity))]
     
-    metrics = calculate_metrics(
-        equity_curve,
-        returns,
-        'Funding Cross-Section',
-        trades
-    )
-    
-    return metrics
+    return {
+        'equity_curve': equity_curve,
+        'returns': returns,
+        'trades': trades,
+        'daily_returns': daily_returns
+    }
 
 
 def strategy_pairs_mean_reversion(start_ms: int, end_ms: int) -> Dict[str, Any]:
@@ -612,23 +726,46 @@ def strategy_pairs_mean_reversion(start_ms: int, end_ms: int) -> Dict[str, Any]:
         equity.append(equity[-1] * (1 + daily_pnl))
         equity_curve[day] = equity[-1]
     
+    # Build daily returns dictionary
+    daily_returns = {}
+    for i in range(1, len(list(equity_curve.keys()))):
+        days_sorted = sorted(equity_curve.keys())
+        day = days_sorted[i]
+        prev_day = days_sorted[i-1]
+        daily_returns[day] = (equity_curve[day] / equity_curve[prev_day]) - 1
+    
     returns = [equity[i] / equity[i-1] - 1 for i in range(1, len(equity))]
     
-    metrics = calculate_metrics(
-        equity_curve,
-        returns,
-        'Pairs Mean Reversion',
-        trades
-    )
+    # Calculate per-pair metrics
+    per_pair_metrics = {}
+    for pair_name in pairs:
+        pair_str = f'{pair_name[0]}/{pair_name[1]}'
+        pair_trades = [t for t in trades if t.get('pair') == pair_str]
+        
+        per_pair_metrics[pair_str] = {
+            'trades': len(pair_trades),
+            'entries': len([t for t in pair_trades if 'enter' in t.get('action', '')]),
+            'exits': len([t for t in pair_trades if 'exit' in t.get('action', '') or 'stop' in t.get('action', '')])
+        }
     
-    return metrics
+    return {
+        'equity_curve': equity_curve,
+        'returns': returns,
+        'trades': trades,
+        'daily_returns': daily_returns,
+        'per_pair': per_pair_metrics
+    }
 
 
 def calculate_metrics(
     equity_curve: Dict[int, float],
     returns: List[float],
     strategy_name: str,
-    trades: List[Dict[str, Any]]
+    trades: List[Dict[str, Any]],
+    daily_returns: Dict[int, float],
+    giiq_bo_returns: Dict[int, float],
+    btc_returns: Dict[int, float],
+    start_date_ms: int
 ) -> Dict[str, Any]:
     """Calculate performance metrics for a strategy."""
     
@@ -664,23 +801,50 @@ def calculate_metrics(
     loss_sum = abs(sum(losses))
     profit_factor = (win_sum / loss_sum) if loss_sum > 0 else (float('inf') if win_sum > 0 else 0)
     
-    # Year-by-year split
+    # Year-by-year split (use actual calendar years)
     yearly = defaultdict(list)
     days = sorted(equity_curve.keys())
     
     for i in range(1, len(days)):
         day = days[i]
         ret = equity_curve[day] / equity_curve[days[i-1]] - 1
-        # Approximate year from day index (day 0 = start date)
-        year = 2020 + (day - days[0]) // 365  # Rough approximation
-        yearly[year].append(ret)
+        # Convert day index to actual year
+        day_ms = day * 86400000
+        year = 1970 + day_ms // (365.25 * 86400000)
+        yearly[int(year)].append(ret)
     
     yearly_returns = {}
+    yearly_sharpe = {}
+    yearly_mdd = {}
+    yearly_trades = {}
+    
     for year, rets in yearly.items():
         year_equity = 1.0
+        peak = 1.0
+        mdd = 0.0
+        
         for r in rets:
             year_equity *= (1 + r)
+            peak = max(peak, year_equity)
+            dd = 1 - year_equity / peak
+            mdd = max(mdd, dd)
+        
         yearly_returns[year] = year_equity - 1
+        
+        # Yearly Sharpe
+        if len(rets) > 1:
+            mean_ret = sum(rets) / len(rets)
+            std_ret = statistics.stdev(rets)
+            yearly_sharpe[year] = (mean_ret / std_ret * (252 ** 0.5)) if std_ret > 0 else 0
+        else:
+            yearly_sharpe[year] = 0
+        
+        yearly_mdd[year] = mdd
+        
+        # Count trades per year
+        year_start_day = int((year - 1970) * 365.25)
+        year_end_day = int((year - 1970 + 1) * 365.25)
+        yearly_trades[year] = sum(1 for t in trades if 'day' in t and year_start_day <= t['day'] < year_end_day)
     
     # IS/OOS split (≤2023 vs 2024-2026)
     is_returns = []
@@ -700,11 +864,27 @@ def calculate_metrics(
     for r in oos_returns:
         oos_equity *= (1 + r)
     
-    # Correlations (placeholder - would need actual GiiQ BO and BTC returns)
-    corr_giiq = None  # "Not calculated (requires GiiQ BO returns)"
-    corr_btc = None   # "Not calculated (requires aligned BTC returns)"
+    is_sharpe = 0.0
+    oos_sharpe = 0.0
     
-    return {
+    if len(is_returns) > 1:
+        mean_is = sum(is_returns) / len(is_returns)
+        std_is = statistics.stdev(is_returns)
+        is_sharpe = (mean_is / std_is * (252 ** 0.5)) if std_is > 0 else 0
+    
+    if len(oos_returns) > 1:
+        mean_oos = sum(oos_returns) / len(oos_returns)
+        std_oos = statistics.stdev(oos_returns)
+        oos_sharpe = (mean_oos / std_oos * (252 ** 0.5)) if std_oos > 0 else 0
+    
+    # Correlations
+    corr_giiq = calculate_correlation(daily_returns, giiq_bo_returns) if giiq_bo_returns else None
+    corr_btc = calculate_correlation(daily_returns, btc_returns) if btc_returns else None
+    
+    # Check if underpowered
+    underpowered = len(trades) < 50
+    
+    result = {
         'strategy': strategy_name,
         'total_return': f'{total_return:.2%}',
         'cagr': f'{cagr:.2%}',
@@ -713,13 +893,34 @@ def calculate_metrics(
         'profit_factor': f'{profit_factor:.2f}' if profit_factor != float('inf') else 'inf',
         'num_trades': len(trades),
         'num_days': len(returns),
-        'yearly_returns': {str(y): f'{r:.2%}' for y, r in sorted(yearly_returns.items())},
-        'is_return': f'{is_equity - 1:.2%}' if is_returns else 'N/A',
-        'oos_return': f'{oos_equity - 1:.2%}' if oos_returns else 'N/A',
-        'corr_giiq_bo': 'Not calculated (requires GiiQ BO proxy returns)',
-        'corr_btc': 'Not calculated (requires aligned BTC returns)',
+        'underpowered': underpowered,
+        'yearly_summary': {
+            str(y): {
+                'return': f'{yearly_returns[y]:.2%}',
+                'sharpe': f'{yearly_sharpe[y]:.2f}',
+                'mdd': f'{yearly_mdd[y]:.2%}',
+                'trades': yearly_trades[y]
+            }
+            for y in sorted(yearly_returns.keys())
+        },
+        'is_summary': {
+            'return': f'{is_equity - 1:.2%}' if is_returns else 'N/A',
+            'sharpe': f'{is_sharpe:.2f}' if is_returns else 'N/A',
+            'days': len(is_returns)
+        },
+        'oos_summary': {
+            'return': f'{oos_equity - 1:.2%}' if oos_returns else 'N/A',
+            'sharpe': f'{oos_sharpe:.2f}' if oos_returns else 'N/A',
+            'days': len(oos_returns)
+        },
+        'correlations': {
+            'giiq_bo': f'{corr_giiq:.3f}' if corr_giiq is not None else 'N/A',
+            'btc': f'{corr_btc:.3f}' if corr_btc is not None else 'N/A'
+        },
         'trades_sample': trades[:5] if len(trades) > 5 else trades
     }
+    
+    return result
 
 
 def main():
@@ -732,60 +933,148 @@ def main():
     print("=" * 80)
     print("GiiQ Diversification Strategy Backtest")
     print("=" * 80)
-    print(f"Lookback: {args.days} days")
-    print(f"Data source: Hyperliquid public API")
+    print(f"Lookback: {args.days} days (requesting maximum available from HL)")
+    print(f"Data source: Hyperliquid public API (candleSnapshot up to 5000 daily candles)")
     print(f"Output: {args.output}")
     print()
     
     # Date range
     end_time = int(time.time() * 1000)
-    start_time = end_time - (args.days * 86400 * 1000)
+    start_time = 0  # Request all available history
     
     # Get universe
     print("Fetching universe...")
     universe = get_universe()
     print(f"Universe: {len(universe)} coins - {', '.join(universe[:10])}...")
     
+    # Fetch price data for universe (shared across strategies and GiiQ BO)
+    print("\nFetching price data for full universe...")
+    price_data = {}
+    data_start_dates = {}
+    
+    for coin in universe:
+        candles = get_daily_candles(coin, start_time, end_time)
+        if candles:
+            price_data[coin] = {day: c['close'] for day, c in candles.items()}
+            if candles:
+                data_start_dates[coin] = min(candles.keys())
+    
+    # Report data availability
+    if data_start_dates:
+        earliest_day = min(data_start_dates.values())
+        earliest_date = datetime.fromtimestamp(earliest_day * 86400).strftime('%Y-%m-%d')
+        avg_days = sum(len(p) for p in price_data.values()) / len(price_data)
+        print(f"Data available: earliest {earliest_date}, avg {avg_days:.0f} days per coin")
+    
+    # Calculate GiiQ BO proxy
+    print("\nCalculating GiiQ BO proxy (20-day Donchian breakout, 10-day low exit)...")
+    giiq_bo_returns, giiq_bo_equity = calculate_giiq_bo_proxy(price_data)
+    print(f"GiiQ BO proxy: {len(giiq_bo_returns)} days of returns")
+    
+    # Calculate BTC returns
+    btc_returns = {}
+    if 'BTC' in price_data:
+        days_sorted = sorted(price_data['BTC'].keys())
+        for i in range(1, len(days_sorted)):
+            day = days_sorted[i]
+            prev_day = days_sorted[i-1]
+            if price_data['BTC'][prev_day] > 0:
+                btc_returns[day] = (price_data['BTC'][day] / price_data['BTC'][prev_day]) - 1
+        print(f"BTC returns: {len(btc_returns)} days")
+    
     # Run strategies
     results = {
         'meta': {
             'timestamp': datetime.now().astimezone().isoformat(),
-            'lookback_days': args.days,
-            'data_source': 'Hyperliquid public API',
-            'data_limitations': 'Limited history available via public API; full history with delisted coins requires Binance data archive',
+            'requested_lookback_days': args.days,
+            'actual_days_available': int(avg_days) if data_start_dates else 0,
+            'earliest_data': earliest_date if data_start_dates else 'N/A',
+            'data_source': 'Hyperliquid public API (candleSnapshot, fundingHistory)',
+            'data_limitations': f'HL provides up to 5000 daily candles per coin (~13.7 years). Earliest data: {earliest_date if data_start_dates else "N/A"}. No Binance data archive attempted (requires additional setup).',
             'universe_size': len(universe),
             'costs': {
                 'taker_fee': '0.045%',
                 'slippage': '0.05% per side',
-                'funding': 'Included for strategy 2'
+                'funding': 'Historical funding rates from HL fundingHistory (per coin, no user address required)'
+            },
+            'giiq_bo_proxy': {
+                'spec': 'Long-only 20-day Donchian breakout, exit at 10-day low',
+                'days': len(giiq_bo_returns)
             }
         },
         'strategies': {}
     }
     
     try:
-        results['strategies']['cross_sectional_reversal'] = strategy_cross_sectional_reversal(
-            universe, start_time, end_time
-        )
+        print("\nRunning Strategy 1: Cross-Sectional Reversal...")
+        strat1 = strategy_cross_sectional_reversal(universe, start_time, end_time)
+        # Fill in correlations
+        if 'error' not in strat1:
+            strat1_metrics = calculate_metrics(
+                strat1.get('equity_curve', {}),
+                strat1.get('returns', []),
+                'Cross-Sectional Reversal',
+                strat1.get('trades', []),
+                strat1.get('daily_returns', {}),
+                giiq_bo_returns,
+                btc_returns,
+                start_time
+            )
+            results['strategies']['cross_sectional_reversal'] = strat1_metrics
+        else:
+            results['strategies']['cross_sectional_reversal'] = strat1
     except Exception as e:
         results['strategies']['cross_sectional_reversal'] = {'error': str(e)}
         print(f"Strategy 1 failed: {e}")
+        import traceback
+        traceback.print_exc()
     
     try:
-        results['strategies']['funding_cross_section'] = strategy_funding_cross_section(
-            universe, start_time, end_time
-        )
+        print("\nRunning Strategy 2: Funding Cross-Section...")
+        strat2 = strategy_funding_cross_section(universe, start_time, end_time)
+        if 'error' not in strat2:
+            strat2_metrics = calculate_metrics(
+                strat2.get('equity_curve', {}),
+                strat2.get('returns', []),
+                'Funding Cross-Section',
+                strat2.get('trades', []),
+                strat2.get('daily_returns', {}),
+                giiq_bo_returns,
+                btc_returns,
+                start_time
+            )
+            results['strategies']['funding_cross_section'] = strat2_metrics
+        else:
+            results['strategies']['funding_cross_section'] = strat2
     except Exception as e:
         results['strategies']['funding_cross_section'] = {'error': str(e)}
         print(f"Strategy 2 failed: {e}")
+        import traceback
+        traceback.print_exc()
     
     try:
-        results['strategies']['pairs_mean_reversion'] = strategy_pairs_mean_reversion(
-            start_time, end_time
-        )
+        print("\nRunning Strategy 3: Pairs Mean Reversion...")
+        strat3 = strategy_pairs_mean_reversion(start_time, end_time)
+        if 'error' not in strat3:
+            strat3_metrics = calculate_metrics(
+                strat3.get('equity_curve', {}),
+                strat3.get('returns', []),
+                'Pairs Mean Reversion',
+                strat3.get('trades', []),
+                strat3.get('daily_returns', {}),
+                giiq_bo_returns,
+                btc_returns,
+                start_time
+            )
+            strat3_metrics['per_pair'] = strat3.get('per_pair', {})
+            results['strategies']['pairs_mean_reversion'] = strat3_metrics
+        else:
+            results['strategies']['pairs_mean_reversion'] = strat3
     except Exception as e:
         results['strategies']['pairs_mean_reversion'] = {'error': str(e)}
         print(f"Strategy 3 failed: {e}")
+        import traceback
+        traceback.print_exc()
     
     # Save results
     with open(args.output, 'w') as f:

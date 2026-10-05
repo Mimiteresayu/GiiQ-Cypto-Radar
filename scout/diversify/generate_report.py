@@ -46,8 +46,8 @@ def generate_report(search_results, backtest_results, output_path):
         strategies = backtest_results['strategies']
         
         # Summary table
-        lines.append("| Strategy | PF | CAGR | Sharpe | MDD | Trades | IS Return | OOS Return |")
-        lines.append("|----------|-----|------|--------|-----|--------|-----------|------------|")
+        lines.append("| Strategy | PF | CAGR | Sharpe | MDD | Trades | Corr(GiiQ BO) | Corr(BTC) | IS Return | OOS Return |")
+        lines.append("|----------|-----|------|--------|-----|--------|---------------|-----------|-----------|------------|")
         
         strategy_names = {
             'cross_sectional_reversal': '1. Cross-Sectional Reversal',
@@ -59,9 +59,14 @@ def generate_report(search_results, backtest_results, output_path):
             if key in strategies:
                 s = strategies[key]
                 if 'error' in s:
-                    lines.append(f"| {name} | ERROR | - | - | - | - | - | - |")
+                    lines.append(f"| {name} | ERROR | - | - | - | - | - | - | - | - |")
                 else:
-                    lines.append(f"| {name} | {s.get('profit_factor', 'N/A')} | {s.get('cagr', 'N/A')} | {s.get('sharpe', 'N/A')} | {s.get('max_drawdown', 'N/A')} | {s.get('num_trades', 0)} | {s.get('is_return', 'N/A')} | {s.get('oos_return', 'N/A')} |")
+                    underpowered = ' ⚠️ UNDERPOWERED' if s.get('underpowered', False) else ''
+                    corr_giiq = s.get('correlations', {}).get('giiq_bo', 'N/A')
+                    corr_btc = s.get('correlations', {}).get('btc', 'N/A')
+                    is_ret = s.get('is_summary', {}).get('return', 'N/A')
+                    oos_ret = s.get('oos_summary', {}).get('return', 'N/A')
+                    lines.append(f"| {name}{underpowered} | {s.get('profit_factor', 'N/A')} | {s.get('cagr', 'N/A')} | {s.get('sharpe', 'N/A')} | {s.get('max_drawdown', 'N/A')} | {s.get('num_trades', 0)} | {corr_giiq} | {corr_btc} | {is_ret} | {oos_ret} |")
         
         lines.append("")
         lines.append("**Costs:** 0.045% taker fee + 0.05% slippage per side; funding included for strategy 2.")
@@ -96,30 +101,49 @@ def generate_report(search_results, backtest_results, output_path):
                 lines.append(f"- **Max Drawdown:** {s.get('max_drawdown', 'N/A')}")
                 lines.append(f"- **Profit Factor:** {s.get('profit_factor', 'N/A')}")
                 lines.append(f"- **Number of Trades:** {s.get('num_trades', 0)}")
+                
+                if s.get('underpowered', False):
+                    lines.append(f"- **⚠️ UNDERPOWERED:** <50 trades, results may not be statistically significant")
+                
                 lines.append(f"- **Days Traded:** {s.get('num_days', 0)}")
                 lines.append("")
                 
-                # Year-by-year
-                if 'yearly_returns' in s and s['yearly_returns']:
-                    lines.append("**Year-by-Year Returns:**")
+                # Correlations
+                corr = s.get('correlations', {})
+                lines.append("**Correlations:**")
+                lines.append("")
+                lines.append(f"- vs GiiQ BO (20d Donchian): {corr.get('giiq_bo', 'N/A')}")
+                lines.append(f"- vs BTC: {corr.get('btc', 'N/A')}")
+                lines.append("")
+                
+                # Year-by-year table
+                if 'yearly_summary' in s and s['yearly_summary']:
+                    lines.append("**Year-by-Year Performance:**")
                     lines.append("")
-                    for year, ret in sorted(s['yearly_returns'].items()):
-                        lines.append(f"- {year}: {ret}")
+                    lines.append("| Year | Return | Sharpe | MDD | Trades |")
+                    lines.append("|------|--------|--------|-----|--------|")
+                    for year, data in sorted(s['yearly_summary'].items()):
+                        lines.append(f"| {year} | {data.get('return', 'N/A')} | {data.get('sharpe', 'N/A')} | {data.get('mdd', 'N/A')} | {data.get('trades', 0)} |")
                     lines.append("")
                 
                 # IS/OOS
                 lines.append("**In-Sample (≤2023) vs Out-of-Sample (2024-2026):**")
                 lines.append("")
-                lines.append(f"- IS Return: {s.get('is_return', 'N/A')}")
-                lines.append(f"- OOS Return: {s.get('oos_return', 'N/A')}")
+                is_summary = s.get('is_summary', {})
+                oos_summary = s.get('oos_summary', {})
+                lines.append(f"- **IS:** Return {is_summary.get('return', 'N/A')}, Sharpe {is_summary.get('sharpe', 'N/A')}, {is_summary.get('days', 0)} days")
+                lines.append(f"- **OOS:** Return {oos_summary.get('return', 'N/A')}, Sharpe {oos_summary.get('sharpe', 'N/A')}, {oos_summary.get('days', 0)} days")
                 lines.append("")
                 
-                # Correlations
-                lines.append("**Correlations:**")
-                lines.append("")
-                lines.append(f"- vs GiiQ BO: {s.get('corr_giiq_bo', 'Not calculated')}")
-                lines.append(f"- vs BTC: {s.get('corr_btc', 'Not calculated')}")
-                lines.append("")
+                # Per-pair for pairs strategy
+                if key == 'pairs_mean_reversion' and 'per_pair' in s:
+                    lines.append("**Per-Pair Breakdown:**")
+                    lines.append("")
+                    lines.append("| Pair | Trades | Entries | Exits |")
+                    lines.append("|------|--------|---------|-------|")
+                    for pair, data in sorted(s['per_pair'].items()):
+                        lines.append(f"| {pair} | {data.get('trades', 0)} | {data.get('entries', 0)} | {data.get('exits', 0)} |")
+                    lines.append("")
     
     else:
         lines.append("**No backtest results available.**")
