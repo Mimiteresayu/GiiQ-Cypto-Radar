@@ -108,7 +108,9 @@ limit at a 5% slippage price (what SDK `market_close` does), then `clearinghouse
 to confirm size 0. Size before/after and fill price are logged. Up to 3 attempts per coin; if a
 position is still non-zero or the close/read fails, a `CRITICAL` line is logged and appended to
 `/data/c48_3_HALTED` (close manually in the HL testnet UI), and the exit is still non-zero. A
-plain Railway SIGTERM (redeploy/stop) only cancels BTC orders and does not write the halt marker.
+plain Railway SIGTERM (redeploy/stop) runs the same cancel + reduce-only close + verify (CRITICAL
+logged on failure) but does not write the halt marker, so the new container can start; it then
+exits 0.
 
 **Prism must spot-check fills (place/fill/cancel logs vs HL testnet `clearinghouseState`, lev <= 3,
 notional <= 8% NAV, DD) before any YELLOW/PASS.**

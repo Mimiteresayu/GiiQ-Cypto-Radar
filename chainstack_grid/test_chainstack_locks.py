@@ -550,10 +550,35 @@ class TestFlatten(unittest.TestCase):
             self.assertEqual(rc, 3)
             self.assertEqual(c.closes, [("BTC", 0.0002)])
 
-    def test_signal_stop_does_not_close(self):
-        c = FakeClient(positions=[btc_pos()])
-        ge.stop_bot(FakeProc(), c, self.data, "signal 15", halt=False)
-        self.assertEqual(c.closes, [])
+    def signal_stop(self, c):
+        from io import StringIO
+        from contextlib import redirect_stdout
+        buf = StringIO()
+        proc = FakeProc()
+        with redirect_stdout(buf):
+            problems = ge.stop_bot(proc, c, self.data, "signal 15", halt=False)
+        return proc, problems, buf.getvalue()
+
+    def test_signal_stop_flattens_without_halt_file(self):
+        c = FakeClient(positions=[btc_pos(szi="0.0002")])
+        c.orders = [{"coin": "BTC", "oid": 1}]
+        proc, problems, out = self.signal_stop(c)
+        self.assertEqual(proc.signals, [signal.SIGTERM])
+        self.assertEqual(c.cancelled_coins, ["BTC"])
+        self.assertEqual(c.closes, [("BTC", 0.0002)])
+        self.assertEqual(c.positions[0]["szi"], "0.0")
+        self.assertEqual(problems, [])
+        self.assertIn("size 0.0002 -> 0 (filled 0.0002 @ 85000.0)", out)
+        self.assertFalse((self.data / ge.HALT_MARKER_NAME).exists())
+
+    def test_signal_stop_close_failure_critical_without_halt_file(self):
+        c = FakeClient(positions=[btc_pos(szi="0.0002")])
+        c.close_fails = True
+        _, problems, out = self.signal_stop(c)
+        self.assertEqual(len(c.closes), ge.CLOSE_ATTEMPTS)
+        self.assertTrue(problems)
+        self.assertIn("CRITICAL", out)
+        self.assertFalse((self.data / ge.HALT_MARKER_NAME).exists())
 
     def test_sdk_close_is_reduce_only_ioc(self):
         calls = {}

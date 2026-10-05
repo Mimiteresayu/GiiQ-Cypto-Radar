@@ -366,17 +366,11 @@ def stop_bot(proc, client, data_dir: Path, reason: str, halt: bool = True) -> li
             proc.wait(timeout=60)
         except subprocess.TimeoutExpired:
             proc.kill()
-    if not halt:
-        try:
-            log(f"cancelled {client.cancel_all(COIN)} open {COIN} orders")
-        except Exception as e:  # noqa: BLE001
-            log(f"ERROR cancelling orders: {e}; cancel manually in the HL testnet UI")
-        return []
     problems = flatten(client)
     if problems:
         msg = "CRITICAL: flatten failed, close manually in the HL testnet UI: " + "; ".join(problems)
         log(msg)
-        if data_dir.is_dir():
+        if halt and data_dir.is_dir():
             with marker.open("a", encoding="utf-8") as f:
                 f.write(scrub(msg) + "\n")
     else:
