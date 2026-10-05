@@ -1,0 +1,4 @@
+*
+!Dockerfile
+!giiq_entrypoint.py
+!configs/giiq_c48_1_paper.json
