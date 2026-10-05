@@ -184,9 +184,14 @@ def calculate_giiq_bo_proxy(price_data: Dict[str, Dict[int, float]]) -> Tuple[Di
                 continue
             
             # Calculate 10-day low
-            low_10d = min(price_data[coin][all_days[j]] 
+            low_prices = [price_data[coin][all_days[j]] 
                          for j in range(max(0, i-10), i) 
-                         if all_days[j] in price_data[coin])
+                         if all_days[j] in price_data[coin]]
+            
+            if not low_prices:  # Skip if no historical data
+                continue
+            
+            low_10d = min(low_prices)
             
             current_price = price_data[coin][day]
             
@@ -206,9 +211,14 @@ def calculate_giiq_bo_proxy(price_data: Dict[str, Dict[int, float]]) -> Tuple[Di
                 continue
             
             # Calculate 20-day high (excluding today)
-            high_20d = max(prices[all_days[j]] 
+            high_prices = [prices[all_days[j]] 
                           for j in range(max(0, i-20), i) 
-                          if all_days[j] in prices)
+                          if all_days[j] in prices]
+            
+            if not high_prices:  # Skip if no historical data
+                continue
+            
+            high_20d = max(high_prices)
             
             current_price = prices[day]
             
