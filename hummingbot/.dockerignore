@@ -1,0 +1,7 @@
+.env
+data/
+logs/
+conf/
+docs/
+test_*.py
+__pycache__/

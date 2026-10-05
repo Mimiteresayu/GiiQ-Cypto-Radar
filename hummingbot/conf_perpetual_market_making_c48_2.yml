@@ -1,0 +1,44 @@
+########################################
+# C48-2 LOCKED — perpetual_market_making
+# Cove gate 2026-10-05. Do not loosen.
+# order_amount is BASE size; set so notional ≈ NAV*2%.
+# Keys match upstream perpetual_market_making_config_map.py and
+# conf_perpetual_market_making_strategy_TEMPLATE.yml (template_version 6) at
+# hummingbot v2.16.0 (8f19061) and master v2.17.0 (9af100d) — unchanged between them.
+# giiq_entrypoint.py refuses to start if any lock below is broken.
+########################################
+template_version: 6
+strategy: perpetual_market_making
+derivative: hyperliquid_perpetual_testnet
+market: BTC-USD
+leverage: 2
+position_mode: One-way
+bid_spread: 0.2
+ask_spread: 0.2
+minimum_spread: -100
+order_refresh_time: 30.0
+order_refresh_tolerance_pct: 0.0
+# NAV $2500 @ BTC ~$100k → ~0.0005 BTC ≈ $50 (2%). Recalc before live:
+#   order_amount = (NAV * 0.02) / mid   (override at runtime with GIIQ_ORDER_AMOUNT)
+order_amount: 0.0005
+long_profit_taking_spread: 0.5
+short_profit_taking_spread: 0.5
+stop_loss_spread: 1.0
+time_between_stop_loss_orders: 60.0
+stop_loss_slippage_buffer: 0.5
+price_ceiling: -1
+price_floor: -1
+order_levels: 1
+order_level_amount: 0
+order_level_spread: 1
+filled_order_delay: 60.0
+order_optimization_enabled: false
+ask_order_optimization_depth: 0
+bid_order_optimization_depth: 0
+price_source: current_market
+price_type: mid_price
+price_source_derivative: null
+price_source_market: null
+price_source_custom_api: null
+custom_api_update_interval: 5.0
+order_override: null
