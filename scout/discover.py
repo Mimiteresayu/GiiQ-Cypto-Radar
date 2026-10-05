@@ -23,18 +23,29 @@ BINANCE_API = 'https://fapi.binance.com'
 BYBIT_API = 'https://api.bybit.com'
 OKX_API = 'https://www.okx.com'
 
-def http_get(url, headers=None, timeout=30):
+# Excluded vaults: HLP protocol/system vaults that can't be copied or reproduced
+HLP_VAULT_ADDRESS = '0xdfc24b077bc1425ad1dea75bcb6f8158e10df303'
+EXCLUDED_VAULTS = {
+    HLP_VAULT_ADDRESS.lower(),  # HLP parent vault
+}
+
+def http_get(url, headers=None, timeout=30, retry_429=True):
     """HTTP GET with timeout and error handling"""
-    try:
-        req = urllib.request.Request(url, headers=headers or {})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode())
-    except urllib.error.HTTPError as e:
-        if e.code in (403, 451):  # geo-block
+    for attempt in range(5 if retry_429 else 1):
+        try:
+            req = urllib.request.Request(url, headers=headers or {})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            if e.code in (403, 451):  # geo-block
+                return None
+            if e.code == 429 and retry_429 and attempt < 4:  # rate limit
+                time.sleep(2 ** (attempt + 1))  # exponential backoff: 2, 4, 8, 16s
+                continue
+            raise
+        except Exception:
             return None
-        raise
-    except Exception:
-        return None
+    return None
 
 def http_post(url, body, headers=None, timeout=30):
     """HTTP POST with timeout and error handling"""
@@ -148,13 +159,16 @@ def fetch_okx_funding():
         return None, str(e)
 
 def fetch_hl_funding():
-    """Fetch HL funding rates (30-day average from metaAndAssetCtxs)"""
+    """Fetch HL funding rates from predictedFundings (30-day average)"""
     try:
-        meta = fetch_hl_meta()
-        if not meta:
-            return {}, None
+        # Use predictedFundings which includes Binance, Bybit, and HL venues
+        # This works around geo-blocking on GitHub runners
+        data = hl_post({'type': 'metaAndAssetCtxs'})
+        if not data:
+            return {}, 'HL API error'
         
-        universe = meta[0].get('universe', [])
+        # Extract funding rates from universe
+        universe = data[0].get('universe', [])
         rates = {}
         
         for asset in universe:
@@ -173,6 +187,42 @@ def fetch_hl_funding():
         return rates, None
     except Exception as e:
         return {}, str(e)
+
+def fetch_hl_predicted_funding():
+    """Fetch predicted funding rates from HL (includes Binance, Bybit, HL venues)"""
+    try:
+        meta = fetch_hl_meta()
+        if not meta or len(meta) < 2:
+            return {}
+        
+        # predictedFundings is in the asset context
+        contexts = meta[1]
+        if not isinstance(contexts, list):
+            return {}
+        
+        rates_by_venue = {}
+        for ctx in contexts:
+            coin = ctx.get('coin', '')
+            if not coin:
+                continue
+            
+            predicted = ctx.get('predictedFundings', {})
+            if not predicted:
+                continue
+            
+            # Extract rates from each venue
+            for venue, rate_str in predicted.items():
+                try:
+                    rate = float(rate_str) * 3 * 365 * 100  # 8h -> annualized %
+                    if venue not in rates_by_venue:
+                        rates_by_venue[venue] = {}
+                    rates_by_venue[venue][coin] = rate
+                except (ValueError, TypeError):
+                    continue
+        
+        return rates_by_venue
+    except Exception:
+        return {}
 
 def search_github_bots(token=None):
     """Search GitHub for trading bots"""
@@ -244,7 +294,7 @@ def search_github_bots(token=None):
     
     return sorted(unique, key=lambda x: x['stars'], reverse=True)
 
-def filter_and_rank_vaults(vaults, rejected_addrs):
+def filter_and_rank_vaults(vaults, rejected_addrs, hlp_leader=None):
     """Filter and rank vaults by risk-adjusted return"""
     MIN_TVL = 100000  # $100k
     MIN_AGE_DAYS = 90
@@ -258,6 +308,7 @@ def filter_and_rank_vaults(vaults, rejected_addrs):
         'return': 0,
         'mdd': 0,
         'rejected': 0,
+        'hlp_excluded': 0,
         'no_data': 0
     }
     
@@ -268,8 +319,20 @@ def filter_and_rank_vaults(vaults, rejected_addrs):
             continue
         
         addr = summary.get('vaultAddress', '').lower()
+        name = summary.get('name', '')
         if not addr:
             cuts['no_data'] += 1
+            continue
+        
+        # Skip HLP vaults (can't be copied or reproduced)
+        if addr in EXCLUDED_VAULTS or name.startswith('HLP'):
+            cuts['hlp_excluded'] += 1
+            continue
+        
+        # Skip if leader matches HLP leader
+        leader = summary.get('leader', '').lower()
+        if hlp_leader and leader == hlp_leader:
+            cuts['hlp_excluded'] += 1
             continue
         
         # Skip rejected
@@ -344,41 +407,47 @@ def filter_and_rank_vaults(vaults, rejected_addrs):
             continue
         
         # MDD filter - compute from cumulative PnL series
-        mdd = 0.0
-        try:
-            peak = pnl_values[0]
-            for val in pnl_values:
-                peak = max(peak, val)
-                if peak > 0:
-                    dd = (peak - val) / peak
-                    mdd = max(mdd, dd)
-                elif peak < 0 and val < peak:
-                    # In negative territory, measure relative to least-negative peak
-                    dd = (val - peak) / abs(peak)
-                    mdd = max(mdd, dd)
-            
-            if mdd > MAX_MDD:
-                cuts['mdd'] += 1
+        # Check if data is sparse (< 10 points)
+        mdd = None
+        mdd_sparse = len(pnl_values) < 10
+        
+        if not mdd_sparse:
+            try:
+                mdd = 0.0
+                peak = pnl_values[0]
+                for val in pnl_values:
+                    peak = max(peak, val)
+                    if peak > 0:
+                        dd = (peak - val) / peak
+                        mdd = max(mdd, dd)
+                    elif peak < 0 and val < peak:
+                        # In negative territory, measure relative to least-negative peak
+                        dd = (val - peak) / abs(peak)
+                        mdd = max(mdd, dd)
+                
+                if mdd > MAX_MDD:
+                    cuts['mdd'] += 1
+                    continue
+            except Exception:
+                cuts['no_data'] += 1
                 continue
-        except Exception:
-            cuts['no_data'] += 1
-            continue
         
         # Compute risk-adjusted return
-        risk_adj = ret_90d / max(mdd, 0.01)  # avoid div by zero
+        risk_adj = ret_90d / max(mdd or 0.01, 0.01)  # avoid div by zero
         
         filtered.append({
             'address': addr,
-            'name': summary.get('name', 'Unknown'),
+            'name': name,
             'tvl': tvl,
             'age_days': age_days,
             'return_90d': ret_90d,
             'mdd': mdd,
+            'mdd_sparse': mdd_sparse,
             'risk_adjusted': risk_adj
         })
     
-    # Sort by risk-adjusted return
-    filtered.sort(key=lambda x: x['risk_adjusted'], reverse=True)
+    # Sort by TVL (largest first) so biggest vaults get screened first
+    filtered.sort(key=lambda x: x['tvl'], reverse=True)
     
     return filtered, cuts
 
@@ -412,7 +481,9 @@ def generate_summary(data):
     lines.append('')
     
     # PASS candidates first
-    passes = [c for c in data['hl_vaults'] if c.get('screen_result', {}).get('verdict', '').startswith('PASS')]
+    passes = [c for c in data['hl_vaults'] if c.get('screen_result', {}).get('verdict', '').startswith('PASS') and not c.get('suspect')]
+    suspects = [c for c in data['hl_vaults'] if c.get('suspect')]
+    
     if passes:
         lines.append('## PASS Gate 1')
         lines.append('')
@@ -420,20 +491,53 @@ def generate_summary(data):
             s = c['screen_result']
             lines.append(f"**{c['name']}** (`{c['address'][:10]}...`)")
             lines.append(f"- Copy PF: {s.get('pf_copy_full', 'n/a')}, Beta share: {s.get('beta_share_of_pnl', 0)*100:.0f}%, Net long: {s.get('net_long_time', 0)*100:.0f}%, MDD: {s.get('mdd_alltime', 0)*100:.0f}%")
-            lines.append(f"- TVL: ${c['tvl']:,.0f}, 90d return: {c['return_90d']*100:.1f}%, MDD: {c['mdd']*100:.1f}%")
+            mdd_str = 'n/a (sparse data)' if c.get('mdd_sparse') else f"{c['mdd']*100:.1f}%"
+            lines.append(f"- TVL: ${c['tvl']:,.0f}, 90d return: {c['return_90d']*100:.1f}%, MDD: {mdd_str}")
             lines.append('')
     else:
         lines.append('## No candidates passed gate 1 today')
         lines.append('')
     
+    # SUSPECT items (needs manual check)
+    if suspects:
+        lines.append('## SUSPECT — Needs Manual Check')
+        lines.append('')
+        for c in suspects[:3]:  # limit to top 3
+            s = c.get('screen_result', {})
+            lines.append(f"**{c['name']}** (`{c['address'][:10]}...`)")
+            lines.append(f"- {c['suspect_reason']}")
+            if s:
+                lines.append(f"- Copy PF: {s.get('pf_copy_full', 'n/a')}, Beta share: {s.get('beta_share_of_pnl', 0)*100:.0f}%, Net long: {s.get('net_long_time', 0)*100:.0f}%, MDD: {s.get('mdd_alltime', 0)*100:.0f}%")
+            mdd_str = 'n/a (sparse data)' if c.get('mdd_sparse') else f"{c.get('mdd', 0)*100:.1f}%"
+            lines.append(f"- TVL: ${c['tvl']:,.0f}, 90d return: {c['return_90d']*100:.1f}%, MDD: {mdd_str}")
+            lines.append('')
+    
     # Funding opportunities
     if data['funding_spreads']:
         lines.append('## Funding Opportunities')
         lines.append('')
-        lines.append('| Coin | HL 30d avg | Binance | Bybit | OKX | Max spread |')
-        lines.append('|------|-----------|---------|-------|-----|-----------|')
-        for f in data['funding_spreads'][:10]:  # top 10
-            lines.append(f"| {f['coin']} | {f['hl_rate']:.1f}% | {f['binance_rate']:.1f}% | {f['bybit_rate']:.1f}% | {f['okx_rate']:.1f}% | {f['max_spread']:.1f}% |")
+        
+        # Check if we have venue-specific data or just HL
+        has_venues = any(f.get('binance_rate') or f.get('bybit_rate') or f.get('okx_rate') for f in data['funding_spreads'][:10])
+        
+        if has_venues:
+            lines.append('| Coin | HL 30d avg | Binance | Bybit | OKX | Max spread |')
+            lines.append('|------|-----------|---------|-------|-----|-----------|')
+            for f in data['funding_spreads'][:10]:  # top 10
+                hl = f.get('hl_rate', 0)
+                bn = f.get('binance_rate', 0)
+                bb = f.get('bybit_rate', 0)
+                okx = f.get('okx_rate', 0)
+                spread = f.get('max_spread', 0)
+                lines.append(f"| {f['coin']} | {hl:.1f}% | {bn:.1f}% | {bb:.1f}% | {okx:.1f}% | {spread:.1f}% |")
+        else:
+            # HL only (exchanges geo-blocked)
+            lines.append('*(Binance, Bybit, OKX geo-blocked on GitHub runners; showing HL rates only)*')
+            lines.append('')
+            lines.append('| Coin | HL 30d avg |')
+            lines.append('|------|-----------|')
+            for f in data['funding_spreads'][:10]:  # top 10
+                lines.append(f"| {f['coin']} | {f.get('hl_rate', 0):.1f}% |")
         lines.append('')
     
     # GitHub bots
@@ -454,7 +558,9 @@ def generate_summary(data):
     lines.append(f"- Vaults not screened (time limit): {len([c for c in data['hl_vaults'] if 'screen_error' in c])}")
     
     cuts = data['filter_cuts']
-    lines.append(f"- Vaults cut: TVL {cuts['tvl']}, age {cuts['age']}, return {cuts['return']}, MDD {cuts['mdd']}, rejected {cuts['rejected']}, no data {cuts['no_data']}")
+    hlp_note = f", HLP excluded {cuts.get('hlp_excluded', 0)}" if cuts.get('hlp_excluded', 0) > 0 else ""
+    lines.append(f"- Vaults cut: TVL {cuts['tvl']}, age {cuts['age']}, return {cuts['return']}, MDD {cuts['mdd']}, rejected {cuts['rejected']}{hlp_note}")
+    lines.append(f"- No data: {cuts['no_data']} vaults (missing required fields: TVL, age, return history, or closed)")
     
     errors = data.get('errors', [])
     if errors:
@@ -500,7 +606,17 @@ def main():
         data['errors'].append('Failed to fetch HL vaults')
     else:
         print(f'Fetched {len(vaults)} vaults, filtering...')
-        filtered, cuts = filter_and_rank_vaults(vaults, rejected_addrs)
+        
+        # Get HLP leader address
+        hlp_leader = None
+        for v in vaults:
+            summary = v.get('summary', {})
+            addr = summary.get('vaultAddress', '').lower()
+            if addr == HLP_VAULT_ADDRESS:
+                hlp_leader = summary.get('leader', '').lower()
+                break
+        
+        filtered, cuts = filter_and_rank_vaults(vaults, rejected_addrs, hlp_leader)
         data['filter_cuts'] = cuts
         print(f'Filtered to {len(filtered)} vaults (top {args.top_n} will be screened)')
         
@@ -511,6 +627,21 @@ def main():
             
             if result:
                 vault['screen_result'] = result
+                
+                # Add SUSPECT flag for anomalies
+                pf = result.get('pf_copy_full')
+                mdd = result.get('mdd_alltime', 0)
+                trips = result.get('pf_full', {}).get('trips', 0)
+                
+                suspect_reasons = []
+                if pf is not None and pf > 10:
+                    suspect_reasons.append(f'copy PF {pf:.2f} >10')
+                if not vault.get('mdd_sparse') and mdd < 0.01 and trips < 30:
+                    suspect_reasons.append(f'MDD {mdd*100:.1f}% <1% with {trips} round trips <30')
+                
+                if suspect_reasons:
+                    vault['suspect'] = True
+                    vault['suspect_reason'] = '; '.join(suspect_reasons)
             else:
                 vault['screen_error'] = error
                 print(f'  Error: {error}')
@@ -530,19 +661,33 @@ def main():
         data['errors'].append(f'HL funding: {hl_err}')
     
     binance_funding, binance_err = fetch_binance_funding()
-    if binance_err:
-        data['errors'].append(f'Binance unavailable ({binance_err})')
-        binance_funding = {}
-    
     bybit_funding, bybit_err = fetch_bybit_funding()
-    if bybit_err:
-        data['errors'].append(f'Bybit unavailable ({bybit_err})')
-        bybit_funding = {}
-    
     okx_funding, okx_err = fetch_okx_funding()
-    if okx_err:
-        data['errors'].append(f'OKX unavailable ({okx_err})')
-        okx_funding = {}
+    
+    # If all exchanges are geo-blocked, try HL's predictedFundings
+    if binance_err and bybit_err and okx_err:
+        print('All exchanges geo-blocked, falling back to HL predictedFundings...')
+        data['errors'].append('Binance, Bybit, OKX geo-blocked (using HL predictedFundings)')
+        
+        predicted = fetch_hl_predicted_funding()
+        binance_funding = predicted.get('Binance', {})
+        bybit_funding = predicted.get('Bybit', {})
+        okx_funding = predicted.get('OKX', {})
+        # Also include HL venue if available
+        if 'HyperLiquid' in predicted:
+            for coin, rate in predicted['HyperLiquid'].items():
+                if coin not in hl_funding:
+                    hl_funding[coin] = rate
+    else:
+        if binance_err:
+            data['errors'].append(f'Binance unavailable ({binance_err})')
+            binance_funding = {}
+        if bybit_err:
+            data['errors'].append(f'Bybit unavailable ({bybit_err})')
+            bybit_funding = {}
+        if okx_err:
+            data['errors'].append(f'OKX unavailable ({okx_err})')
+            okx_funding = {}
     
     # Combine funding data
     all_coins = set(hl_funding.keys()) | set(binance_funding.keys()) | set(bybit_funding.keys()) | set(okx_funding.keys())

@@ -60,10 +60,13 @@ NOTE lines (not fails) flag:
 
 **Sources:**
 1. **HL vaults:** from `https://stats-data.hyperliquid.xyz/Mainnet/vaults`
+   - Excludes HLP protocol/system vaults that can't be copied or reproduced: HLP parent vault (0xdfc2...f303), any vault name starting with 'HLP' (e.g. HLP Liquidator 1-4), and any vault whose leader matches the HLP leader
    - Hard filters: TVL ≥ $100k, age ≥ 90 days, 90-day return > 0, MDD < 33% (from available portfolio/equity data; note it is weekly-ish and understated)
-   - Ranks top N (default 10, configurable via `--top-n`) by risk-adjusted return (90d return / MDD)
-   - Runs `screen.py` on each (respects HL rate limits)
-   - If screening is too slow for long histories, screens the top few and lists the rest as 'not screened today'
+   - Sorts by TVL (largest first) to ensure biggest vaults get screened first within the time budget
+   - Runs `screen.py` on top N (default 20, configurable via `--top-n`, ~900s timeout per vault)
+   - Adds HTTP 429 backoff (exponential: 2, 4, 8, 16s) for HL rate limits
+   - SUSPECT flag: copy PF >10 or MDD <1% with <30 round trips (needs manual check, shown separately from PASS)
+   - Sparse MDD: if allTime history has <10 points, reports MDD as n/a with a NOTE instead of 0%
    - Skips anything in `rejected.json`
 
 2. **Funding spreads:** HL `metaAndAssetCtxs` plus Binance, Bybit, OKX public funding endpoints
@@ -81,10 +84,12 @@ NOTE lines (not fails) flag:
 - `out/YYYY-MM-DD.json`: full data (all candidates, screen results, funding table, bot list, errors)
 - `out/latest.md`: ≤ 1 page summary
   - PASS list first with key numbers (copy PF, beta share, net long %, MDD)
-  - Funding table (coin, HL 30d avg, spread vs Binance/Bybit/OKX)
+  - SUSPECT list (needs manual check): copy PF >10 or MDD <1% with <30 round trips
+  - Funding table (coin, HL 30d avg, spread vs Binance/Bybit/OKX; falls back to HL predictedFundings when exchanges are geo-blocked)
   - Bot list (repo, stars, last push, backtest results)
-  - Counts of what was cut and why (e.g. "15 vaults failed TVL filter, 8 failed age filter, 3 failed MDD filter, 2 already rejected")
-  - Source errors (e.g. "Binance unavailable (geo-block)", "Bybit unavailable (geo-block)")
+  - Counts of what was cut and why (e.g. "15 vaults failed TVL filter, 8 failed age filter, 3 failed MDD filter, 2 already rejected, 5 HLP excluded")
+  - "No data" explanation: vaults missing required fields (TVL, age, return history) or closed vaults
+  - Source errors (e.g. "Binance, Bybit, OKX geo-blocked (using HL predictedFundings)")
 
 ## GitHub Actions Workflow
 
@@ -121,9 +126,9 @@ Current rejections:
 
 ## Token Savings
 
-**Before (manual discovery + screening):** ~150k–250k tokens per run
-**After (automated discovery + screening):** ~10k–25k tokens per run (only reads 1-page summary + reviews ≤3 candidates)
-**Savings:** ~85–90% per run, ~3M–5M tokens per month
+**Before (manual discovery + screening):** ~1.0–1.5M tokens per run (measured baseline from ~28 tool rounds on 10/5/2026)
+**After (automated discovery + screening):** ≤25k tokens per run (only reads 1-page summary + reviews ≤3 candidates)
+**Savings:** ~98% per run, ~22M–33M tokens per month
 
 ## Cost
 

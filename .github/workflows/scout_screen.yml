@@ -41,7 +41,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           cd scout
-          python3 discover.py --top-n 10 --timeout-per-screen 600
+          python3 discover.py --top-n 20 --timeout-per-screen 900
       
       - name: Upload artifacts (PR only)
         if: github.event_name == 'pull_request'
