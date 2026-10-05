@@ -72,7 +72,10 @@ class FakeClient:
         self.update_status = update_status
         self.orders = []
         self.cancelled = 0
+        self.cancelled_coins = []
         self.fail_reads = False
+        self.closes = []
+        self.close_fails = False
 
     def update_leverage(self, leverage, coin, is_cross):
         self.calls.append(("update_leverage", leverage, coin, is_cross))
@@ -81,7 +84,10 @@ class FakeClient:
     def user_state(self):
         self.calls.append(("user_state",))
         if self.fail_reads:
-            raise ConnectionError("boom")
+            if self.fail_reads is True or self.fail_reads > 0:
+                if self.fail_reads is not True:
+                    self.fail_reads -= 1
+                raise ConnectionError("boom")
         return state(self.equity, self.positions)
 
     def active_asset_data(self, coin):
@@ -96,9 +102,21 @@ class FakeClient:
 
     def cancel_all(self, coin):
         self.cancelled += 1
+        self.cancelled_coins.append(coin)
         n = len([o for o in self.orders if o.get("coin") == coin])
-        self.orders = []
+        self.orders = [o for o in self.orders if o.get("coin") != coin]
         return n
+
+    def close_position(self, coin, szi):
+        self.closes.append((coin, szi))
+        if self.close_fails:
+            return {"status": "ok", "response": {"type": "order", "data": {
+                "statuses": [{"error": "Order could not immediately match"}]}}}
+        for p in self.positions:
+            if p["coin"] == coin:
+                p["szi"] = "0.0"
+        return {"status": "ok", "response": {"type": "order", "data": {
+            "statuses": [{"filled": {"totalSz": str(abs(szi)), "avgPx": "85000.0", "oid": 7}}]}}}
 
 
 class TestLockedYaml(unittest.TestCase):
@@ -432,6 +450,130 @@ class TestWatchdog(unittest.TestCase):
     def test_signal_stop_does_not_halt(self):
         ge.stop_bot(FakeProc(), FakeClient(), self.data, "signal 15", halt=False)
         self.assertFalse((self.data / ge.HALT_MARKER_NAME).exists())
+
+
+class TestFlatten(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.data = Path(self.tmp.name)
+        self.cfg = locked()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_watchdog(self, client, proc=None):
+        from io import StringIO
+        from contextlib import redirect_stdout
+        buf = StringIO()
+        with redirect_stdout(buf):
+            rc = ge.watchdog(proc or FakeProc(), client, self.cfg, 1500.0, 2, 0, data_dir=self.data)
+        return rc, buf.getvalue()
+
+    def halt_text(self):
+        return (self.data / ge.HALT_MARKER_NAME).read_text()
+
+    def test_halt_cancels_then_reduce_only_closes_and_confirms_flat(self):
+        c = FakeClient(positions=[btc_pos(szi="-0.0015", value="130")])
+        c.orders = [{"coin": "BTC", "oid": 1}]
+        rc, out = self.run_watchdog(c)
+        self.assertEqual(rc, 4)
+        self.assertEqual(c.cancelled_coins, ["BTC"])
+        self.assertEqual(c.closes, [("BTC", -0.0015)])
+        self.assertEqual(c.positions[0]["szi"], "0.0")
+        self.assertIn("size -0.0015 -> 0 (filled 0.0015 @ 85000.0)", out)
+        self.assertIn("flatten OK", out)
+        self.assertNotIn("CRITICAL", out)
+        self.assertNotIn(KEY, out)
+        self.assertIn("notional", self.halt_text())
+        self.assertNotIn("CRITICAL", self.halt_text())
+
+    def test_close_failure_is_critical_in_halt_file_and_nonzero(self):
+        c = FakeClient(setting=(5, "cross"), positions=[btc_pos(szi="0.0002", value="17")])
+        c.close_fails = True
+        rc, out = self.run_watchdog(c)
+        self.assertEqual(rc, 4)
+        self.assertEqual(len(c.closes), ge.CLOSE_ATTEMPTS)
+        self.assertIn("CRITICAL", out)
+        self.assertIn("CRITICAL", self.halt_text())
+        self.assertIn("BTC position still 0.0002", self.halt_text())
+
+    def test_close_exception_is_critical(self):
+        c = FakeClient(setting=(5, "cross"), positions=[btc_pos()])
+        c.close_position = lambda coin, szi: (_ for _ in ()).throw(RuntimeError("rejected"))
+        rc, out = self.run_watchdog(c)
+        self.assertEqual(rc, 4)
+        self.assertIn("CRITICAL", self.halt_text())
+
+    def test_no_close_without_position(self):
+        c = FakeClient(setting=(5, "cross"))
+        rc, out = self.run_watchdog(c)
+        self.assertEqual(rc, 4)
+        self.assertEqual(c.closes, [])
+        self.assertEqual(c.cancelled_coins, ["BTC"])
+        self.assertIn("flatten OK", out)
+
+    def test_non_btc_position_and_order_cancelled_and_closed(self):
+        c = FakeClient(positions=[btc_pos(coin="ETH", szi="0.01", value="30"), btc_pos(szi="0.0002")])
+        c.orders = [{"coin": "ETH", "oid": 2}, {"coin": "BTC", "oid": 3}]
+        rc, out = self.run_watchdog(c)
+        self.assertEqual(rc, 4)
+        self.assertEqual(sorted(c.cancelled_coins), ["BTC", "ETH"])
+        self.assertEqual(sorted(c.closes), [("BTC", 0.0002), ("ETH", 0.01)])
+        self.assertNotIn("CRITICAL", out)
+
+    def test_every_halt_reason_flattens(self):
+        cases = {
+            "dd": dict(equity=1400.0),
+            "notional": dict(positions=[btc_pos(value="200")]),
+            "lev": dict(setting=(4, "cross")),
+            "coin": dict(positions=[btc_pos(coin="SOL", value="10")]),
+        }
+        for name, kw in cases.items():
+            kw.setdefault("positions", [btc_pos(value="10")])
+            c = FakeClient(**kw)
+            with self.subTest(name=name):
+                rc, _ = self.run_watchdog(c)
+                self.assertEqual(rc, 4)
+                self.assertTrue(c.closes)
+                self.assertFalse(any(float(p["szi"]) for p in c.positions))
+
+        c = FakeClient(positions=[btc_pos()])
+        c.fail_reads = ge.RECONCILE_MAX_FAILURES
+        with self.subTest(name="reconcile"):
+            rc, _ = self.run_watchdog(c)
+            self.assertEqual(rc, 4)
+            self.assertEqual(c.closes, [("BTC", 0.0002)])
+
+        c = FakeClient(positions=[btc_pos()])
+        with self.subTest(name="bot_exit"):
+            rc, _ = self.run_watchdog(c, FakeProc(exit_after=0))
+            self.assertEqual(rc, 3)
+            self.assertEqual(c.closes, [("BTC", 0.0002)])
+
+    def test_signal_stop_does_not_close(self):
+        c = FakeClient(positions=[btc_pos()])
+        ge.stop_bot(FakeProc(), c, self.data, "signal 15", halt=False)
+        self.assertEqual(c.closes, [])
+
+    def test_sdk_close_is_reduce_only_ioc(self):
+        calls = {}
+
+        class SdkExchange:
+            def _slippage_price(self, coin, is_buy, slippage):
+                calls["slip"] = (coin, is_buy, slippage)
+                return 80750.0
+
+            def order(self, coin, is_buy, sz, px, order_type, reduce_only=False):
+                calls["order"] = (coin, is_buy, sz, px, order_type, reduce_only)
+                return {}
+
+        client = object.__new__(ge.HLTestnetClient)
+        client.exchange = SdkExchange()
+        client.close_position("BTC", 0.0003)
+        self.assertEqual(calls["slip"], ("BTC", False, 0.05))
+        self.assertEqual(calls["order"], ("BTC", False, 0.0003, 80750.0, {"limit": {"tif": "Ioc"}}, True))
+        client.close_position("BTC", -0.0003)
+        self.assertEqual(calls["order"][1:3], (True, 0.0003))
 
 
 class TestSecrets(unittest.TestCase):

@@ -92,8 +92,9 @@ Any failure exits 2 before the bot starts.
 
 ## Stop conditions (watchdog, every `GIIQ_WATCHDOG_SEC`)
 
-Stop the bot (SIGTERM, so upstream also cancels its orders), cancel all BTC orders via the SDK,
-write the halt marker, exit non-zero when any of:
+Stop the bot (SIGTERM, so upstream also cancels its orders), cancel all open orders via the SDK,
+flatten every open position (BTC and any non-BTC) with a reduce-only IOC order, write the halt
+marker, exit non-zero when any of:
 
 - account drawdown >= 4% from peak equity since start;
 - single-coin notional > 8% NAV, or any non-BTC position/order;
@@ -102,7 +103,12 @@ write the halt marker, exit non-zero when any of:
   2 x grid levels;
 - the bot process exits for any reason.
 
-Positions are left open on stop (upstream's conservative shutdown); close them manually after review.
+Positions are flattened reduce-only: after cancelling, each open position gets a reduce-only IOC
+limit at a 5% slippage price (what SDK `market_close` does), then `clearinghouseState` is re-read
+to confirm size 0. Size before/after and fill price are logged. Up to 3 attempts per coin; if a
+position is still non-zero or the close/read fails, a `CRITICAL` line is logged and appended to
+`/data/c48_3_HALTED` (close manually in the HL testnet UI), and the exit is still non-zero. A
+plain Railway SIGTERM (redeploy/stop) only cancels BTC orders and does not write the halt marker.
 
 **Prism must spot-check fills (place/fill/cancel logs vs HL testnet `clearinghouseState`, lev <= 3,
 notional <= 8% NAV, DD) before any YELLOW/PASS.**

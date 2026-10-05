@@ -12,7 +12,8 @@ Startup (any failure -> exit 2, bot never starts):
      at the HL $10.5 min notional.
 Then the bot runs as a child process. The watchdog polls clearinghouseState and on
 lev > 3 / DD >= 4% / BTC notional > 8% NAV / non-BTC position / reconciliation failure
-stops the bot, cancels all BTC orders, writes the halt marker and exits non-zero.
+stops the bot, cancels all orders, closes every open position reduce-only (IOC) and confirms
+size 0 (CRITICAL + reason in the halt marker if not), writes the halt marker, exits non-zero.
 """
 from __future__ import annotations
 
@@ -42,6 +43,8 @@ MAX_LEVERAGE = assert_locks.MAX_LEVERAGE
 HL_MIN_NOTIONAL_USD = 10.5  # upstream basic_grid.MIN_NOTIONAL_USD
 MIN_GRID_LEVELS = 2  # upstream geometric spacing divides by (levels - 1)
 RECONCILE_MAX_FAILURES = 3
+CLOSE_ATTEMPTS = 3
+CLOSE_SLIPPAGE = 0.05
 
 REQUIRED_ENV = ("HYPERLIQUID_TESTNET_PRIVATE_KEY", "TESTNET_WALLET_ADDRESS")
 SECRET_ENV = ("HYPERLIQUID_TESTNET_PRIVATE_KEY",)
@@ -158,6 +161,13 @@ class HLTestnetClient:
 
     def open_orders(self) -> list:
         return self.info.open_orders(self.master)
+
+    def close_position(self, coin: str, szi: float):
+        """Reduce-only IOC limit at the SDK's 5% slippage price (what SDK market_close does)."""
+        is_buy = szi < 0
+        px = self.exchange._slippage_price(coin, is_buy, CLOSE_SLIPPAGE)
+        return self.exchange.order(coin, is_buy, abs(szi), px,
+                                   {"limit": {"tif": "Ioc"}}, reduce_only=True)
 
     def cancel_all(self, coin: str) -> int:
         orders = [o for o in self.open_orders() if o.get("coin") == coin]
@@ -292,21 +302,86 @@ def _tee(stream, prefix: str) -> None:
         log(f"{prefix}{line.rstrip()}")
 
 
-def stop_bot(proc, client, data_dir: Path, reason: str, halt: bool = True) -> None:
+def _open_positions(state: dict) -> dict[str, float]:
+    out = {}
+    for ap in state.get("assetPositions") or []:
+        pos = ap.get("position") or {}
+        szi = float(pos.get("szi", 0) or 0)
+        if szi != 0:
+            out[pos.get("coin")] = szi
+    return out
+
+
+def _fill_summary(resp) -> str:
+    try:
+        st = resp["response"]["data"]["statuses"][0]
+    except (KeyError, IndexError, TypeError):
+        return f"unexpected response {resp!r}"
+    if "filled" in st:
+        return f"filled {st['filled'].get('totalSz')} @ {st['filled'].get('avgPx')}"
+    return f"not filled: {st}"
+
+
+def flatten(client) -> list[str]:
+    """Cancel every open order, then reduce-only IOC close every open position and confirm
+    size 0 via a fresh clearinghouseState read. Returns problems (empty = flat)."""
+    problems: list[str] = []
+    try:
+        coins = {COIN} | {o.get("coin") for o in client.open_orders()}
+        for coin in sorted(coins):
+            log(f"cancelled {client.cancel_all(coin)} open {coin} orders")
+    except Exception as e:  # noqa: BLE001
+        problems.append(f"cancel failed: {e}")
+    try:
+        positions = _open_positions(client.user_state())
+    except Exception as e:  # noqa: BLE001
+        return problems + [f"cannot read positions: {e}"]
+    for coin, szi in sorted(positions.items()):
+        size = szi
+        for attempt in range(1, CLOSE_ATTEMPTS + 1):
+            try:
+                resp = client.close_position(coin, size)
+                summary = _fill_summary(resp)
+                after = _open_positions(client.user_state()).get(coin, 0.0)
+            except Exception as e:  # noqa: BLE001
+                log(f"close {coin} attempt {attempt}/{CLOSE_ATTEMPTS} failed: {e}")
+                continue
+            log(f"close {coin} attempt {attempt}/{CLOSE_ATTEMPTS}: size {size:g} -> {after:g} ({summary})")
+            size = after
+            if size == 0:
+                break
+        if size != 0:
+            problems.append(f"{coin} position still {size:g} after {CLOSE_ATTEMPTS} reduce-only closes (was {szi:g})")
+    return problems
+
+
+def stop_bot(proc, client, data_dir: Path, reason: str, halt: bool = True) -> list[str]:
     log(f"STOP: {reason}")
+    marker = data_dir / HALT_MARKER_NAME
     if halt and data_dir.is_dir():
-        (data_dir / HALT_MARKER_NAME).write_text(
-            f"{datetime.now(timezone.utc).isoformat()} {scrub(reason)}\n", encoding="utf-8")
+        marker.write_text(f"{datetime.now(timezone.utc).isoformat()} {scrub(reason)}\n", encoding="utf-8")
     if proc.poll() is None:
         proc.send_signal(signal.SIGTERM)
         try:
             proc.wait(timeout=60)
         except subprocess.TimeoutExpired:
             proc.kill()
-    try:
-        log(f"cancelled {client.cancel_all(COIN)} open {COIN} orders")
-    except Exception as e:  # noqa: BLE001
-        log(f"ERROR cancelling orders: {e}; cancel manually in the HL testnet UI")
+    if not halt:
+        try:
+            log(f"cancelled {client.cancel_all(COIN)} open {COIN} orders")
+        except Exception as e:  # noqa: BLE001
+            log(f"ERROR cancelling orders: {e}; cancel manually in the HL testnet UI")
+        return []
+    problems = flatten(client)
+    if problems:
+        msg = "CRITICAL: flatten failed, close manually in the HL testnet UI: " + "; ".join(problems)
+        log(msg)
+        if data_dir.is_dir():
+            with marker.open("a", encoding="utf-8") as f:
+                f.write(scrub(msg) + "\n")
+    else:
+        log("flatten OK: no open orders or positions")
+    return problems
 
 
 def watchdog(proc, client, cfg: dict, equity: float, levels: int, interval: float,
