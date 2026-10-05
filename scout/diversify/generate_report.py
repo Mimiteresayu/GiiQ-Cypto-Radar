@@ -196,9 +196,18 @@ def generate_report(search_results, backtest_results, output_path):
 
 
 def main():
-    search_path = 'scout/diversify/out/search_results.json'
-    backtest_path = 'scout/diversify/out/backtest_results.json'
-    output_path = 'scout/diversify/out/diversify_latest.md'
+    import os
+    
+    # Use absolute paths or paths relative to the script
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    out_dir = os.path.join(script_dir, 'out')
+    
+    # Create out directory if it doesn't exist
+    os.makedirs(out_dir, exist_ok=True)
+    
+    search_path = os.path.join(out_dir, 'search_results.json')
+    backtest_path = os.path.join(out_dir, 'backtest_results.json')
+    output_path = os.path.join(out_dir, 'diversify_latest.md')
     
     search_results = load_json(search_path)
     backtest_results = load_json(backtest_path)
