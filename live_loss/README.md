@@ -21,8 +21,8 @@ Trade-log columns required: `time_open_hkt, time_close_hkt, symbol, side, entry,
 
 ### What Forge must wire (before Mon 2026-10-12 08:30 HKT)
 1. Publish the trade log somewhere the Action can GET: either the read-only cockpit export (`GET /api/exec/exits` → CSV in the columns above, read-only key in secret `LIVE_LOSS_TRADES_TOKEN`), or Forge's exporter writing the CSV to a private location (e.g. private gist / Brain) at a fixed URL.
-2. Set repo secret `LIVE_LOSS_TRADES_URL` (preferred, keeps the URL private) or variable of the same name.
-3. Decide outputs: default = workflow **artifact** (90 days). Set repo variable `LIVE_LOSS_COMMIT_OUT=true` only if MMT accepts weekly P&L in this **public** repo.
+2. Set repo secret `LIVE_LOSS_TRADES_URL` (secret only; a repo variable is not read).
+3. Outputs: workflow **artifact** only (90 days). The workflow has `contents: read` and never commits; `live_loss/out/` is git-ignored and the diagnosis is written to `out/run.log` (artifact), not the job log, because this repo is **public**.
 4. Run once via *Actions → live_loss weekly → Run workflow* with `week=2026-W40` and compare with Prism's box output (5 SoT trades, −30.21, 0 breaches).
 
 ## Re-run
@@ -36,7 +36,7 @@ When the Logic Card changes, add a row to `RULES` (name, effective deploy time H
 ## Common faults
 | Symptom | Cause / fix |
 |---|---|
-| `LIVE_LOSS_TRADES_URL ... not set` | Secret/variable not wired (step 2). |
+| `LIVE_LOSS_TRADES_URL not set` | Secret not wired (step 2). |
 | `trade log fetch failed: HTTPError 401/403` | Token missing/rotated → update `LIVE_LOSS_TRADES_TOKEN`. |
 | `trade log missing columns [...]` | Exporter changed format → fix exporter or column map. |
 | exit 2, "trade log incomplete: N HL close order(s) not in log" | Exporter lagging/broken; rerun after export. Trades are NOT silently ignored. |

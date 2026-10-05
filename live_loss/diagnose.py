@@ -151,7 +151,7 @@ R=dict(week=label,window_hkt=[str(w0),str(w1)],card=CARD,nav_source=nav_src,trad
   losing_causes=(W[W.net<0].cause.value_counts().to_dict() if len(W) else {}),
   needs_attention=[])
 if len(W):
-  br=W[W.cause.str.startswith('RULE_BREACH')]; 
+  br=W[W.cause.str.startswith('RULE_BREACH')]
   if len(br): R['needs_attention'].append(f'{len(br)} losing trade(s) broke a Logic Card rule -> Forge/Harbor check')
   gap=W[W['flags'].str.contains('CARD_GAP')]
   if len(gap): R['needs_attention'].append(f'{len(gap)} trade(s) violate v1.1-only rules (Tiny 3x/2%) entered before Tiny 3x/2% went live ({a.v11_effective} HKT): CARD_GAP, not a breach')

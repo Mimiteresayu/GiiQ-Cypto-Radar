@@ -9,7 +9,7 @@ on:
         description: 'ISO week, e.g. 2026-W40 (blank = last full ISO week)'
         required: false
 permissions:
-  contents: write   # only used by the opt-in commit step
+  contents: read    # read-only checkout; results are NEVER committed (artifact only)
   issues: write     # open an issue on failure
 concurrency: { group: live-loss, cancel-in-progress: false }
 jobs:
@@ -17,8 +17,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
-      # Forge must wire ONE of these (trade log is NOT in this repo):
-      LIVE_LOSS_TRADES: ${{ secrets.LIVE_LOSS_TRADES_URL || vars.LIVE_LOSS_TRADES_URL }}
+      # Trade log is NOT in this repo. Secret only (keeps the URL private; masked in logs).
+      LIVE_LOSS_TRADES: ${{ secrets.LIVE_LOSS_TRADES_URL }}
       LIVE_LOSS_TRADES_TOKEN: ${{ secrets.LIVE_LOSS_TRADES_TOKEN }}   # optional bearer; never printed
       LIVE_LOSS_WALLET: '0xcFCda0F8576a268BaA17935368081F4e687dB122'  # public HL main wallet (already public in executor.py)
       LIVE_LOSS_MCAP: data/mcap_cache.json
@@ -31,17 +31,14 @@ jobs:
       - run: pip install --quiet 'pandas>=2.1,<3' 'numpy<3'
       - name: Check trade-log input is wired
         run: |
-          if [ -z "$LIVE_LOSS_TRADES" ]; then echo "::error::LIVE_LOSS_TRADES_URL (secret or variable) not set - see live_loss/README.md"; exit 1; fi
-      - name: Diagnose
-        run: python live_loss/diagnose.py --strict ${WEEK:+--week "$WEEK"}
+          if [ -z "$LIVE_LOSS_TRADES" ]; then echo "::error::repo secret LIVE_LOSS_TRADES_URL not set - see live_loss/README.md"; exit 1; fi
+      - name: Diagnose (stdout to artifact only; repo is PUBLIC so P&L must not appear in the job log)
+        run: |
+          mkdir -p live_loss/out
+          python live_loss/diagnose.py --strict ${WEEK:+--week "$WEEK"} > live_loss/out/run.log
       - uses: actions/upload-artifact@v4
         if: always()
         with: { name: 'live-loss-${{ github.run_id }}', path: live_loss/out/, retention-days: 90, if-no-files-found: warn }
-      - name: Commit outputs (opt-in; repo is PUBLIC, so P&L becomes public)
-        if: success() && vars.LIVE_LOSS_COMMIT_OUT == 'true'
-        run: |
-          git config user.name 'live-loss-bot'; git config user.email 'actions@users.noreply.github.com'
-          git add live_loss/out/ && git diff --cached --quiet || { git commit -m "live_loss: weekly diagnosis [skip ci]" && git push; }
       - name: Open issue on failure
         if: failure()
         uses: actions/github-script@v7

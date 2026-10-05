@@ -17,3 +17,5 @@ out/pending_skips.json
 # Bitunix shadow runtime files (Railway volume only)
 out/bx_*
 out/cg_*
+# live_loss weekly outputs: Actions artifact only, never committed (public repo)
+live_loss/out/
