@@ -1,0 +1,210 @@
+{
+  "meta": {
+    "timestamp": "2026-10-05T03:22:05.625716+00:00",
+    "lookback_days": 90,
+    "data_source": "Hyperliquid public API",
+    "data_limitations": "Limited history available via public API; full history with delisted coins requires Binance data archive",
+    "universe_size": 50,
+    "costs": {
+      "taker_fee": "0.045%",
+      "slippage": "0.05% per side",
+      "funding": "Included for strategy 2"
+    }
+  },
+  "strategies": {
+    "cross_sectional_reversal": {
+      "strategy": "Cross-Sectional Reversal",
+      "total_return": "27.44%",
+      "cagr": "108.78%",
+      "sharpe": "1.88",
+      "max_drawdown": "13.33%",
+      "profit_factor": "1.36",
+      "num_trades": 12,
+      "num_days": 83,
+      "yearly_returns": {
+        "2020": "27.44%"
+      },
+      "is_return": "27.44%",
+      "oos_return": "N/A",
+      "corr_giiq_bo": "Not calculated (requires GiiQ BO proxy returns)",
+      "corr_btc": "Not calculated (requires aligned BTC returns)",
+      "trades_sample": [
+        {
+          "day": 20648,
+          "turnover": 2.0000000000000004,
+          "cost": 0.0019000000000000004,
+          "long": [
+            "CHIP",
+            "JUP",
+            "AERO",
+            "PENGU",
+            "ZRO"
+          ],
+          "short": [
+            "CRV",
+            "WLD",
+            "AAVE",
+            "ENA",
+            "VIRTUAL"
+          ]
+        },
+        {
+          "day": 20655,
+          "turnover": 2.8888888888888897,
+          "cost": 0.002744444444444445,
+          "long": [
+            "CASHCAT",
+            "AERO",
+            "XPL",
+            "LIT",
+            "WLD"
+          ],
+          "short": [
+            "INJ",
+            "ADA",
+            "PENGU",
+            "NIL",
+            "XMR"
+          ]
+        },
+        {
+          "day": 20662,
+          "turnover": 2.8888888888888897,
+          "cost": 0.002744444444444445,
+          "long": [
+            "CASHCAT",
+            "CHIP",
+            "WLD",
+            "NEAR",
+            "VIRTUAL"
+          ],
+          "short": [
+            "BNB",
+            "ETH",
+            "XPL",
+            "AVAX",
+            "ZRO"
+          ]
+        },
+        {
+          "day": 20669,
+          "turnover": 3.777777777777779,
+          "cost": 0.00358888888888889,
+          "long": [
+            "VVV",
+            "LIT",
+            "STRK",
+            "AAVE",
+            "GRASS"
+          ],
+          "short": [
+            "NEAR",
+            "INJ",
+            "FET",
+            "ZEC",
+            "FARTCOIN"
+          ]
+        },
+        {
+          "day": 20676,
+          "turnover": 3.111111111111112,
+          "cost": 0.0029555555555555563,
+          "long": [
+            "CHIP",
+            "ONDO",
+            "STRK",
+            "FET",
+            "JUP"
+          ],
+          "short": [
+            "PENGU",
+            "ICP",
+            "XMR",
+            "LINK",
+            "ZRO"
+          ]
+        }
+      ]
+    },
+    "funding_cross_section": {
+      "strategy": "Funding Cross-Section",
+      "total_return": "23.70%",
+      "cagr": "144.29%",
+      "sharpe": "2.48",
+      "max_drawdown": "19.77%",
+      "profit_factor": "1.51",
+      "num_trades": 1,
+      "num_days": 60,
+      "yearly_returns": {
+        "2020": "23.70%"
+      },
+      "is_return": "23.70%",
+      "oos_return": "N/A",
+      "corr_giiq_bo": "Not calculated (requires GiiQ BO proxy returns)",
+      "corr_btc": "Not calculated (requires aligned BTC returns)",
+      "trades_sample": [
+        {
+          "day": 20671,
+          "turnover": 2.0,
+          "cost": 0.0019
+        }
+      ]
+    },
+    "pairs_mean_reversion": {
+      "strategy": "Pairs Mean Reversion",
+      "total_return": "50.98%",
+      "cagr": "448.51%",
+      "sharpe": "3.55",
+      "max_drawdown": "10.90%",
+      "profit_factor": "3.16",
+      "num_trades": 74,
+      "num_days": 61,
+      "yearly_returns": {
+        "2020": "50.98%"
+      },
+      "is_return": "50.98%",
+      "oos_return": "N/A",
+      "corr_giiq_bo": "Not calculated (requires GiiQ BO proxy returns)",
+      "corr_btc": "Not calculated (requires aligned BTC returns)",
+      "trades_sample": [
+        {
+          "day": 20677,
+          "pair": "SOL/ARB",
+          "action": "enter_short",
+          "z": 2.5734766154844237,
+          "cost": 0.00095
+        },
+        {
+          "day": 20678,
+          "pair": "SOL/ARB",
+          "action": "exit",
+          "z": 2.1670128803993287,
+          "position": -0.5,
+          "cost": 0.00095
+        },
+        {
+          "day": 20678,
+          "pair": "SOL/ARB",
+          "action": "enter_short",
+          "z": 2.1670128803993287,
+          "cost": 0.00095
+        },
+        {
+          "day": 20679,
+          "pair": "SOL/ARB",
+          "action": "exit",
+          "z": 1.9391417480518789,
+          "position": -0.5,
+          "cost": 0.00095
+        },
+        {
+          "day": 20680,
+          "pair": "SOL/ARB",
+          "action": "enter_short",
+          "z": 2.1909033798850066,
+          "cost": 0.00095
+        }
+      ]
+    }
+  }
+}

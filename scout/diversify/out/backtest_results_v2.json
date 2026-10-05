@@ -1,0 +1,792 @@
+{
+  "meta": {
+    "timestamp": "2026-10-05T03:48:19.009553",
+    "version": "v2_fixed",
+    "earliest_data": "2020-08-19",
+    "avg_days": 1200,
+    "sanity_test": {
+      "calculated_return": "6.333962",
+      "expected_return": "6.333962",
+      "error": "0.00000000",
+      "pass": true,
+      "days": 2239
+    }
+  },
+  "strategies": {
+    "reversal_with_costs": {
+      "strategy": "Cross-Sectional Reversal (with_costs)",
+      "total_return": "-73.82%",
+      "cagr": "-22.56%",
+      "sharpe": "-0.93",
+      "max_drawdown": "84.61%",
+      "profit_factor": "0.85",
+      "num_trades": 189,
+      "num_days": 1321,
+      "underpowered": false,
+      "yearly_summary": {
+        "2023": {
+          "return": "18.26%",
+          "sharpe": "0.76",
+          "mdd": "13.72%",
+          "trades": 0
+        },
+        "2024": {
+          "return": "-58.23%",
+          "sharpe": "-2.04",
+          "mdd": "59.53%",
+          "trades": 0
+        },
+        "2025": {
+          "return": "-50.89%",
+          "sharpe": "-1.86",
+          "mdd": "52.27%",
+          "trades": 0
+        },
+        "2026": {
+          "return": "7.92%",
+          "sharpe": "0.42",
+          "mdd": "25.60%",
+          "trades": 0
+        }
+      },
+      "is_summary": {
+        "return": "18.26%",
+        "sharpe": "0.76",
+        "days": 313
+      },
+      "oos_summary": {
+        "return": "-77.86%",
+        "sharpe": "-1.36",
+        "days": 1008
+      },
+      "correlations": {
+        "giiq_bo": "0.059",
+        "btc": "0.091"
+      },
+      "detailed_trades": [
+        {
+          "date": "2023-02-22",
+          "long_coins": "FET, LTC, ADA, AAVE",
+          "short_coins": "XLM, ZEC, LINK, ICP",
+          "weight_per_long": "0.1250",
+          "weight_per_short": "-0.1250",
+          "turnover": "1.00",
+          "cost_pct": "0.095%"
+        },
+        {
+          "date": "2023-03-01",
+          "long_coins": "AVAX, ICP, SAND, NEAR",
+          "short_coins": "INJ, ETH, LTC, FET",
+          "weight_per_long": "0.1250",
+          "weight_per_short": "-0.1250",
+          "turnover": "2.00",
+          "cost_pct": "0.190%"
+        },
+        {
+          "date": "2023-03-08",
+          "long_coins": "FET, INJ, NEAR, ZEC",
+          "short_coins": "ETH, XLM, BNB, XRP",
+          "weight_per_long": "0.1250",
+          "weight_per_short": "-0.1250",
+          "turnover": "1.50",
+          "cost_pct": "0.143%"
+        },
+        {
+          "date": "2023-03-15",
+          "long_coins": "XRP, LTC, ZEC, UNI",
+          "short_coins": "ETH, BTC, FET, INJ",
+          "weight_per_long": "0.1250",
+          "weight_per_short": "-0.1250",
+          "turnover": "1.50",
+          "cost_pct": "0.143%"
+        },
+        {
+          "date": "2023-03-22",
+          "long_coins": "FET, ICP, NEAR, AAVE",
+          "short_coins": "SOL, BTC, LTC, XRP",
+          "weight_per_long": "0.1250",
+          "weight_per_short": "-0.1250",
+          "turnover": "1.75",
+          "cost_pct": "0.166%"
+        },
+        {
+          "date": "2023-03-29",
+          "long_coins": "AAVE, BNB, UNI, SOL",
+          "short_coins": "ADA, ZEC, XLM, XRP",
+          "weight_per_long": "0.1250",
+          "weight_per_short": "-0.1250",
+          "turnover": "1.50",
+          "cost_pct": "0.143%"
+        },
+        {
+          "date": "2023-04-05",
+          "long_coins": "XRP, FET, ICP, LINK",
+          "short_coins": "CRV, AAVE, DOGE, INJ",
+          "weight_per_long": "0.1250",
+          "weight_per_short": "-0.1250",
+          "turnover": "2.00",
+          "cost_pct": "0.190%"
+        },
+        {
+          "date": "2023-04-12",
+          "long_coins": "DOGE, FET, UNI, ARB",
+          "short_coins": "ICP, NEAR, SOL, INJ",
+          "weight_per_long": "0.1250",
+          "weight_per_short": "-0.1250",
+          "turnover": "1.50",
+          "cost_pct": "0.143%"
+        },
+        {
+          "date": "2023-04-19",
+          "long_coins": "CRV, AAVE, XLM, SOL",
+          "short_coins": "FET, ICP, ARB, INJ",
+          "weight_per_long": "0.1250",
+          "weight_per_short": "-0.1250",
+          "turnover": "1.50",
+          "cost_pct": "0.143%"
+        },
+        {
+          "date": "2023-04-26",
+          "long_coins": "ICP, NEAR, DOGE, FET",
+          "short_coins": "LTC, BTC, INJ, BNB",
+          "weight_per_long": "0.1250",
+          "weight_per_short": "-0.1250",
+          "turnover": "1.75",
+          "cost_pct": "0.166%"
+        }
+      ]
+    },
+    "reversal_no_costs": {
+      "strategy": "Cross-Sectional Reversal (no_costs)",
+      "total_return": "-65.60%",
+      "cagr": "-18.42%",
+      "sharpe": "-0.72",
+      "max_drawdown": "81.51%",
+      "profit_factor": "0.89",
+      "num_trades": 189,
+      "num_days": 1321,
+      "underpowered": false,
+      "yearly_summary": {
+        "2023": {
+          "return": "26.52%",
+          "sharpe": "1.02",
+          "mdd": "13.42%",
+          "trades": 0
+        },
+        "2024": {
+          "return": "-55.00%",
+          "sharpe": "-1.86",
+          "mdd": "56.59%",
+          "trades": 0
+        },
+        "2025": {
+          "return": "-47.15%",
+          "sharpe": "-1.65",
+          "mdd": "48.67%",
+          "trades": 0
+        },
+        "2026": {
+          "return": "14.32%",
+          "sharpe": "0.65",
+          "mdd": "24.13%",
+          "trades": 0
+        }
+      },
+      "is_summary": {
+        "return": "26.52%",
+        "sharpe": "1.02",
+        "days": 313
+      },
+      "oos_summary": {
+        "return": "-72.81%",
+        "sharpe": "-1.16",
+        "days": 1008
+      },
+      "correlations": {
+        "giiq_bo": "0.059",
+        "btc": "0.091"
+      },
+      "detailed_trades": [
+        {
+          "date": "2023-02-22",
+          "long_coins": "FET, LTC, ADA, AAVE",
+          "short_coins": "XLM, ZEC, LINK, ICP",
+          "weight_per_long": "0.1250",
+          "weight_per_short": "-0.1250",
+          "turnover": "1.00",
+          "cost_pct": "0.000%"
+        },
+        {
+          "date": "2023-03-01",
+          "long_coins": "AVAX, ICP, SAND, NEAR",
+          "short_coins": "INJ, ETH, LTC, FET",
+          "weight_per_long": "0.1250",
+          "weight_per_short": "-0.1250",
+          "turnover": "2.00",
+          "cost_pct": "0.000%"
+        },
+        {
+          "date": "2023-03-08",
+          "long_coins": "FET, INJ, NEAR, ZEC",
+          "short_coins": "ETH, XLM, BNB, XRP",
+          "weight_per_long": "0.1250",
+          "weight_per_short": "-0.1250",
+          "turnover": "1.50",
+          "cost_pct": "0.000%"
+        },
+        {
+          "date": "2023-03-15",
+          "long_coins": "XRP, LTC, ZEC, UNI",
+          "short_coins": "ETH, BTC, FET, INJ",
+          "weight_per_long": "0.1250",
+          "weight_per_short": "-0.1250",
+          "turnover": "1.50",
+          "cost_pct": "0.000%"
+        },
+        {
+          "date": "2023-03-22",
+          "long_coins": "FET, ICP, NEAR, AAVE",
+          "short_coins": "SOL, BTC, LTC, XRP",
+          "weight_per_long": "0.1250",
+          "weight_per_short": "-0.1250",
+          "turnover": "1.75",
+          "cost_pct": "0.000%"
+        },
+        {
+          "date": "2023-03-29",
+          "long_coins": "AAVE, BNB, UNI, SOL",
+          "short_coins": "ADA, ZEC, XLM, XRP",
+          "weight_per_long": "0.1250",
+          "weight_per_short": "-0.1250",
+          "turnover": "1.50",
+          "cost_pct": "0.000%"
+        },
+        {
+          "date": "2023-04-05",
+          "long_coins": "XRP, FET, ICP, LINK",
+          "short_coins": "CRV, AAVE, DOGE, INJ",
+          "weight_per_long": "0.1250",
+          "weight_per_short": "-0.1250",
+          "turnover": "2.00",
+          "cost_pct": "0.000%"
+        },
+        {
+          "date": "2023-04-12",
+          "long_coins": "DOGE, FET, UNI, ARB",
+          "short_coins": "ICP, NEAR, SOL, INJ",
+          "weight_per_long": "0.1250",
+          "weight_per_short": "-0.1250",
+          "turnover": "1.50",
+          "cost_pct": "0.000%"
+        },
+        {
+          "date": "2023-04-19",
+          "long_coins": "CRV, AAVE, XLM, SOL",
+          "short_coins": "FET, ICP, ARB, INJ",
+          "weight_per_long": "0.1250",
+          "weight_per_short": "-0.1250",
+          "turnover": "1.50",
+          "cost_pct": "0.000%"
+        },
+        {
+          "date": "2023-04-26",
+          "long_coins": "ICP, NEAR, DOGE, FET",
+          "short_coins": "LTC, BTC, INJ, BNB",
+          "weight_per_long": "0.1250",
+          "weight_per_short": "-0.1250",
+          "turnover": "1.75",
+          "cost_pct": "0.000%"
+        }
+      ]
+    },
+    "funding": {
+      "error": "Insufficient historical funding data (HL limitation)"
+    },
+    "pairs_with_costs": {
+      "strategy": "Pairs Mean Reversion (with_costs)",
+      "total_return": "-88.92%",
+      "cagr": "-22.21%",
+      "sharpe": "-1.10",
+      "max_drawdown": "91.30%",
+      "profit_factor": "0.67",
+      "num_trades": 2792,
+      "num_days": 2208,
+      "underpowered": false,
+      "yearly_summary": {
+        "2020": {
+          "return": "-15.42%",
+          "sharpe": "-1.79",
+          "mdd": "22.57%",
+          "trades": 0
+        },
+        "2021": {
+          "return": "-13.23%",
+          "sharpe": "-0.29",
+          "mdd": "32.07%",
+          "trades": 0
+        },
+        "2022": {
+          "return": "-52.80%",
+          "sharpe": "-1.52",
+          "mdd": "53.59%",
+          "trades": 0
+        },
+        "2023": {
+          "return": "-39.51%",
+          "sharpe": "-1.57",
+          "mdd": "50.02%",
+          "trades": 0
+        },
+        "2024": {
+          "return": "-35.44%",
+          "sharpe": "-1.93",
+          "mdd": "37.07%",
+          "trades": 0
+        },
+        "2025": {
+          "return": "-19.89%",
+          "sharpe": "-1.15",
+          "mdd": "26.74%",
+          "trades": 0
+        },
+        "2026": {
+          "return": "2.22%",
+          "sharpe": "0.21",
+          "mdd": "19.89%",
+          "trades": 0
+        }
+      },
+      "is_summary": {
+        "return": "-79.05%",
+        "sharpe": "-1.17",
+        "days": 1200
+      },
+      "oos_summary": {
+        "return": "-47.14%",
+        "sharpe": "-1.09",
+        "days": 1008
+      },
+      "correlations": {
+        "giiq_bo": "0.030",
+        "btc": "0.106"
+      },
+      "detailed_trades": [
+        {
+          "entry_date": "2020-09-23",
+          "exit_date": "2020-09-24",
+          "pair": "BTC/ETH",
+          "direction": "SHORT",
+          "entry_z": 2.262,
+          "exit_z": 1.326,
+          "entry_spread": 3.4635,
+          "exit_spread": 3.4259,
+          "spread_change": -0.0376,
+          "gross_pnl_pct": 0.94,
+          "cost_pct": 0.1,
+          "net_pnl_pct": 0.85,
+          "reason": "zero_cross"
+        },
+        {
+          "entry_date": "2020-10-14",
+          "exit_date": "2020-10-15",
+          "pair": "ETH/SOL",
+          "direction": "SHORT",
+          "entry_z": 2.011,
+          "exit_z": 1.959,
+          "entry_spread": 5.1002,
+          "exit_spread": 5.1155,
+          "spread_change": 0.0153,
+          "gross_pnl_pct": -0.38,
+          "cost_pct": 0.1,
+          "net_pnl_pct": -0.48,
+          "reason": "zero_cross"
+        },
+        {
+          "entry_date": "2020-10-16",
+          "exit_date": "2020-10-17",
+          "pair": "BTC/SOL",
+          "direction": "SHORT",
+          "entry_z": 2.114,
+          "exit_z": 1.732,
+          "entry_spread": 8.5732,
+          "exit_spread": 8.5463,
+          "spread_change": -0.027,
+          "gross_pnl_pct": 0.67,
+          "cost_pct": 0.1,
+          "net_pnl_pct": 0.58,
+          "reason": "zero_cross"
+        },
+        {
+          "entry_date": "2020-10-19",
+          "exit_date": "2020-10-20",
+          "pair": "BTC/SOL",
+          "direction": "SHORT",
+          "entry_z": 2.173,
+          "exit_z": 2.583,
+          "entry_spread": 8.6495,
+          "exit_spread": 8.7475,
+          "spread_change": 0.0979,
+          "gross_pnl_pct": -2.45,
+          "cost_pct": 0.1,
+          "net_pnl_pct": -2.54,
+          "reason": "zero_cross"
+        },
+        {
+          "entry_date": "2020-10-19",
+          "exit_date": "2020-10-20",
+          "pair": "ETH/SOL",
+          "direction": "SHORT",
+          "entry_z": 2.095,
+          "exit_z": 2.253,
+          "entry_spread": 5.2171,
+          "exit_spread": 5.2733,
+          "spread_change": 0.0561,
+          "gross_pnl_pct": -1.4,
+          "cost_pct": 0.1,
+          "net_pnl_pct": -1.5,
+          "reason": "zero_cross"
+        },
+        {
+          "entry_date": "2020-10-20",
+          "exit_date": "2020-10-21",
+          "pair": "BTC/ETH",
+          "direction": "SHORT",
+          "entry_z": 3.581,
+          "exit_z": 3.837,
+          "entry_spread": 3.4742,
+          "exit_spread": 3.4883,
+          "spread_change": 0.0141,
+          "gross_pnl_pct": -0.35,
+          "cost_pct": 0.1,
+          "net_pnl_pct": -0.45,
+          "reason": "zero_cross"
+        },
+        {
+          "entry_date": "2020-10-20",
+          "exit_date": "2020-10-21",
+          "pair": "BTC/SOL",
+          "direction": "SHORT",
+          "entry_z": 2.583,
+          "exit_z": 2.674,
+          "entry_spread": 8.7475,
+          "exit_spread": 8.8186,
+          "spread_change": 0.0711,
+          "gross_pnl_pct": -1.78,
+          "cost_pct": 0.1,
+          "net_pnl_pct": -1.87,
+          "reason": "zero_cross"
+        },
+        {
+          "entry_date": "2020-10-20",
+          "exit_date": "2020-10-21",
+          "pair": "ETH/SOL",
+          "direction": "SHORT",
+          "entry_z": 2.253,
+          "exit_z": 2.356,
+          "entry_spread": 5.2733,
+          "exit_spread": 5.3303,
+          "spread_change": 0.057,
+          "gross_pnl_pct": -1.43,
+          "cost_pct": 0.1,
+          "net_pnl_pct": -1.52,
+          "reason": "zero_cross"
+        },
+        {
+          "entry_date": "2020-10-21",
+          "exit_date": "2020-10-22",
+          "pair": "BTC/ETH",
+          "direction": "SHORT",
+          "entry_z": 3.837,
+          "exit_z": 0.977,
+          "entry_spread": 3.4883,
+          "exit_spread": 3.4435,
+          "spread_change": -0.0448,
+          "gross_pnl_pct": 1.12,
+          "cost_pct": 0.1,
+          "net_pnl_pct": 1.02,
+          "reason": "zero_cross"
+        },
+        {
+          "entry_date": "2020-10-21",
+          "exit_date": "2020-10-22",
+          "pair": "BTC/SOL",
+          "direction": "SHORT",
+          "entry_z": 2.674,
+          "exit_z": 2.205,
+          "entry_spread": 8.8186,
+          "exit_spread": 8.7964,
+          "spread_change": -0.0222,
+          "gross_pnl_pct": 0.55,
+          "cost_pct": 0.1,
+          "net_pnl_pct": 0.46,
+          "reason": "zero_cross"
+        }
+      ],
+      "per_pair": {
+        "BTC/ETH": {
+          "trades": 716,
+          "entries": 358,
+          "exits": 358
+        },
+        "BTC/SOL": {
+          "trades": 746,
+          "entries": 373,
+          "exits": 373
+        },
+        "ETH/SOL": {
+          "trades": 828,
+          "entries": 414,
+          "exits": 414
+        },
+        "SOL/ARB": {
+          "trades": 502,
+          "entries": 251,
+          "exits": 251
+        }
+      }
+    },
+    "pairs_no_costs": {
+      "strategy": "Pairs Mean Reversion (no_costs)",
+      "total_return": "-57.99%",
+      "cagr": "-9.42%",
+      "sharpe": "-0.38",
+      "max_drawdown": "72.31%",
+      "profit_factor": "0.87",
+      "num_trades": 2792,
+      "num_days": 2208,
+      "underpowered": false,
+      "yearly_summary": {
+        "2020": {
+          "return": "-10.16%",
+          "sharpe": "-1.14",
+          "mdd": "18.71%",
+          "trades": 0
+        },
+        "2021": {
+          "return": "3.06%",
+          "sharpe": "0.21",
+          "mdd": "22.72%",
+          "trades": 0
+        },
+        "2022": {
+          "return": "-41.45%",
+          "sharpe": "-1.05",
+          "mdd": "43.02%",
+          "trades": 0
+        },
+        "2023": {
+          "return": "-21.99%",
+          "sharpe": "-0.74",
+          "mdd": "38.71%",
+          "trades": 0
+        },
+        "2024": {
+          "return": "-18.67%",
+          "sharpe": "-0.90",
+          "mdd": "23.43%",
+          "trades": 0
+        },
+        "2025": {
+          "return": "0.29%",
+          "sharpe": "0.08",
+          "mdd": "15.42%",
+          "trades": 0
+        },
+        "2026": {
+          "return": "21.78%",
+          "sharpe": "1.43",
+          "mdd": "7.52%",
+          "trades": 0
+        }
+      },
+      "is_summary": {
+        "return": "-57.71%",
+        "sharpe": "-0.60",
+        "days": 1200
+      },
+      "oos_summary": {
+        "return": "-0.66%",
+        "sharpe": "0.05",
+        "days": 1008
+      },
+      "correlations": {
+        "giiq_bo": "0.029",
+        "btc": "0.107"
+      },
+      "detailed_trades": [
+        {
+          "entry_date": "2020-09-23",
+          "exit_date": "2020-09-24",
+          "pair": "BTC/ETH",
+          "direction": "SHORT",
+          "entry_z": 2.262,
+          "exit_z": 1.326,
+          "entry_spread": 3.4635,
+          "exit_spread": 3.4259,
+          "spread_change": -0.0376,
+          "gross_pnl_pct": 0.94,
+          "cost_pct": 0.0,
+          "net_pnl_pct": 0.94,
+          "reason": "zero_cross"
+        },
+        {
+          "entry_date": "2020-10-14",
+          "exit_date": "2020-10-15",
+          "pair": "ETH/SOL",
+          "direction": "SHORT",
+          "entry_z": 2.011,
+          "exit_z": 1.959,
+          "entry_spread": 5.1002,
+          "exit_spread": 5.1155,
+          "spread_change": 0.0153,
+          "gross_pnl_pct": -0.38,
+          "cost_pct": 0.0,
+          "net_pnl_pct": -0.38,
+          "reason": "zero_cross"
+        },
+        {
+          "entry_date": "2020-10-16",
+          "exit_date": "2020-10-17",
+          "pair": "BTC/SOL",
+          "direction": "SHORT",
+          "entry_z": 2.114,
+          "exit_z": 1.732,
+          "entry_spread": 8.5732,
+          "exit_spread": 8.5463,
+          "spread_change": -0.027,
+          "gross_pnl_pct": 0.67,
+          "cost_pct": 0.0,
+          "net_pnl_pct": 0.67,
+          "reason": "zero_cross"
+        },
+        {
+          "entry_date": "2020-10-19",
+          "exit_date": "2020-10-20",
+          "pair": "BTC/SOL",
+          "direction": "SHORT",
+          "entry_z": 2.173,
+          "exit_z": 2.583,
+          "entry_spread": 8.6495,
+          "exit_spread": 8.7475,
+          "spread_change": 0.0979,
+          "gross_pnl_pct": -2.45,
+          "cost_pct": 0.0,
+          "net_pnl_pct": -2.45,
+          "reason": "zero_cross"
+        },
+        {
+          "entry_date": "2020-10-19",
+          "exit_date": "2020-10-20",
+          "pair": "ETH/SOL",
+          "direction": "SHORT",
+          "entry_z": 2.095,
+          "exit_z": 2.253,
+          "entry_spread": 5.2171,
+          "exit_spread": 5.2733,
+          "spread_change": 0.0561,
+          "gross_pnl_pct": -1.4,
+          "cost_pct": 0.0,
+          "net_pnl_pct": -1.4,
+          "reason": "zero_cross"
+        },
+        {
+          "entry_date": "2020-10-20",
+          "exit_date": "2020-10-21",
+          "pair": "BTC/ETH",
+          "direction": "SHORT",
+          "entry_z": 3.581,
+          "exit_z": 3.837,
+          "entry_spread": 3.4742,
+          "exit_spread": 3.4883,
+          "spread_change": 0.0141,
+          "gross_pnl_pct": -0.35,
+          "cost_pct": 0.0,
+          "net_pnl_pct": -0.35,
+          "reason": "zero_cross"
+        },
+        {
+          "entry_date": "2020-10-20",
+          "exit_date": "2020-10-21",
+          "pair": "BTC/SOL",
+          "direction": "SHORT",
+          "entry_z": 2.583,
+          "exit_z": 2.674,
+          "entry_spread": 8.7475,
+          "exit_spread": 8.8186,
+          "spread_change": 0.0711,
+          "gross_pnl_pct": -1.78,
+          "cost_pct": 0.0,
+          "net_pnl_pct": -1.78,
+          "reason": "zero_cross"
+        },
+        {
+          "entry_date": "2020-10-20",
+          "exit_date": "2020-10-21",
+          "pair": "ETH/SOL",
+          "direction": "SHORT",
+          "entry_z": 2.253,
+          "exit_z": 2.356,
+          "entry_spread": 5.2733,
+          "exit_spread": 5.3303,
+          "spread_change": 0.057,
+          "gross_pnl_pct": -1.43,
+          "cost_pct": 0.0,
+          "net_pnl_pct": -1.43,
+          "reason": "zero_cross"
+        },
+        {
+          "entry_date": "2020-10-21",
+          "exit_date": "2020-10-22",
+          "pair": "BTC/ETH",
+          "direction": "SHORT",
+          "entry_z": 3.837,
+          "exit_z": 0.977,
+          "entry_spread": 3.4883,
+          "exit_spread": 3.4435,
+          "spread_change": -0.0448,
+          "gross_pnl_pct": 1.12,
+          "cost_pct": 0.0,
+          "net_pnl_pct": 1.12,
+          "reason": "zero_cross"
+        },
+        {
+          "entry_date": "2020-10-21",
+          "exit_date": "2020-10-22",
+          "pair": "BTC/SOL",
+          "direction": "SHORT",
+          "entry_z": 2.674,
+          "exit_z": 2.205,
+          "entry_spread": 8.8186,
+          "exit_spread": 8.7964,
+          "spread_change": -0.0222,
+          "gross_pnl_pct": 0.55,
+          "cost_pct": 0.0,
+          "net_pnl_pct": 0.55,
+          "reason": "zero_cross"
+        }
+      ],
+      "per_pair": {
+        "BTC/ETH": {
+          "trades": 716,
+          "entries": 358,
+          "exits": 358
+        },
+        "BTC/SOL": {
+          "trades": 746,
+          "entries": 373,
+          "exits": 373
+        },
+        "ETH/SOL": {
+          "trades": 828,
+          "entries": 414,
+          "exits": 414
+        },
+        "SOL/ARB": {
+          "trades": 502,
+          "entries": 251,
+          "exits": 251
+        }
+      }
+    }
+  }
+}

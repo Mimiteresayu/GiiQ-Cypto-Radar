@@ -1,0 +1,94 @@
+name: Scout Diversify
+
+on:
+  workflow_dispatch:
+  
+  pull_request:
+    paths:
+      - 'scout/diversify/**'
+      - '.github/workflows/scout_diversify.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  diversify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: |
+          pip install requests
+      
+      - name: Run strategy search
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd scout/diversify
+          python3 search.py --token "$GITHUB_TOKEN" --top-n 10 --output out/search_results.json
+        continue-on-error: true
+      
+      - name: Run backtests
+        run: |
+          cd scout/diversify
+          python3 backtest_v2.py --output out/backtest_results_v2.json --days 1825
+        continue-on-error: true
+      
+      - name: Generate report
+        run: |
+          cd scout/diversify
+          python3 generate_report.py
+      
+      - name: Save results to JSON
+        run: |
+          cd scout/diversify/out
+          timestamp=$(date -u +%Y-%m-%d)
+          cp diversify_latest.md "diversify_${timestamp}.md"
+          
+          # Combine search and backtest results into one JSON
+          jq -s '.[0] * .[1]' search_results.json backtest_results_v2.json > "diversify_${timestamp}.json" || echo '{}' > "diversify_${timestamp}.json"
+      
+      - name: Upload artifacts (PR only)
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: diversify-outputs-${{ github.sha }}
+          path: scout/diversify/out/
+      
+      - name: Commit and push to scout-out branch (dispatch only)
+        if: github.event_name != 'pull_request'
+        run: |
+          git config user.name "Scout Diversify Bot"
+          git config user.email "scout-diversify@giiq.bot"
+          
+          # Create or switch to scout-out branch
+          git fetch origin scout-out || true
+          git checkout scout-out 2>/dev/null || git checkout -b scout-out
+          
+          # Merge latest scout/diversify from the triggering branch
+          git checkout ${{ github.ref_name }} -- scout/diversify/ || true
+          
+          # Stage outputs
+          git add scout/diversify/out/
+          
+          # Check if there are changes to commit
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            # Commit with [skip ci]
+            git commit -m "Scout diversify run $(date -u +%Y-%m-%d) [skip ci]"
+            
+            # Push to scout-out branch
+            git push origin scout-out
+          fi
