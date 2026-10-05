@@ -25,6 +25,8 @@ class TestLockedConfig(unittest.TestCase):
         self.assertEqual(c["bot"]["long"]["risk"]["total_wallet_exposure_limit"], 0.02)
         self.assertEqual(c["bot"]["long"]["risk"]["n_positions"], 1)
         self.assertIs(c["live"]["filter_by_min_effective_cost"], False)
+        self.assertEqual(c["live"]["approved_coins"], {"long": ["BTC"], "short": []})
+        self.assertEqual(c["bot"]["short"]["risk"]["total_wallet_exposure_limit"], 0)
         self.assertAlmostEqual(ge.worst_case_single_coin_we(c["bot"]["long"]["risk"]), 0.02)
         self.assertIs(c["bot"]["long"]["hsl"]["enabled"], True)
         self.assertEqual(c["bot"]["long"]["hsl"]["red_threshold"], 0.08)
