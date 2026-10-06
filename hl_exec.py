@@ -14,18 +14,23 @@ Margin mode: ISOLATED. Each entry's liquidation price then depends only on that 
 own margin/leverage, so the SoT check "liq beyond Hard SL" is deterministic at entry time,
 and a gap through one coin cannot drain the whole Unified balance. (In cross mode the liq
 price depends on total equity, which is what produced the meaningless negative estimates.)
+
+GIIQ-SoT-5: Deterministic client order IDs (cloid) to prevent double-sends on retries.
+Post-fill reconciliation: verify position size, isolated mode, leverage, liq price, and SL order.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
 import time
 import urllib.error
 import urllib.request as _url_req
-from typing import Any, Dict, List, Optional
+from datetime import datetime, timezone, timedelta
+from typing import Any, Dict, List, Optional, Tuple
 
-from exec_common import is_live_mode, round_price, floor_to_decimals
+from exec_common import is_live_mode, round_price, floor_to_decimals, liq_beyond_sl_long, isolated_liq_price_long, hkt_date
 
 HL_INFO_URL = "https://api.hyperliquid.xyz/info"
 DEFAULT_MAIN_ADDRESS = "0xcFCda0F8576a268BaA17935368081F4e687dB122"
@@ -216,8 +221,12 @@ class HLClient:
         resp = self.exchange().update_leverage(int(leverage), coin, is_cross=not USE_ISOLATED_MARGIN)
         return {"ok": _ok(resp), "raw": resp}
 
-    def open_long_ioc(self, coin: str, qty: float, limit_px: float) -> Dict[str, Any]:
-        resp = self.exchange().order(coin, True, qty, limit_px, {"limit": {"tif": "Ioc"}}, reduce_only=False)
+    def open_long_ioc(self, coin: str, qty: float, limit_px: float, cloid: Optional[str] = None) -> Dict[str, Any]:
+        """Open a LONG IOC order with optional deterministic client order ID (GIIQ-SoT-5)."""
+        builder = {"limit": {"tif": "Ioc"}}
+        if cloid:
+            builder["limit"]["cloid"] = cloid  # type: ignore
+        resp = self.exchange().order(coin, True, qty, limit_px, builder, reduce_only=False)
         return parse_order_response(resp)
 
     def place_stop_loss(self, coin: str, qty: float, trigger_px: float, sz_decimals: int) -> Dict[str, Any]:
@@ -249,14 +258,112 @@ class HLClient:
 
 
 # ---------------------------------------------------------------- composite flows
+def _make_cloid(coin: str, hkt_date_str: str, kind: str = "entry") -> str:
+    """GIIQ-SoT-5: deterministic client order ID from hash(symbol + HKT date + kind).
+    
+    A rerun or retry will produce the same cloid, preventing double-sends of identical orders.
+    """
+    s = f"{coin}|{hkt_date_str}|{kind}"
+    h = hashlib.sha256(s.encode()).hexdigest()[:16]
+    return f"giiq{h}"
+
+
+def _reconcile_position(hl: Any, coin: str, expected_filled: float, leverage: int, hard_sl: float,
+                        coin_max_leverage: Optional[float], sz_decimals: int) -> Tuple[bool, List[str], float]:
+    """GIIQ-SoT-5: post-fill reconciliation. Re-read perp state and verify:
+    - position size matches filled size
+    - isolated margin mode
+    - leverage matches requested
+    - liquidation price is beyond Hard SL
+    - SL order is resting
+    
+    Returns (ok, problems, actual_margin_used). On any problem, the caller should close + alert.
+    """
+    problems: List[str] = []
+    margin_used = 0.0
+    
+    try:
+        perp = hl.perp_state()
+        positions = []
+        for grp in perp.get("assetPositions", []) or []:
+            p = grp.get("position") or {}
+            if p.get("coin") == coin:
+                try:
+                    szi = float(p.get("szi", 0))
+                    if abs(szi) > 1e-12:
+                        positions.append(p)
+                except (TypeError, ValueError):
+                    pass
+        
+        if not positions:
+            problems.append("position not found after fill")
+            return False, problems, 0.0
+        
+        pos = positions[0]
+        actual_size = abs(float(pos.get("szi") or 0))
+        actual_lev_val = (pos.get("leverage") or {}).get("value")
+        actual_lev = int(float(actual_lev_val)) if actual_lev_val not in (None, "") else None
+        liq_px = float(pos.get("liquidationPx") or 0)
+        margin_used = float(pos.get("marginUsed") or 0)
+        
+        # Check size
+        if abs(actual_size - expected_filled) > 1e-9:
+            problems.append(f"size mismatch: expected {expected_filled}, got {actual_size}")
+        
+        # Check isolated mode (leverage type should not be cross)
+        lev_type = (pos.get("leverage") or {}).get("type")
+        if lev_type == "cross":
+            problems.append(f"margin mode is CROSS, expected ISOLATED")
+        
+        # Check leverage
+        if actual_lev is not None and actual_lev != leverage:
+            problems.append(f"leverage mismatch: expected {leverage}x, got {actual_lev}x")
+        
+        # Check liquidation price vs Hard SL
+        if liq_px > 0:
+            # Recalculate expected liq
+            entry_px = float(pos.get("entryPx") or 0)
+            if entry_px > 0:
+                expected_liq = isolated_liq_price_long(entry_px, leverage, coin_max_leverage)
+                if not liq_beyond_sl_long(liq_px, hard_sl):
+                    problems.append(f"liq {liq_px:.6g} not below Hard SL {hard_sl:.6g}")
+        
+        # Check SL order is resting
+        open_orders = hl.open_orders()
+        sl_orders = trigger_orders_for(open_orders, coin)
+        if not sl_orders:
+            # Try to place it now
+            try:
+                sl_res = hl.place_stop_loss(coin, actual_size, hard_sl, sz_decimals)
+                if sl_res.get("status") not in ("resting", "filled"):
+                    problems.append(f"SL order not resting and placement failed: {sl_res.get('error')}")
+            except Exception as e:  # noqa: BLE001
+                problems.append(f"SL order missing and placement failed: {str(e)[:120]}")
+        
+    except Exception as e:  # noqa: BLE001
+        problems.append(f"reconciliation failed: {str(e)[:160]}")
+        return False, problems, 0.0
+    
+    return len(problems) == 0, problems, margin_used
+
+
 def enter_long_with_sl(hl: Any, coin: str, qty: float, limit_px: float, leverage: int,
-                       hard_sl: float, sz_decimals: int) -> Dict[str, Any]:
+                       hard_sl: float, sz_decimals: int, coin_max_leverage: Optional[float] = None,
+                       now: Optional[datetime] = None) -> Dict[str, Any]:
     """LIVE entry: set isolated leverage -> IOC limit buy -> reduce-only stop-market SL.
 
-    Fail-safe: if the SL cannot be placed, the filled size is closed immediately.
-    Returns {status: executed|no_fill|leverage_failed|entry_failed|sl_failed_closed|sl_failed_CLOSE_FAILED, ...}
+    GIIQ-SoT-5: adds deterministic client order ID and post-fill reconciliation.
+    Fail-safe: if the SL cannot be placed or reconciliation fails, the filled size is closed immediately.
+    Returns {status: executed|no_fill|leverage_failed|entry_failed|sl_failed_closed|sl_failed_CLOSE_FAILED|
+             reconcile_failed_closed|reconcile_failed_CLOSE_FAILED, ...}
     """
-    res: Dict[str, Any] = {"coin": coin, "qty": qty, "limit_px": limit_px, "leverage": leverage, "hard_sl": hard_sl}
+    now = now or datetime.now(timezone.utc)
+    HKT = timezone(timedelta(hours=8))
+    day = now.astimezone(HKT).strftime("%Y-%m-%d")
+    cloid = _make_cloid(coin, day, "entry")
+    
+    res: Dict[str, Any] = {"coin": coin, "qty": qty, "limit_px": limit_px, "leverage": leverage, 
+                           "hard_sl": hard_sl, "cloid": cloid}
     try:
         lev = hl.set_leverage(coin, leverage)
     except Exception as e:  # noqa: BLE001
@@ -268,7 +375,7 @@ def enter_long_with_sl(hl: Any, coin: str, qty: float, limit_px: float, leverage
         return res
 
     try:
-        entry = hl.open_long_ioc(coin, qty, limit_px)
+        entry = hl.open_long_ioc(coin, qty, limit_px, cloid=cloid)
     except Exception as e:  # noqa: BLE001
         entry = {"status": "error", "error": str(e), "filled_sz": 0.0}
     res["entry_result"] = {k: v for k, v in entry.items() if k != "raw"}
@@ -284,30 +391,49 @@ def enter_long_with_sl(hl: Any, coin: str, qty: float, limit_px: float, leverage
     filled = floor_to_decimals(filled, sz_decimals)
     res["filled_sz"] = filled
     res["avg_px"] = entry.get("avg_px")
-    _log(f"{coin}: FILLED {filled} @ {entry.get('avg_px')} ({leverage}x isolated); placing Hard SL @ {hard_sl}")
+    _log(f"{coin}: FILLED {filled} @ {entry.get('avg_px')} ({leverage}x isolated) cloid={cloid}; placing Hard SL @ {hard_sl}")
 
     try:
         sl = hl.place_stop_loss(coin, filled, hard_sl, sz_decimals)
     except Exception as e:  # noqa: BLE001
         sl = {"status": "error", "error": str(e)}
     res["sl_result"] = {k: v for k, v in sl.items() if k != "raw"}
-    if sl.get("status") in ("resting", "filled"):
-        res["status"] = "executed"
+    sl_ok = sl.get("status") in ("resting", "filled")
+    if sl_ok:
         res["sl_oid"] = sl.get("oid")
         _log(f"{coin}: Hard SL placed oid={sl.get('oid')} trigger={sl.get('trigger_px')}")
+    
+    # GIIQ-SoT-5: post-fill reconciliation
+    _log(f"{coin}: running post-fill reconciliation...")
+    reconcile_ok, problems, actual_margin = _reconcile_position(
+        hl, coin, filled, leverage, hard_sl, coin_max_leverage, sz_decimals
+    )
+    res["reconcile"] = {"ok": reconcile_ok, "problems": problems, "actual_margin_used": actual_margin}
+    
+    if sl_ok and reconcile_ok:
+        res["status"] = "executed"
+        res["actual_margin_used"] = actual_margin
+        _log(f"{coin}: reconciliation OK, actual margin={actual_margin:.2f}")
         return res
-
-    # FAIL-SAFE: no SL -> flatten immediately
-    _log(f"{coin}: Hard SL placement FAILED ({sl.get('error')}) -> closing position NOW")
+    
+    # FAIL-SAFE: SL failed or reconciliation failed -> flatten immediately
+    why = []
+    if not sl_ok:
+        why.append(f"SL placement FAILED: {sl.get('error')}")
+    if not reconcile_ok:
+        why.append(f"reconciliation FAILED: {'; '.join(problems)}")
+    
+    _log(f"{coin}: {'; '.join(why)} -> closing position NOW")
     try:
         close = hl.market_close(coin, filled)
     except Exception as e:  # noqa: BLE001
         close = {"status": "error", "error": str(e)}
     res["close_result"] = {k: v for k, v in close.items() if k != "raw"}
+    
     if close.get("status") == "filled":
-        res["status"] = "sl_failed_closed"
+        res["status"] = "reconcile_failed_closed" if not reconcile_ok else "sl_failed_closed"
     else:
-        res["status"] = "sl_failed_CLOSE_FAILED"
+        res["status"] = "reconcile_failed_CLOSE_FAILED" if not reconcile_ok else "sl_failed_CLOSE_FAILED"
         _log(f"{coin}: CRITICAL fail-safe close FAILED: {close.get('error')} -- MANUAL ACTION REQUIRED")
     return res
 

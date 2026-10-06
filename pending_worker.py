@@ -59,7 +59,7 @@ from exec_common import (  # noqa: E402
     liq_beyond_sl_long,
     margin_cap_ok,
     coin_notional_ok,
-    daily_entry_cap_ok,
+    count_entries_today_for_reporting,
     total_margin_nav_ok,
     MAX_COIN_NOTIONAL_NAV_PCT,
     MAX_TOTAL_MARGIN_NAV_PCT,
@@ -280,10 +280,7 @@ def _run_pending(hl: Any = None, radar_1d: Optional[dict] = None, radar_4h: Opti
         if not hard_sl or hard_sl <= 0:
             note(f"no Hard SL level ({sl_label})")
             continue
-        ok_day, why_day = daily_entry_cap_ok(entries_today, entries_run)
-        if not ok_day:
-            note(f"in zone but {why_day}")
-            continue
+        # GIIQ-SoT-5: daily entry cap removed
         fixed_lev, room, lev_note = None, None, ""
         if kind == ADD_ON:
             fixed_lev = lev_by_coin.get(sym) or (pos_by_coin.get(sym) or {}).get("leverage")

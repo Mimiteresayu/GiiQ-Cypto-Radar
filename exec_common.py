@@ -23,12 +23,12 @@ from typing import Any, Dict, Optional, Tuple
 # ---------------------------------------------------------------- constants
 # SoT version id. Bump (GIIQ-SoT-2, ...) whenever an executor rule changes and add an entry to
 # docs/SOT_CHANGELOG.md. Shown in the cockpit header, executor/pending run reports and DESK_DATA.
-SOT_ID = "GIIQ-SoT-4"
+SOT_ID = "GIIQ-SoT-5"
 
 MIN_NOTIONAL_USD = 10.0  # Hyperliquid minimum order value (USD)
 MIN_LEVERAGE = 1.0
 MAX_LEVERAGE = 5.0
-MIN_SL_DIST_PCT = 1.5
+MIN_SL_DIST_PCT = 0.6  # IOC slippage 0.5% + fees 0.09%
 MAX_MARGIN_UTILIZATION_PCT = 80.0
 DEFAULT_MAX_CANDIDATE_AGE_H = 3.0  # 08:05 build -> 08:55 execute (+ slack)
 HKT = timezone(timedelta(hours=8))
@@ -44,30 +44,29 @@ RADAR_MIN_UNIVERSE_FRAC = 0.85
 # Price sanity (ticker collision / bad data): skip a coin if the HL live mid differs from the
 # radar price by more than this (radar price = latest closed 4H close, fallback 1D close).
 PRICE_SANITY_MAX_DIFF_PCT = 50.0
-# Minimum order: notional must be >= max(HL minimum $10, 1% of the run's NAV snapshot).
-MIN_ORDER_NAV_PCT = 1.0
+# Minimum order: notional must be >= HL minimum $10. GIIQ-SoT-5: 1% NAV minimum removed.
+MIN_ORDER_NAV_PCT = 0.0  # no longer used, kept for compatibility
 
 # ---------------------------------------------------------------- GIIQ-SoT-2 sizing (MMT 2026-09-28)
 # Per-trade risk = the isolated margin itself: 2-4% NAV per coin (hard cap 4%). NOT sized by SL
-# distance (SL/exits are dynamic, tier-based). Leverage 3-5x isolated; the isolated liquidation
-# price must sit beyond (below, for a LONG) the Hard SL - step leverage down toward 3x, skip if
-# impossible at 3x. Existing 80% total margin cap unchanged. ADD_ON keeps the existing leverage.
+# distance (SL/exits are dynamic, tier-based). Leverage 2-5x isolated; the isolated liquidation
+# price must sit beyond (below, for a LONG) the Hard SL - step leverage down toward 2x, skip if
+# impossible at 2x. Existing 80% total margin cap unchanged. ADD_ON keeps the existing leverage.
 # AI size/leverage are maximums inside these bands.
-SOT2_MIN_LEV = 3
+SOT2_MIN_LEV = 2  # GIIQ-SoT-5: lowered from 3x to 2x
 SOT2_MAX_LEV = 5
 SOT2_MIN_MARGIN_PCT = 2.0
 SOT2_MAX_MARGIN_PCT = 4.0
-# ---------------------------------------------------------------- GIIQ-SoT-3 (MMT 2026-09-28)
+# ---------------------------------------------------------------- GIIQ-SoT-3 / SoT-5 (MMT 2026-09-28 / 2026-10-06)
 # Portfolio caps on top of the per-trade 2-4% margin risk (alts move with BTC, so cap the total):
-# MMT 2026-10-03 13:35-13:45 HKT (AIQ-0022): total cap raised 30% -> 70% NAV. The 80% margin
-# utilization cap (MAX_MARGIN_UTILIZATION_PCT) stays as the outermost hard cap; 20% coin cap unchanged.
-MAX_TOTAL_MARGIN_NAV_PCT = 70.0   # all isolated margin (existing + new, cumulative) <= 70% NAV
+# GIIQ-SoT-5: single 80% NAV cap replacing the 70% margin + 80% utilisation pair.
+MAX_TOTAL_MARGIN_NAV_PCT = 80.0   # all isolated margin (existing + new, cumulative) <= 80% NAV (HL+BX combined)
 MAX_COIN_NOTIONAL_NAV_PCT = 20.0  # one coin's notional (existing + add) <= 20% NAV (also after ADD_ON)
-MAX_NEW_ENTRIES_PER_DAY = 3       # new fills per HKT day: Base + CONTINUATION + ADD_ON together
+# GIIQ-SoT-5: daily entry cap removed (owner: 'as many as we can until total cap reach')
 # ADD_ON: the base position must be a real winner in PRICE terms (Signum 1x meaning), not leveraged ROE:
-# at 3-5x, +10% ROE is only a +2-3.3% move.
+# at 2-5x, +10% ROE is only a +2-5% move.
 ADDON_MIN_PRICE_GAIN_PCT = 10.0
-# Fallback decisions (Harbor 08:40, only when Claude's POST never arrived): Base only, 2% margin.
+# Fallback decisions (Harbor 08:40, only when Claude's POST never arrived): approve every executable candidate at floor size.
 FALLBACK_MARGIN_PCT = 2.0
 # Tiny tier limits (MMT 2026-10-03 13:35-13:45 HKT, AIQ-0022): leverage <= 3x, margin <= 2% NAV per
 # trade. Tiny = mcap < $200M or unknown (mcap_tiers.tier_for), so any tier other than
@@ -299,8 +298,8 @@ def price_sane(mid: Optional[float], radar_px: Optional[float]) -> Tuple[bool, O
 
 
 def min_order_usd(nav: float) -> float:
-    """Minimum entry notional = max(HL minimum $10, 1% of the NAV snapshot)."""
-    return max(MIN_NOTIONAL_USD, max(0.0, float(nav or 0.0)) * MIN_ORDER_NAV_PCT / 100.0)
+    """Minimum entry notional = HL minimum $10. GIIQ-SoT-5: 1% NAV minimum removed."""
+    return MIN_NOTIONAL_USD
 
 
 def _usdc_row(spot: dict) -> dict:
@@ -314,7 +313,7 @@ def nav_snapshot(spot: dict, perp: dict, abstraction: Optional[str] = None,
                  now: Optional[datetime] = None) -> Dict[str, Any]:
     """NAV used for ALL sizing in one run (taken once per run, never refreshed mid-run).
 
-    NAV definition (GIIQ-SoT-1):
+    NAV definition (GIIQ-SoT-1, conservative NAV added in GIIQ-SoT-5):
     - Unified account (HL userAbstraction == "unifiedAccount", our main wallet): NAV = spot USDC
       `total`. In unified mode the perp collateral (perp marginSummary.accountValue, incl. the
       isolated margin + uPnL of open positions) is already inside spot USDC as `hold`, so adding
@@ -322,6 +321,7 @@ def nav_snapshot(spot: dict, perp: dict, abstraction: Optional[str] = None,
     - Standard (split) account: NAV = perp marginSummary.accountValue + spot USDC total.
     - Unknown mode (abstraction lookup failed): NAV = max(spot USDC total, perp accountValue)
       - never double counts, equals the unified value for our wallet.
+    - GIIQ-SoT-5 Conservative NAV: min(equity incl. unrealised P&L, free USDC + margin collateral)
     Non-USDC spot tokens are not counted (the account holds none)."""
     usdc = _usdc_row(spot)
     spot_total = _f(usdc.get("total")) or 0.0
@@ -331,14 +331,28 @@ def nav_snapshot(spot: dict, perp: dict, abstraction: Optional[str] = None,
     margin_used = _f(ms.get("totalMarginUsed")) or 0.0
     ab = (abstraction or "").strip()
     if ab == "unifiedAccount":
-        nav, source = spot_total, "unified: spot USDC total (perp accountValue already included as hold)"
+        equity_nav = spot_total
+        source = "unified: spot USDC total (perp accountValue already included as hold)"
     elif ab and ab not in ("unifiedAccount", "unknown"):
-        nav, source = perp_av + spot_total, f"{ab}: perp accountValue + spot USDC total"
+        equity_nav = perp_av + spot_total
+        source = f"{ab}: perp accountValue + spot USDC total"
     else:
-        nav, source = max(spot_total, perp_av), "abstraction unknown: max(spot USDC total, perp accountValue)"
-    return {"nav": round(nav, 6), "source": source, "abstraction": ab or "unknown",
+        equity_nav = max(spot_total, perp_av)
+        source = "abstraction unknown: max(spot USDC total, perp accountValue)"
+    
+    # GIIQ-SoT-5: Conservative NAV = min(equity, free USDC + isolated margin)
+    # spot_total = free USDC + hold; hold includes isolated margin in unified mode
+    # For split accounts: free + margin_used
+    free_usdc = spot_total - spot_hold if ab == "unifiedAccount" else (spot_total if ab else spot_total)
+    conservative_nav = free_usdc + margin_used
+    nav = min(equity_nav, conservative_nav)
+    
+    return {"nav": round(nav, 6), "source": source + f" (conservative: min of equity, free+margin)", 
+            "abstraction": ab or "unknown",
             "spot_usdc_total": spot_total, "spot_usdc_hold": spot_hold, "perp_account_value": perp_av,
-            "margin_used": margin_used, "ts": (now or datetime.now(timezone.utc)).isoformat()}
+            "margin_used": margin_used, "equity_nav": round(equity_nav, 6), 
+            "conservative_nav": round(conservative_nav, 6),
+            "ts": (now or datetime.now(timezone.utc)).isoformat()}
 
 
 def build_run_report(run: str, result: Dict[str, Any], nav: Optional[dict] = None,
@@ -412,12 +426,12 @@ def size_by_margin(nav: float, entry_px: float, hard_sl: float, coin_max_leverag
                    ai_size_pct: Any = None, ai_leverage: Any = None, fixed_leverage: Optional[int] = None,
                    max_margin_pct: Optional[float] = None, liq_ref_px: Optional[float] = None,
                    tier: Optional[str] = None) -> Dict[str, Any]:
-    """GIIQ-SoT-2: choose (leverage, margin %) for a LONG entry. Risk = the isolated margin.
+    """GIIQ-SoT-2/SoT-5: choose (leverage, margin %) for a LONG entry. Risk = the isolated margin.
 
     - margin = AI size clamped to 2-4% NAV (AI value = maximum; missing -> the 4% cap; an AI value
       below 2% is lifted to the 2% floor). `max_margin_pct` can lower the cap (ADD_ON 5.5% room);
       room < 2% -> skip.
-    - leverage: from min(5x, AI leverage [floored at 3x], coin maxLeverage) down to 3x, the first
+    - leverage: from min(5x, AI leverage [floored at 2x], coin maxLeverage) down to 2x, the first
       whose isolated liq (from the worst-case entry / liq_ref_px) is strictly below the Hard SL.
       fixed_leverage (ADD_ON = existing position leverage) is not stepped. Impossible -> skip.
     - tier (MMT 2026-10-03, AIQ-0022): when given and Tiny (or unknown), leverage is capped at
@@ -469,7 +483,7 @@ def size_by_margin(nav: float, entry_px: float, hard_sl: float, coin_max_leverag
             continue
         return {"ok": True, "leverage": L, "margin_pct": round(m, 4), "notional_usd": nav * m / 100.0 * L,
                 "liq": liq, "sl_dist_pct": round((entry_px - hard_sl) / entry_px * 100, 3), "notes": notes + fails}
-    return {"ok": False, "reason": "SoT-2 leverage impossible: " + "; ".join(fails), "notes": notes}
+    return {"ok": False, "reason": "SoT-5 leverage impossible: " + "; ".join(fails), "notes": notes}
 
 
 def addon_gates(pos: Optional[dict], nav: float, mid: Optional[float] = None,
@@ -503,7 +517,7 @@ def addon_gates(pos: Optional[dict], nav: float, mid: Optional[float] = None,
 
 
 def total_margin_nav_ok(margin_used: float, new_margin: float, nav: float) -> Tuple[bool, float]:
-    """GIIQ-SoT-4: total isolated margin (existing + new) <= 70% NAV (was 30%). Returns (ok, pct)."""
+    """GIIQ-SoT-5: total isolated margin (existing + new) <= 80% NAV. Returns (ok, pct)."""
     if not nav or nav <= 0:
         return False, 100.0
     pct = (margin_used + new_margin) / nav * 100.0
@@ -518,11 +532,10 @@ def coin_notional_ok(existing_notional: float, new_notional: float, nav: float) 
     return pct <= MAX_COIN_NOTIONAL_NAV_PCT + 1e-9, pct
 
 
-def daily_entry_cap_ok(entries_today: int, entries_this_run: int) -> Tuple[bool, str]:
+def count_entries_today_for_reporting(entries_today: int, entries_this_run: int) -> str:
+    """GIIQ-SoT-5: daily entry cap removed, this function kept for reporting only."""
     n = int(entries_today or 0) + int(entries_this_run or 0)
-    if n >= MAX_NEW_ENTRIES_PER_DAY:
-        return False, f"daily new-entry cap reached ({n}/{MAX_NEW_ENTRIES_PER_DAY} today)"
-    return True, f"{n}/{MAX_NEW_ENTRIES_PER_DAY} entries today"
+    return f"{n} entries today (no cap)"
 
 
 # ---------------------------------------------------------------- misc
