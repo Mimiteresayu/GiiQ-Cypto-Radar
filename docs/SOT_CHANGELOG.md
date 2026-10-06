@@ -12,6 +12,42 @@ header, the executor / pending run reports, the preflight JSON and `[DESK_DATA]`
 
 ---
 
+## Cove HEALTH FAIL 2026-10-05: CONTINUATION / ADD_ON disabled + decision-day candidate freeze
+Cove sign-off `cove/bo_health_sign_2026-10-05.md` (decisions (a) + (b)); Forge diagnosis
+`forge/bo_health_gate_2026-10-05.md`. SoT id left at `GIIQ-SoT-4`: this turns a path **off**
+behind a flag and does not change any Base / sizing / exit rule. MMT may bump it at merge.
+
+**(a) CONTINUATION / ADD_ON pending disabled (default ON in code).**
+- Flag `PENDING_CONTINUATION_DISABLED` (`pending_entries.pending_disabled()`): unset/`1` = disabled;
+  only `0` / `false` / `no` / `off` re-enables. Covers both CONTINUATION and ADD_ON.
+- Executor 08:55: a Chase approval is **acknowledged, no entry**: result/run-report `no_entry`
+  (not a skip), no pending is created (LIVE or DRY_RUN). Base entries unchanged.
+- Active CONTINUATION / ADD_ON records are cancelled with
+  `close_reason = "disabled by Cove HEALTH FAIL 2026-10-05"`: at cockpit boot (`serve.main`, so
+  deploy + restart clears them), in the executor (LIVE) and in the 4H `:10` pending worker (LIVE).
+  While disabled, the pending worker never evaluates bars or places orders. DRY_RUN never mutates the store.
+- Preflight: `pending_mode` line; Chase approvals show OK `Chase -> no entry (... disabled ...)`.
+  `POST /api/ai/decision` response lists `chase_no_entry`; `/api/exec/pending` has `disabled`.
+- Not changed: Base entry path, Hard SL placement / exits on open positions (CHIP), margin caps,
+  kill switch, HL keys, Railway-only orders.
+- Re-enable (only after Cove re-signs CONTINUATION health): set `PENDING_CONTINUATION_DISABLED=0` on the
+  cockpit service and redeploy. Cancelled records are never re-armed; new Chase approvals create new pendings.
+
+**(b) Decision-day candidate freeze.**
+- `entry_candidates_latest.json` keeps regenerating (4H/1H scans, live radar) for the ENTRY tab, but
+  approvals are now matched against `out/entry_candidates_decision_YYYYMMDD.json` (HKT date):
+  written by the scheduled 08:05 scan (overwrite), else by the first AI decision POST / 08:50 fallback
+  of the day (only if missing). Only a list built today HKT is frozen.
+- Executor + preflight use the snapshot; if it is missing they fall back to latest with a clear log
+  (`candidates_source`). The candidate freshness guard still runs on latest (never less strict).
+- Preflight: an approval missing from the list with an **active** CONTINUATION / ADD_ON pending is OK
+  `already pending <kind>` (was WARN `approved but not in the current candidate list`). While disabled,
+  a missing approval whose decision type is CHASE is OK `no entry` too.
+- Tests: `test_pending_disabled.py` (the suite runs with `PENDING_CONTINUATION_DISABLED=0` via
+  `conftest.py` so the existing CONTINUATION / ADD_ON rules stay covered).
+
+---
+
 ## GIIQ-SoT-4 (2026-10-03, MMT decision 2026-10-03 13:35–13:45 HKT via Harbor; AIQ-0022)
 HL executor + pending worker (shared `exec_common`). Bitunix (`bx_live.py`) is not touched: it has its
 own sizing (1% NAV / 3x pilot) and its caps are AIQ-0003.

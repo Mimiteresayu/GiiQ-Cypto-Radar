@@ -299,6 +299,59 @@ def _generate_entry_candidates() -> int | None:
         return None
 
 
+def _freeze_decision_candidates(source: str, overwrite: bool) -> dict:
+    """Decision-day snapshot entry_candidates_decision_YYYYMMDD.json (HKT) that executor + preflight
+    match today's approvals against (latest keeps regenerating for the ENTRY tab). Non-fatal."""
+    try:
+        from entry_candidates import freeze_decision_snapshot
+        r = freeze_decision_snapshot(overwrite=overwrite, source=source, out_dir=OUT_DIR)
+    except Exception as e:
+        r = {"ok": False, "written": False, "why": f"error: {e}"}
+    sys.stderr.write(f"[entry_candidates] decision snapshot ({source}): "
+                     + (f"frozen -> {r.get('file')} count={r.get('count')}" if r.get("written")
+                        else f"not written ({r.get('why')})") + "\n")
+    return r
+
+
+def _chase_no_entry_note(stored: list) -> dict:
+    """While CONTINUATION / ADD_ON is disabled, tell the AI desk which Chase approvals will not enter."""
+    try:
+        from entry_candidates import load_decision_candidates
+        from pending_entries import DISABLE_ENV, DISABLED_REASON, pending_disabled
+        if not pending_disabled():
+            return {}
+        cd, _label, _frozen = load_decision_candidates(out_dir=OUT_DIR)
+    except Exception:
+        return {}
+    cmap = {c.get("symbol"): c for c in (cd.get("candidates") or [])}
+    chase = sorted({d.get("symbol") for d in stored if d.get("decision") == "approve" and (
+        str(d.get("type") or "").upper() == "CHASE"
+        or (cmap.get(d.get("symbol"), {}).get("type") == "Chase" and not cmap[d.get("symbol")].get("is_base")))})
+    out = {"pending_disabled": f"{DISABLED_REASON} (re-enable {DISABLE_ENV}=0)"}
+    if chase:
+        out["chase_no_entry"] = chase
+        sys.stderr.write(f"[AI_DECISION] Chase approvals acknowledged, no entry (pending disabled): {chase}\n")
+    return out
+
+
+def _enforce_pending_disabled_at_boot() -> dict:
+    """Deploy + restart clears active CONTINUATION / ADD_ON pendings while the disable flag is on."""
+    try:
+        from pending_entries import DISABLE_ENV, enforce_disabled
+        r = enforce_disabled()
+    except Exception as e:
+        sys.stderr.write(f"[PENDING] !!!!!!!! boot pending-disable check failed: {e}\n")
+        return {"error": str(e)}
+    if r.get("disabled"):
+        gone = r.get("cancelled") or []
+        msg = (f"CONTINUATION/ADD_ON pending DISABLED ({r.get('reason')}; re-enable {DISABLE_ENV}=0): "
+               + (f"cancelled {len(gone)} active at boot {gone}" if gone else "no active pendings"))
+    else:
+        msg = f"CONTINUATION/ADD_ON pending ENABLED ({DISABLE_ENV}=0)"
+    sys.stderr.write(f"[PENDING] {msg}\n")
+    return r
+
+
 def _fetch_hl_live() -> dict:
     """Fetch fresh HL clearinghouse + spot state for HL_ADDRESS (no cache).
     
@@ -1415,8 +1468,12 @@ def _scheduled_1d_scan(manual: bool = False) -> None:
             sys.stderr.write(f"[SCHEDULER] {job_name} scan failed: {note[:200]}\n")
             return
         count = _generate_entry_candidates()
-        _update_job_status(job_name, "success", f"{note}; candidates={count}")
-        sys.stderr.write(f"[SCHEDULER] {job_name} completed: {note}; candidates={count}\n")
+        # scheduled 08:05 run defines the decision day; a manual re-run only fills a missing snapshot
+        snap = _freeze_decision_candidates(job_name, overwrite=not manual) if count is not None else {}
+        snap_state = "frozen" if snap.get("written") else ("kept" if snap.get("ok") else "none")
+        note = f"{note}; candidates={count}; decision_snapshot={snap_state}"
+        _update_job_status(job_name, "success", note)
+        sys.stderr.write(f"[SCHEDULER] {job_name} completed: {note}\n")
     except Exception as e:
         _update_job_status(job_name, "error", "", str(e))
         sys.stderr.write(f"[SCHEDULER] {job_name} exception: {e}\n")
@@ -1636,7 +1693,10 @@ def _scheduled_executor(manual: bool = False, live_api: bool = False) -> dict:
         _record_run_report(job_name, res)
         msg = (f"[{SOT_ID}] {res.get('mode', '?')} {status}: executed={len(res.get('executed', []))} "
                f"actions={len(res.get('actions', []))} skipped={len(res.get('skipped', []))}"
+               + (f" no_entry={len(res['no_entry'])}" if res.get("no_entry") else "")
                + (f" | {res.get('message')}" if res.get("message") else ""))
+        if res.get("no_entry"):
+            msg += " | no entry (pending disabled): " + ", ".join(str(x.get("symbol")) for x in res["no_entry"])
         if res.get("skipped"):
             msg += " | skips: " + "; ".join(f"{x.get('symbol')}: {x.get('reason')}" for x in res["skipped"])[:900]
         if res.get("alerts"):
@@ -1855,6 +1915,8 @@ def _scheduled_fallback(manual: bool = False) -> dict:
                        "message": "preview only" if manual else "AUTO_FALLBACK=0 - not stored (no trade today)"}
             else:
                 stored = store_decisions(fb, source="fallback")
+                if stored.get("ok"):
+                    _freeze_decision_candidates("decision_fallback", overwrite=False)
                 if dim_ledger and stored.get("stored"):
                     try:
                         conn = dim_ledger.connect()
@@ -2154,6 +2216,12 @@ def _init_scheduler() -> BackgroundScheduler | None:
                               id="bx_1h", name="Bitunix shadow 1H (new tokens + open shadow)", **common)
         scheduler.start()
         _SCHED_REF["s"] = scheduler
+        try:
+            from pending_entries import pending_disabled
+            chase_line = ("Base now; Chase -> no entry (CONTINUATION/ADD_ON pending DISABLED)" if pending_disabled()
+                          else "Base now; Chase -> pending pullback")
+        except Exception:
+            chase_line = "Base now; Chase -> pending pullback"
         sys.stderr.write(
             "[SCHEDULER] APScheduler started (Asia/Hong_Kong)\n"
             "  - 08:05 HKT: 1D+4H scan + entry candidates\n"
@@ -2163,8 +2231,8 @@ def _init_scheduler() -> BackgroundScheduler | None:
             "  - Hourly :07: 1H scan + Small/Tiny exits\n"
             "  - Every 4h :10: 4H scan + Mega/Large exits\n"
             "  - boot + 08:45 HKT: LIVE executor preflight\n"
-            "  - 08:55 HKT: Auto-executor (Base now; Chase -> pending pullback)\n"
-            "  - Every 4h :10 (after 4H scan): pending pullback entries\n"
+            f"  - 08:55 HKT: Auto-executor ({chase_line})\n"
+            "  - Every 4h :10 (after 4H scan): pending pullback entries (cancel-only while disabled)\n"
             f"  - cron minute {LIVE_RADAR_MINUTES}: LIVE radar 1D/4H/1H + candidates sync + DESK_DATA\n"
             + ("  - BX shadow (no orders): 08:20 daily, 4h :25 (08:20 run covers 08), hourly :27\n"
                if BX_ENABLED and not BX_SERVICE_URL else
@@ -2383,11 +2451,13 @@ class Handler(SimpleHTTPRequestHandler):
         if path == "/api/exec/pending":
             if self._ai_key_ok():
                 try:
-                    from pending_entries import load_pending
+                    from pending_entries import DISABLED_REASON, load_pending, pending_disabled
                     allrec = load_pending()
+                    disabled = DISABLED_REASON if pending_disabled() else None
                 except Exception:
-                    allrec = []
-                self._send_json(200, {"ok": True, "active": _pending_view(), "all": allrec[-50:]})
+                    allrec, disabled = [], None
+                self._send_json(200, {"ok": True, "disabled": disabled, "active": _pending_view(),
+                                      "all": allrec[-50:]})
             return
         if path == "/api/exec/run-report":
             # keyed, read-only: one HKT day's executor / pending run report (ops_cron daily audit)
@@ -2927,6 +2997,10 @@ class Handler(SimpleHTTPRequestHandler):
                 conn.close()
             except Exception as e:
                 result["ledger_error"] = str(e)
+        if result.get("ok") and result.get("stored"):
+            snap = _freeze_decision_candidates("ai_decision_post", overwrite=False)
+            result["decision_snapshot"] = {k: snap.get(k) for k in ("file", "written", "why")}
+            result.update(_chase_no_entry_note(result["stored"]))
         result.pop("stored", None)
         if bx_res is not None:
             result["bx"] = bx_res
@@ -3098,6 +3172,7 @@ class Handler(SimpleHTTPRequestHandler):
 def main() -> None:
     os.chdir(ROOT)
     os.makedirs(OUT_DIR, exist_ok=True)
+    _enforce_pending_disabled_at_boot()
     
     # Initialize APScheduler (new in-process scheduler)
     scheduler = None

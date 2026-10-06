@@ -1,0 +1,14 @@
+# Local run (HL testnet):
+#   cp .env.example .env   # fill locally, never commit
+#   docker compose up --build
+services:
+  hummingbot-c48-2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: giiq-hummingbot:c48-2
+    container_name: giiq-hummingbot-c48-2
+    restart: "no"
+    env_file: .env
+    volumes:
+      - ./data:/home/hummingbot/data

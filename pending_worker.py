@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Pending pullback worker, run in the Railway 4H :10 job (right after the 4H scan + exits).
 N / N+1 confirmation on the band TF (ADD_ON 4H, CONTINUATION 1D) — see pending_entries.py.
+DISABLED by default (Cove HEALTH FAIL 2026-10-05): the pass only cancels active pendings (LIVE) and
+never evaluates or fills, unless PENDING_CONTINUATION_DISABLED=0.
 
 For each ACTIVE pending entry (created by the executor from AI-approved Chase decisions):
   expire (7d) / cancel (band TF closed below Lower, CONTINUATION already held, ADD_ON base gone)
@@ -66,6 +68,7 @@ from exec_common import (  # noqa: E402
     round_price,
 )
 from pending_entries import ACTIVE, ADD_ON, band, evaluate, load_pending, save_pending, summary  # noqa: E402
+from pending_entries import DISABLE_ENV, DISABLED_REASON, cancel_active_pending, pending_disabled  # noqa: E402
 
 # SoT size bands (margin % of equity). CONTINUATION = SoT "Continuation" 2-4%.
 # ADD_ON has no explicit SoT band yet -> same conservative 2-4% (confirm with MMT).
@@ -137,6 +140,26 @@ def _run_pending(hl: Any = None, radar_1d: Optional[dict] = None, radar_4h: Opti
         res["sequence"] = f"exits (done {after_exits}) -> positions re-fetched -> pending entries"
     persist = entries is None
     entries = load_pending() if entries is None else entries
+    if pending_disabled():
+        # no evaluation, no fills: cancel what is still active (LIVE) and stop
+        res["disabled"] = DISABLED_REASON
+        if live:
+            gone = cancel_active_pending(entries, now)
+        else:
+            gone = [e for e in entries if e.get("status") == ACTIVE]
+        res["cancelled"] = [{"id": e.get("id"), "symbol": e.get("symbol"), "kind": e.get("kind"),
+                             "reason": DISABLED_REASON + ("" if live else " (DRY_RUN: would cancel)")} for e in gone]
+        if live and gone and persist:
+            try:
+                save_pending(entries)
+            except Exception as e:  # noqa: BLE001
+                res.update(status="error", message=f"pending store write failed: {e}")
+                return res
+        res["message"] = (f"CONTINUATION/ADD_ON pending DISABLED ({DISABLED_REASON}; re-enable: {DISABLE_ENV}=0)"
+                          + (f"; cancelled {len(gone)}" if gone else ""))
+        _log(f"{mode} {res['message']}" + (f": {[e.get('id') for e in gone]}" if gone else ""))
+        res["pending_active"] = summary(entries, {}, {}, {})
+        return res
     act = [e for e in entries if e.get("status") == ACTIVE]
     if not act:
         res["message"] = "no active pending entries"

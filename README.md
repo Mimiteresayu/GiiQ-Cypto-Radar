@@ -304,6 +304,7 @@ Trimmed radar feed for public consumption (e.g., giiqquant site):
 | `HL_API_WALLET_ADDRESS` | No | `0xb74a9E2E…4D0` | Expected address of `HL_API_PRIVATE_KEY`; LIVE refuses to start on mismatch |
 | `EXEC_ENTRY_SLIPPAGE_PCT` | No | `0.5` | IOC entry limit = live mid × (1 + x%) (max 2) |
 | `EXEC_MAX_CANDIDATE_AGE_H` | No | `3` | Executor fails closed if candidates are older / not from today (HKT) / `stale` |
+| `PENDING_CONTINUATION_DISABLED` | No | disabled | CONTINUATION / ADD_ON pendings are OFF (Cove HEALTH FAIL 2026-10-05): Chase approvals = no entry, active pendings cancelled at boot. `0` re-enables. See `docs/SOT_CHANGELOG.md` |
 | `OTR_SCHED_LOCK_WAIT_S` | No | `1200` | Scheduled jobs wait this long for the scan lock instead of skipping |
 | `DESK_DATA_CHUNK_BYTES` | No | `32000` | Max bytes per `[DESK_DATA]` log line before splitting into `[DESK_DATA i/n]` (32 KB lines verified intact in Railway logs) |
 | `OTR_LIVE_MINUTES` | No | `3-59/10` | APScheduler cron minutes (HKT) for the LIVE radar loop |

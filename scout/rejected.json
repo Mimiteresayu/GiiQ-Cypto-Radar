@@ -1,0 +1,22 @@
+{
+  "hl_vaults": [
+    {
+      "address": "0xa844d7ac9fa3424c4fd38a25baa23e460ec3e802",
+      "name": "69 Jump Street",
+      "reason": "copy-route full-history PF 1.19 <=1.2",
+      "rejected_date": "2026-10-04"
+    },
+    {
+      "address": "0x1e37a337ed460039d1b15bd3bc489de789768d5e",
+      "name": "Growi HF",
+      "reason": "beta share 100% (R² 0.61); net long 90%; PF coverage <50%",
+      "rejected_date": "2026-10-04"
+    },
+    {
+      "address": "0xa1b6d8efbcb2fb750a84dbc05649fa4968034f04",
+      "name": "PF1",
+      "reason": "manual criterion 9 (not reproducible on Railway)",
+      "rejected_date": "2026-10-04"
+    }
+  ]
+}
