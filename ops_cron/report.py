@@ -1,10 +1,13 @@
-"""Shared report shell. No I/O."""
+"""Shared report shell. No I/O except one NAV warning on stderr."""
 from __future__ import annotations
 
+import sys
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from . import rules
+
+_nav_warning_sent = False
 
 
 def shell(check: str, now: datetime, status: str, summary: str, problems: List[dict], notify: Optional[str],
@@ -30,10 +33,24 @@ def problem(code: str, msg: str, coin: Optional[str] = None, source: str = "ops_
 
 
 def known_usd(v, readable: bool) -> str:
-    """A failed or missing balance is the word unknown. Never a zero standing in for a missed read."""
+    """A failed or missing balance is 未知. Never a zero standing in for a missed read."""
     if not readable or v is None:
-        return "unknown"
+        return "未知"
     return usd(v)
+
+
+def warn_nav_unverified(msg: str) -> None:
+    """One stderr line per process when NAV cannot be verified. Not an alert."""
+    global _nav_warning_sent
+    if _nav_warning_sent:
+        return
+    _nav_warning_sent = True
+    sys.stderr.write(str(msg).rstrip() + "\n")
+
+
+def reset_nav_warning() -> None:
+    global _nav_warning_sent
+    _nav_warning_sent = False
 
 
 def usd(v) -> str:

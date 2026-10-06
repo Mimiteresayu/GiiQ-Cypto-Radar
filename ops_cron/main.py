@@ -149,18 +149,20 @@ def run(check: str, env: Mapping[str, str], dry_run: bool = False, fixture: Opti
         made = persist.ensure_tables(dsn)
         if made != "ok":
             sys.stderr.write(f"[OPS] Brain schema failed: {made}\n")
+        # Trade-log (and the other report tables) first. The journal watermark is max(trade_time)
+        # in that table, so a failed report insert must not be masked by a later ops_check_run row.
+        if rep.get("brain_rows"):
+            extra = []
+            for spec in rep["brain_rows"]:
+                extra.append(persist.insert_rows(dsn, spec["table"], spec["columns"], spec["values"]))
+            rep["brain_tables"] = extra
+            if any(x != "ok" for x in extra):
+                sys.stderr.write(f"[OPS] Brain report insert failed: {extra}\n")
         rep["persisted"] = persist.insert(rep, dsn)
+        if rep["persisted"] != "ok":
+            sys.stderr.write(f"[OPS] Brain insert failed: {rep['persisted']}\n")
     else:
         rep["persisted"] = "skipped (BRAIN_DATABASE_URL not set)"
-    if dsn and rep["persisted"] != "ok":
-        sys.stderr.write(f"[OPS] Brain insert failed: {rep['persisted']}\n")
-    if dsn and rep.get("brain_rows"):
-        extra = []
-        for spec in rep["brain_rows"]:
-            extra.append(persist.insert_rows(dsn, spec["table"], spec["columns"], spec["values"]))
-        rep["brain_tables"] = extra
-        if any(x != "ok" for x in extra):
-            sys.stderr.write(f"[OPS] Brain report insert failed: {extra}\n")
     try:
         _write_out(rep, env)
     except Exception as e:  # noqa: BLE001

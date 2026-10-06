@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS raw.river_desk_veto (
     excess_vs_btc     DOUBLE PRECISION,
     hard_sl_hit       BOOLEAN,
     outcome           TEXT,
+    window_complete   BOOLEAN,                          -- false when the 48h after the signal has not elapsed
     report            JSONB NOT NULL
 );
 

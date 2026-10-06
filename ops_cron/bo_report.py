@@ -4,7 +4,7 @@ Stops use the same `stops.sl_distance` / `stops.both_stops` function as Harbor.
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List
 
 from . import decider, hlparse, report, rules, stops
@@ -12,6 +12,7 @@ from . import decider, hlparse, report, rules, stops
 
 def fetch(src, now: datetime, env: Dict[str, str]) -> Dict[str, Any]:
     day = now.astimezone(rules.HKT).strftime("%Y-%m-%d")
+    yday = (now.astimezone(rules.HKT) - timedelta(days=1)).strftime("%Y-%m-%d")
     w_start, _ = hlparse.window_week(now)
     t_start, _ = hlparse.window_today(now)
     end_ms = int(now.timestamp() * 1000)
@@ -24,6 +25,7 @@ def fetch(src, now: datetime, env: Dict[str, str]) -> Dict[str, Any]:
         "fills": src.hl({"type": "userFillsByTime", "user": src.hl_address,
                          "startTime": int(w_start.timestamp() * 1000), "endTime": end_ms}),
         "run_report": src.cockpit(f"/api/exec/run-report?date={day}"),
+        "run_report_yesterday": src.cockpit(f"/api/exec/run-report?date={yday}"),
         "week_start_ms": int(w_start.timestamp() * 1000),
         "today_start_ms": int(t_start.timestamp() * 1000),
     }
@@ -40,7 +42,8 @@ def fetch(src, now: datetime, env: Dict[str, str]) -> Dict[str, Any]:
     return inp
 
 
-def _actors(coin: str, dec: dict, day: str, coin_fills: List[dict]) -> List[str]:
+def _actors(coin: str, dec: dict, day: str, coin_fills: List[dict], executed: List[dict],
+            orders: Any = None, exit_actions: Any = None) -> List[str]:
     who = decider.decider_for_coin(coin, dec, day) if isinstance(dec, dict) else "unknown"
     ts = None
     if isinstance(dec, dict):
@@ -55,12 +58,15 @@ def _actors(coin: str, dec: dict, day: str, coin_fills: List[dict]) -> List[str]
     lines = [f"entry decision: {who}" + (f" at {ts}" if ts else " (no log time)" if who == "unknown" else "")]
     opens = [x for x in coin_fills if str(x.get("dir") or "").startswith("Open")]
     closes = [x for x in coin_fills if str(x.get("dir") or "").startswith("Close") or "Liquidat" in str(x.get("dir") or "")]
-    if opens:
+    if any(hlparse.order_actor(x, executed) == "Railway" for x in opens):
         lines.append(f"order: Railway at {opens[-1].get('time')}")
     else:
         lines.append("order: unknown")
-    if closes:
-        lines.append(f"close: Railway at {closes[-1].get('time')}")
+    kinds = [hlparse.close_actor(x, orders, exit_actions) for x in closes]
+    if "hard_sl" in kinds:
+        lines.append("close: hard_sl")
+    elif "exit_job_1h" in kinds:
+        lines.append("close: exit_job_1h")
     else:
         lines.append("close: unknown")
     return lines
@@ -74,13 +80,17 @@ def build(inputs: Dict[str, Any], now: datetime, env: Dict[str, str]) -> Dict[st
     state = state_res.get("data") if state_res.get("ok") else None
     if not state_res.get("ok"):
         problems.append(report.problem("DATA_UNAVAILABLE", f"HL account unreadable: {state_res.get('error') or 'missing'}"))
-    nav = hlparse.account_value(state) if state_res.get("ok") else None
-    spot_res = inputs.get("hl_spot") or {}
-    usdc = hlparse.spot_usdc(spot_res.get("data")) if spot_res.get("ok") else None
+    spot_res = inputs.get("hl_spot") if "hl_spot" in inputs else {"ok": False}
+    nav_info = hlparse.nav_from_envelopes(state_res, spot_res)
+    if nav_info.get("warning"):
+        report.warn_nav_unverified(nav_info["warning"])
+    nav = nav_info["nav"]
+    usdc = nav_info["spot"]
     margin = hlparse.margin_used(state) if state_res.get("ok") else None
     if nav and margin is not None and nav > 0 and (margin / nav * 100.0) > stops.MARGIN_CAP_PCT:
         problems.append(report.problem(
             "MARGIN_HIGH", f"margin {margin / nav * 100:.1f}% of NAV is above the {stops.MARGIN_CAP_PCT:.0f}% cap"))
+    margin_txt = "未核實" if nav is None else (report.pct(margin / nav * 100.0) if margin is not None and nav else "未知")
     fills = hlparse.fills((inputs.get("fills") or {}).get("data")) if (inputs.get("fills") or {}).get("ok") else None
     if fills is None:
         problems.append(report.problem("DATA_UNAVAILABLE", "HL fills unreadable"))
@@ -89,8 +99,10 @@ def build(inputs: Dict[str, Any], now: datetime, env: Dict[str, str]) -> Dict[st
     day_pnl = hlparse.sum_pnl(hlparse.in_window(fills, t0, now)) if fills is not None else None
     week_pnl = hlparse.sum_pnl(hlparse.in_window(fills, w0, now)) if fills is not None else None
 
+    executed = hlparse.executed_records(inputs.get("run_report"), inputs.get("run_report_yesterday"))
     rr = (inputs.get("run_report") or {}).get("data") if (inputs.get("run_report") or {}).get("ok") else None
     dec = rr.get("decisions") if isinstance(rr, dict) else None
+    exit_actions = (rr.get("exit_actions") if isinstance(rr, dict) else None) or []
     if not isinstance(dec, dict) or not dec.get("ok", True):
         problems.append(report.problem("DATA_UNAVAILABLE", "desk decisions unreadable"))
         posted = False
@@ -119,7 +131,8 @@ def build(inputs: Dict[str, Any], now: datetime, env: Dict[str, str]) -> Dict[st
         if isinstance(orders, list) and not (resting or {}).get("ok"):
             problems.append(report.problem("NO_SL", f"Hard SL is not on HL for {coin}", coin))
         coin_fills = [x for x in (fills or []) if x.get("coin") == coin]
-        who = _actors(coin, dec if isinstance(dec, dict) else {}, day, coin_fills)
+        who = _actors(coin, dec if isinstance(dec, dict) else {}, day, coin_fills, executed,
+                      orders if isinstance(orders, list) else [], exit_actions)
         blocks.append("\n".join([
             f"### {coin}",
             f"entry {p.get('entry_px')} mark {mark} unrealized {report.usd(p.get('unrealized_pnl'))}",
@@ -134,9 +147,10 @@ def build(inputs: Dict[str, Any], now: datetime, env: Dict[str, str]) -> Dict[st
     lines = [
         f"# BO live {day} {session}",
         "",
-        f"perp accountValue {report.known_usd(nav, state_res.get('ok') and nav is not None)} · "
-        f"spot USDC {report.known_usd(usdc, spot_res.get('ok') and usdc is not None)} · "
-        f"today P&L {report.usd(day_pnl)} · week P&L {report.usd(week_pnl)} · "
+        f"perp accountValue {report.known_usd(nav_info.get('perp'), state_res.get('ok') and nav_info.get('perp') is not None)} · "
+        f"spot USDC {report.known_usd(usdc, bool(spot_res.get('ok')) and usdc is not None)} · "
+        f"{nav_info['label']} · margin% {margin_txt} · "
+        f"已實現 P&L (realized, excl. funding & unrealized) {report.usd(day_pnl)} · week P&L {report.usd(week_pnl)} · "
         f"week cost ~${cost:.0f} · week P&L minus cost {report.usd(vs)}",
         "",
         "## Positions",

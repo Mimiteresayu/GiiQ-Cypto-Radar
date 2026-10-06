@@ -1,7 +1,7 @@
 """Pure parsers for public Hyperliquid info payloads. No network."""
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from .stops import num
@@ -65,6 +65,41 @@ def spot_usdc(state: Any) -> Optional[float]:
         if isinstance(row, dict) and str(row.get("coin") or "").upper() == "USDC":
             return num(row.get("total"))
     return None
+
+
+NAV_UNVERIFIED = "NAV: 未核實"
+# NAV = perp marginSummary.accountValue + spot USDC total, once. Do not add totalRawUsd.
+# A failed spot read is unverified (None): on a unified account accountValue may already
+# include that USDC, so a perp-only fallback would double-count or under-count.
+
+
+def portfolio_nav(perp_state: Any, spot_state: Any, *, perp_ok: bool, spot_ok: bool) -> dict:
+    """NAV used by exit-monitor, daily-audit, Harbor, the BO report, and the C48 scoreboard.
+
+    Both reads must succeed. Spot USDC total is added once (0 is a real perp-only balance).
+    If the spot read fails, or the USDC total is missing, nav is None and the label is
+    `NAV: 未核實`. Callers then print margin% as 未核實 and skip the margin alert.
+    """
+    perp = account_value(perp_state) if perp_ok else None
+    spot = spot_usdc(spot_state) if spot_ok else None
+    if perp_ok and perp is not None and spot_ok and spot is not None:
+        nav = perp + spot
+        from . import report
+        return {"nav": nav, "perp": perp, "spot": spot, "label": f"NAV: {report.usd(nav)}", "warning": None}
+    warning = "NAV: 未核實 (spot USDC or perp accountValue unreadable; margin% not computed)"
+    return {"nav": None, "perp": perp, "spot": spot, "label": NAV_UNVERIFIED, "warning": warning}
+
+
+def nav_from_envelopes(state_res: Any, spot_res: Any) -> dict:
+    """`portfolio_nav` for the `{ok, data}` envelopes the jobs already fetch."""
+    state_res = state_res if isinstance(state_res, dict) else {}
+    spot_res = spot_res if isinstance(spot_res, dict) else {}
+    return portfolio_nav(
+        state_res.get("data") if state_res.get("ok") else None,
+        spot_res.get("data") if spot_res.get("ok") else None,
+        perp_ok=bool(state_res.get("ok")),
+        spot_ok=bool(spot_res.get("ok")),
+    )
 
 
 def fills(data: Any) -> List[dict]:
@@ -227,3 +262,170 @@ def window_week(now: datetime):
     hk = now.astimezone(rules.HKT)
     monday = (hk - timedelta(days=hk.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
     return monday, now
+
+
+# An HL fill is not evidence that Railway placed the order.
+MATCH_WINDOW_MS = 15 * 60 * 1000
+_LONG = {"b", "buy", "bid", "long", "open long"}
+_SHORT = {"a", "sell", "ask", "short", "open short"}
+
+
+def _ms(v: Any) -> Optional[int]:
+    if v is None or v == "":
+        return None
+    if isinstance(v, datetime):
+        if v.tzinfo is None:
+            v = v.replace(tzinfo=timezone.utc)
+        return int(v.timestamp() * 1000)
+    if isinstance(v, (int, float)):
+        n = float(v)
+        if n < 10_000_000_000:
+            n *= 1000.0
+        return int(n)
+    try:
+        d = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=timezone.utc)
+    return int(d.timestamp() * 1000)
+
+
+def _record_ms(rec: dict) -> Optional[int]:
+    for key in ("time", "timestamp", "ts", "run_ts"):
+        ms = _ms(rec.get(key))
+        if ms is not None:
+            return ms
+    return None
+
+
+def _norm_side(v: Any) -> Optional[str]:
+    s = str(v or "").strip().lower()
+    if s in _LONG or s.startswith("open long"):
+        return "long"
+    if s in _SHORT or s.startswith("open short"):
+        return "short"
+    return None
+
+
+def _open_side(fill: dict) -> Optional[str]:
+    d = str(fill.get("dir") or "")
+    if d.startswith("Open Long"):
+        return "long"
+    if d.startswith("Open Short"):
+        return "short"
+    return _norm_side(fill.get("side"))
+
+
+def _record_side(rec: dict) -> Optional[str]:
+    for key in ("side", "dir", "kind"):
+        side = _norm_side(rec.get(key))
+        if side:
+            return side
+    return None
+
+
+def executed_records(*payloads: Any) -> List[dict]:
+    """Executed rows from cockpit run-report envelopes. Dry-runs are not placed orders."""
+    out = []
+    for res in payloads:
+        if not isinstance(res, dict) or not res.get("ok"):
+            continue
+        data = res.get("data")
+        if not isinstance(data, dict):
+            continue
+        for item in data.get("executed") or []:
+            if isinstance(item, dict) and not item.get("dry_run"):
+                out.append(item)
+    return out
+
+
+def order_actor(fill: dict, executed: Any) -> str:
+    """`Railway` only when this open fill matches an executed record: same coin, ±15 min, same side."""
+    if not str(fill.get("dir") or "").startswith("Open"):
+        return "unknown"
+    coin = str(fill.get("coin") or "").upper()
+    fms = _ms(fill.get("time"))
+    side = _open_side(fill)
+    if not coin or fms is None or not side:
+        return "unknown"
+    for rec in executed or []:
+        if not isinstance(rec, dict):
+            continue
+        if str(rec.get("symbol") or rec.get("coin") or "").upper() != coin:
+            continue
+        rms = _record_ms(rec)
+        rside = _record_side(rec)
+        if rms is None or rside is None:
+            continue
+        if rside == side and abs(fms - rms) <= MATCH_WINDOW_MS:
+            return "Railway"
+    return "unknown"
+
+
+def _says_stop(fill: dict) -> bool:
+    blob = " ".join(str(fill.get(k) or "") for k in ("dir", "orderType", "order_type", "triggerCondition")).lower()
+    if "stop" in blob or "trigger" in blob:
+        return True
+    return bool(fill.get("isTrigger"))
+
+
+def _stop_oids(orders: Any) -> set:
+    oids = set()
+    for o in orders or []:
+        if not isinstance(o, dict) or o.get("oid") in (None, ""):
+            continue
+        otype = str(o.get("orderType") or "")
+        is_trigger = bool(o.get("isTrigger")) or "stop" in otype.lower() or "trigger" in otype.lower()
+        protective = bool(o.get("reduceOnly")) or bool(o.get("isPositionTpsl"))
+        if is_trigger and protective:
+            oids.add(str(o.get("oid")))
+    return oids
+
+
+def _matches_exit_job(fill: dict, actions: Any) -> bool:
+    """True only when an already-fetched 1H exit-job record matches. No record source → False."""
+    if not actions:
+        return False
+    coin = str(fill.get("coin") or "").upper()
+    fms = _ms(fill.get("time"))
+    oid = str(fill.get("oid") or "")
+    for a in actions:
+        if not isinstance(a, dict):
+            continue
+        job = str(a.get("job") or a.get("run_job") or "").lower()
+        action = str(a.get("action") or a.get("kind") or "").lower()
+        marked = ("1h" in job and "exit" in job) or action in {"exit", "1h_exit", "exit_job_1h"}
+        if not marked:
+            continue
+        ac = str(a.get("coin") or a.get("symbol") or "").upper()
+        if ac != coin:
+            continue
+        if oid and str(a.get("oid") or "") == oid:
+            return True
+        ams = _record_ms(a)
+        if fms is not None and ams is not None and abs(fms - ams) <= MATCH_WINDOW_MS:
+            return True
+    return False
+
+
+def close_actor(fill: dict, orders: Any = None, exit_actions: Any = None, historical_orders: Any = None) -> str:
+    """One of `hard_sl`, `exit_job_1h`, `unknown`. Never Railway."""
+    d = str(fill.get("dir") or "")
+    if not (d.startswith("Close") or "liquidat" in d.lower()):
+        return "unknown"
+    oid = str(fill.get("oid") or "")
+    if _says_stop(fill) or (oid and oid in _stop_oids(orders)) or (oid and oid in _stop_oids(historical_orders)):
+        return "hard_sl"
+    if _matches_exit_job(fill, exit_actions):
+        return "exit_job_1h"
+    return "unknown"
+
+
+def fill_key(fill: dict) -> Optional[str]:
+    """HL fill id used to skip a re-insert. tid, else hash. None when neither is present."""
+    if fill.get("tid") not in (None, ""):
+        return f"tid:{fill.get('tid')}"
+    if fill.get("hash") not in (None, ""):
+        return f"hash:{fill.get('hash')}"
+    return None

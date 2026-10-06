@@ -117,7 +117,10 @@ def insert_rows(dsn: str, table: str, columns: Sequence[str], rows: Sequence[Seq
         conn = _connect(dsn)
         try:
             with conn.cursor() as cur:
-                for row in rows:
+                writing = list(rows)
+                if table == "raw.river_trade_log":
+                    writing = _skip_known_trade_fills(cur, columns, writing)
+                for row in writing:
                     cur.execute(sql, tuple(_jsonish(v) for v in row))
             conn.commit()
         finally:
@@ -127,38 +130,83 @@ def insert_rows(dsn: str, table: str, columns: Sequence[str], rows: Sequence[Seq
         return f"error: {type(e).__name__}: {str(e).replace(dsn, '***')[:160]}"
 
 
-def last_journal_run(dsn: str) -> Optional[datetime]:
-    """Watermark for the trade journal. Read-only. None on a first run or a missing table.
+# Watermark is the newest fill already stored for this account. ops_check_run status is not consulted:
+# a problem run must still advance, and a failed trade_log write must not.
+JOURNAL_FILL_WATERMARK_SQL = (
+    "SELECT MAX(trade_time) FROM raw.river_trade_log "
+    "WHERE report->>'kind' = 'fill' "
+    "AND COALESCE(report->>'account', %s) = %s"
+)
+JOURNAL_FILL_IDS_SQL = (
+    "SELECT report->>'fill_id' FROM raw.river_trade_log "
+    "WHERE report->>'kind' = 'fill' AND report->>'fill_id' IS NOT NULL "
+    "AND COALESCE(report->>'account', %s) = %s"
+)
 
-    Prefers the last successful ops_check_run for river_trade_log, else the latest trade_time.
-    """
-    if not dsn:
+
+def _as_utc(val: Any) -> Optional[datetime]:
+    if val is None:
         return None
-    queries = (
-        "SELECT MAX(run_at) FROM raw.ops_check_run WHERE check_name = 'river_trade_log' AND status = 'ok'",
-        "SELECT MAX(trade_time) FROM raw.river_trade_log",
-    )
+    if isinstance(val, datetime):
+        return val if val.tzinfo else val.replace(tzinfo=timezone.utc)
+    parsed = datetime.fromisoformat(str(val).replace("Z", "+00:00"))
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def last_journal_fill_time(dsn: str, account: str) -> Optional[datetime]:
+    """Max fill time stored in raw.river_trade_log for this account. None on a first run or a read error."""
+    if not dsn or not JOURNAL_FILL_WATERMARK_SQL.upper().startswith("SELECT "):
+        return None
+    if "ops_check_run" in JOURNAL_FILL_WATERMARK_SQL or "status" in JOURNAL_FILL_WATERMARK_SQL:
+        return None
     try:
         conn = _connect(dsn)
         try:
             with conn.cursor() as cur:
-                for sql in queries:
-                    if not sql.upper().startswith("SELECT "):
-                        return None
-                    cur.execute(sql)
-                    row = cur.fetchone()
-                    val = row[0] if row else None
-                    if val is None:
-                        continue
-                    if isinstance(val, datetime):
-                        return val if val.tzinfo else val.replace(tzinfo=timezone.utc)
-                    parsed = datetime.fromisoformat(str(val).replace("Z", "+00:00"))
-                    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+                cur.execute(JOURNAL_FILL_WATERMARK_SQL, (account, account))
+                row = cur.fetchone()
+                return _as_utc(row[0] if row else None)
         finally:
             conn.close()
     except Exception:  # noqa: BLE001
         return None
-    return None
+
+
+def existing_journal_fill_ids(dsn: str, account: str) -> Optional[set]:
+    """Fill ids already stored. None when the read fails (do not insert; the next run retries)."""
+    if not dsn or not JOURNAL_FILL_IDS_SQL.upper().startswith("SELECT "):
+        return None
+    try:
+        conn = _connect(dsn)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(JOURNAL_FILL_IDS_SQL, (account, account))
+                return {r[0] for r in cur.fetchall() if r and r[0]}
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _skip_known_trade_fills(cur, columns: Sequence[str], rows: Sequence[Sequence[Any]]) -> List[Sequence[Any]]:
+    """Insert-only dedupe. Rows whose report fill_id is already stored are skipped."""
+    if "report" not in columns:
+        return list(rows)
+    idx = list(columns).index("report")
+    cur.execute(
+        "SELECT report->>'fill_id' FROM raw.river_trade_log "
+        "WHERE report->>'kind' = 'fill' AND report->>'fill_id' IS NOT NULL")
+    known = {r[0] for r in cur.fetchall() if r and r[0]}
+    kept = []
+    for row in rows:
+        rep = row[idx] if idx < len(row) else None
+        fid = rep.get("fill_id") if isinstance(rep, dict) else None
+        if fid and fid in known:
+            continue
+        if fid:
+            known.add(fid)
+        kept.append(row)
+    return kept
 
 
 def insert(report: Dict[str, Any], dsn: str) -> str:

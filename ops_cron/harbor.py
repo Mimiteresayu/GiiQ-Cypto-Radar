@@ -86,9 +86,12 @@ def build(inputs: Dict[str, Any], now: datetime, env: Dict[str, str]) -> Dict[st
     state = state_res.get("data") if state_res.get("ok") else None
     if not state_res.get("ok"):
         problems.append(report.problem("DATA_UNAVAILABLE", f"HL account unreadable: {state_res.get('error') or 'missing'}"))
-    nav = hlparse.account_value(state) if state_res.get("ok") else None
-    spot_res = inputs.get("hl_spot") or {}
-    usdc = hlparse.spot_usdc(spot_res.get("data")) if spot_res.get("ok") else None
+    spot_res = inputs.get("hl_spot") if "hl_spot" in inputs else {"ok": False}
+    nav_info = hlparse.nav_from_envelopes(state_res, spot_res)
+    if nav_info.get("warning"):
+        report.warn_nav_unverified(nav_info["warning"])
+    nav = nav_info["nav"]
+    usdc = nav_info["spot"]
     pos = hlparse.positions(state)
     upnl = sum(p["unrealized_pnl"] or 0.0 for p in pos) if pos else (None if state is None else 0.0)
 
@@ -203,8 +206,9 @@ def build(inputs: Dict[str, Any], now: datetime, env: Dict[str, str]) -> Dict[st
     lines = [
         f"# Harbor P&L {day}",
         "",
-        f"perp accountValue {report.known_usd(nav, state_res.get('ok') and nav is not None)} · "
+        f"perp accountValue {report.known_usd(nav_info.get('perp'), state_res.get('ok') and nav_info.get('perp') is not None)} · "
         f"spot USDC {report.known_usd(usdc, spot_res.get('ok') and usdc is not None)} · "
+        f"{nav_info['label']} · "
         f"unrealized {report.usd(upnl)} · "
         f"yesterday realized {report.usd(y_pnl)} · 7d realized {report.usd(w_pnl)} · "
         f"since open realized {UNKNOWN + ' (userFills capped at 2000)' if all_truncated else report.usd(all_pnl)}",

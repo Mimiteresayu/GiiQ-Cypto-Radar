@@ -26,6 +26,7 @@ def fetch_scoreboard(src, now: datetime, env: Dict[str, str]) -> Dict[str, Any]:
     start_ms = end_ms - 14 * 86_400_000
     return {
         "state": src.hl({"type": "clearinghouseState", "user": src.hl_address}),
+        "spot": src.hl({"type": "spotClearinghouseState", "user": src.hl_address}),
         "orders": src.hl({"type": "frontendOpenOrders", "user": src.hl_address}),
         "fills": src.hl({"type": "userFillsByTime", "user": src.hl_address, "startTime": start_ms, "endTime": end_ms}),
         "nav_start": env.get("C48_NAV_START") or "",
@@ -42,7 +43,11 @@ def build_scoreboard(inputs: Dict[str, Any], now: datetime, env: Dict[str, str])
         problems.append(report.problem("DATA_UNAVAILABLE", f"testnet account unreadable: {state_res.get('error') or 'missing'}"))
     if not fill_res.get("ok"):
         problems.append(report.problem("DATA_UNAVAILABLE", f"testnet fills unreadable: {fill_res.get('error') or 'missing'}"))
-    nav = hlparse.account_value(state_res.get("data") if state_res.get("ok") else None)
+    spot_res = inputs.get("spot") if "spot" in inputs else {"ok": False}
+    nav_info = hlparse.nav_from_envelopes(state_res, spot_res)
+    if nav_info.get("warning"):
+        report.warn_nav_unverified(nav_info["warning"])
+    nav = nav_info["nav"]
     nav_start = stops.num((inputs.get("nav_start") or env.get("C48_NAV_START") or "").strip() or None)
     if nav_start is None:
         problems.append(report.problem("DATA_UNAVAILABLE", "C48_NAV_START is unset; drawdown is 未知"))
@@ -54,6 +59,7 @@ def build_scoreboard(inputs: Dict[str, Any], now: datetime, env: Dict[str, str])
     lev = max((p.get("lev") or 0.0) for p in pos) if pos else None
     notional_pct = (notional / nav * 100.0) if nav else None
     margin_pct = (margin / nav * 100.0) if nav and margin is not None else None
+    margin_txt = "未核實" if nav is None else report.pct(margin_pct)
     dd = None
     if nav is not None and nav_start:
         dd = max(0.0, (nav_start - nav) / nav_start * 100.0)
@@ -99,8 +105,8 @@ def build_scoreboard(inputs: Dict[str, Any], now: datetime, env: Dict[str, str])
                 orders, p["coin"], p["side"], p["szi"], mark)["ok"]:
             problems.append(report.problem("NO_SL", f"no Hard SL on {p['coin']}", p["coin"]))
     status = "problem" if problems else "ok"
-    summary = (f"C48 NAV {report.usd(nav)} net {report.usd(net)} dd {report.pct(dd)} "
-               f"lev {lev if lev is not None else '未知'} notional {report.pct(notional_pct)}")
+    summary = (f"C48 {nav_info['label']} net {report.usd(net)} dd {report.pct(dd)} "
+               f"lev {lev if lev is not None else '未知'} notional {report.pct(notional_pct)} margin% {margin_txt}")
     md = "\n".join([
         f"## C48-3 scoreboard {now.astimezone(rules.HKT).strftime('%Y-%m-%d %H:%M')} HKT",
         "",
@@ -272,7 +278,7 @@ def build_veto(inputs: Dict[str, Any], now: datetime, env: Dict[str, str]) -> Di
         else:
             strategy = "unknown"
         decision = (rec or {}).get("decision") or "none"
-        who = "unknown"
+        who = decider.decider_of(rec) if rec else "unknown"
         sig_ts = decider._ts((rec or {}).get("timestamp")) if rec else None
         if sig_ts is not None and sig_ts.astimezone(rules.HKT).strftime("%Y-%m-%d") != sig_day:
             sig_ts = None
@@ -303,20 +309,28 @@ def build_veto(inputs: Dict[str, Any], now: datetime, env: Dict[str, str]) -> Di
             outcome = "flat"
         if hit:
             problems.append(report.problem("HARD_SL_HIT", f"{coin} 48h low went through 4H Filter", coin))
+        window_complete = (now_ms - start_ms) >= 48 * 3_600_000
         rows.append({
             "coin": coin, "strategy": strategy, "desk_decision": decision, "decider": who,
             "ret_48h": raw, "ret_48h_sl_aware": aware, "excess_vs_btc": excess,
             "hard_sl_hit": hit, "outcome": outcome, "candle_source": source,
+            "window_complete": window_complete,
         })
     status = "problem" if problems else "ok"
+    complete = [r for r in rows if r.get("window_complete")]
+    ups = [r for r in complete if r.get("outcome") == "up"]
+    cont = (len(ups) / len(complete)) if complete else None
     lines = ["## Desk veto + CONT", "",
-             "coin | strategy | desk_decision | decider | ret_48h | ret_48h_sl_aware | excess_vs_btc | hard_sl_hit | outcome",
+             f"continuation rate (complete 48h windows only): {_n(cont)}",
+             "",
+             "coin | strategy | desk_decision | decider | ret_48h | ret_48h_sl_aware | excess_vs_btc | hard_sl_hit | outcome | window",
              ""]
     for r in rows:
+        flag = "48h" if r.get("window_complete") else "窗口未夠 48h"
         lines.append(
             f"{r['coin']} | {r['strategy']} | {r['desk_decision']} | {r['decider']} | "
             f"{_n(r['ret_48h'])} | {_n(r['ret_48h_sl_aware'])} | {_n(r['excess_vs_btc'])} | "
-            f"{r['hard_sl_hit']} | {r['outcome']}")
+            f"{r['hard_sl_hit']} | {r['outcome']} | {flag}")
     if not rows:
         lines.append("(no signals)")
     md = "\n".join(lines) + "\n"
@@ -324,13 +338,13 @@ def build_veto(inputs: Dict[str, Any], now: datetime, env: Dict[str, str]) -> Di
     for r in rows:
         brain_values.append((now.isoformat(), sig_day, r["coin"], r["strategy"], r["desk_decision"], r["decider"],
                              r["ret_48h"], r["ret_48h_sl_aware"], r["excess_vs_btc"], r["hard_sl_hit"],
-                             r["outcome"], r))
+                             r["outcome"], bool(r["window_complete"]), r))
     brain = []
     if brain_values:
         brain.append({
             "table": "raw.river_desk_veto",
             "columns": ["run_at", "as_of", "coin", "strategy", "desk_decision", "decider", "ret_48h",
-                        "ret_48h_sl_aware", "excess_vs_btc", "hard_sl_hit", "outcome", "report"],
+                        "ret_48h_sl_aware", "excess_vs_btc", "hard_sl_hit", "outcome", "window_complete", "report"],
             "values": brain_values,
         })
     notify = "problem" if problems else None
@@ -365,29 +379,37 @@ def signed_fill_size(fill: dict) -> Optional[float]:
     return sz
 
 
-def journal_window_start(now: datetime, last_run: Optional[datetime]) -> datetime:
-    """From the last successful journal run. First run looks back 26h so yesterday's late closes are kept."""
-    if last_run is None:
+def journal_window_start(now: datetime, last_fill: Optional[datetime]) -> datetime:
+    """From the newest fill time already stored. First run (empty table) looks back 26h."""
+    if last_fill is None:
         return now - timedelta(hours=26)
-    if last_run.tzinfo is None:
-        last_run = last_run.replace(tzinfo=timezone.utc)
-    return last_run
+    if last_fill.tzinfo is None:
+        last_fill = last_fill.replace(tzinfo=timezone.utc)
+    return last_fill
 
 
 def fetch_journal(src, now: datetime, env: Dict[str, str]) -> Dict[str, Any]:
     from . import persist
     day = now.astimezone(rules.HKT).strftime("%Y-%m-%d")
-    last = persist.last_journal_run(persist.brain_dsn(env)) if persist.brain_dsn(env) else None
+    yday = (now.astimezone(rules.HKT) - timedelta(days=1)).strftime("%Y-%m-%d")
+    account = (env.get("HL_ADDRESS") or getattr(src, "hl_address", "") or "").strip()
+    dsn = persist.brain_dsn(env)
+    last = persist.last_journal_fill_time(dsn, account) if dsn else None
+    known = persist.existing_journal_fill_ids(dsn, account) if dsn else set()
     start = journal_window_start(now, last)
     end_ms = int(now.timestamp() * 1000)
     inp = {
         "day": day,
+        "account": account,
         "fills": src.hl({"type": "userFillsByTime", "user": src.hl_address,
                          "startTime": int(start.timestamp() * 1000), "endTime": end_ms}),
         "state": src.hl({"type": "clearinghouseState", "user": src.hl_address}),
         "orders": src.hl({"type": "frontendOpenOrders", "user": src.hl_address}),
         "mids": src.hl({"type": "allMids"}),
         "run_report": src.cockpit(f"/api/exec/run-report?date={day}"),
+        "run_report_yesterday": src.cockpit(f"/api/exec/run-report?date={yday}"),
+        "existing_fill_ids": known,
+        "fill_dedupe_ok": known is not None,
     }
     coins = set()
     if inp["fills"].get("ok"):
@@ -411,6 +433,16 @@ def fetch_journal(src, now: datetime, env: Dict[str, str]) -> Dict[str, Any]:
     return inp
 
 
+def _decision_for(dec: Any, coin: str) -> Optional[dict]:
+    if not isinstance(dec, dict):
+        return None
+    for bucket in (dec.get("records"), dec.get("history")):
+        for rec in bucket or []:
+            if isinstance(rec, dict) and str(rec.get("symbol") or "").upper() == str(coin or "").upper():
+                return rec
+    return None
+
+
 def build_journal(inputs: Dict[str, Any], now: datetime, env: Dict[str, str]) -> Dict[str, Any]:
     day = inputs.get("day") or now.astimezone(rules.HKT).strftime("%Y-%m-%d")
     problems: List[dict] = []
@@ -424,22 +456,53 @@ def build_journal(inputs: Dict[str, Any], now: datetime, env: Dict[str, str]) ->
         dec = {"records": [], "history": []}
     mids = hlparse.mids((inputs.get("mids") or {}).get("data")) if (inputs.get("mids") or {}).get("ok") else {}
     now_ms = int(now.timestamp() * 1000)
+    dedupe_ok = bool(inputs.get("fill_dedupe_ok", True))
+    known_ids = inputs.get("existing_fill_ids")
+    if not dedupe_ok or ("existing_fill_ids" in inputs and known_ids is None):
+        problems.append(report.problem("DATA_UNAVAILABLE", "trade log fill ids unreadable; fills not inserted"))
+        dedupe_ok = False
+        known_ids = set()
+    elif known_ids is None:
+        known_ids = set()
+    executed = hlparse.executed_records(inputs.get("run_report"), inputs.get("run_report_yesterday"))
+    orders = (inputs.get("orders") or {}).get("data") if (inputs.get("orders") or {}).get("ok") else []
+    historical = inputs.get("historical_orders")
+    rr = (inputs.get("run_report") or {}).get("data") if (inputs.get("run_report") or {}).get("ok") else None
+    exit_actions = (rr.get("exit_actions") if isinstance(rr, dict) else None) or []
+    account = (env.get("HL_ADDRESS") or inputs.get("account") or "").strip()
     rows = []
     seen = set()
+    seen_ids = set(known_ids or [])
     for x in hlparse.fills(fill_res.get("data")) if fill_res.get("ok") else []:
         coin = str(x.get("coin") or "")
+        fid = hlparse.fill_key(x)
+        if fid and fid in seen_ids:
+            seen.add(coin)
+            continue
+        if fid:
+            seen_ids.add(fid)
         seen.add(coin)
         px = hlparse.num(x.get("px"))
         sz = signed_fill_size(x)
         side = str(x.get("side") or x.get("dir") or "")
-        who = "unknown"
+        who = decider.decider_of(_decision_for(dec, coin))
+        d = str(x.get("dir") or "")
+        if d.startswith("Open"):
+            order_actor = hlparse.order_actor(x, executed)
+            close_actor = ""
+        elif d.startswith("Close") or "liquidat" in d.lower():
+            order_actor = ""
+            close_actor = hlparse.close_actor(x, orders, exit_actions, historical)
+        else:
+            order_actor = "unknown"
+            close_actor = "unknown"
         pack = (inputs.get("candles") or {}).get(coin) or {}
         c1 = (pack.get("1h") or {}).get("data") if (pack.get("1h") or {}).get("ok") else None
         c4 = (pack.get("4h") or {}).get("data") if (pack.get("4h") or {}).get("ok") else None
         both = stops.both_stops(px, px, sz, c1, c4, now_ms)
         hard_px = (both["hard"] or {}).get("price")
         hit = False
-        if hard_px and px and str(x.get("dir") or "").startswith("Close") and px <= hard_px:
+        if hard_px and px and d.startswith("Close") and px <= hard_px:
             hit = True
             problems.append(report.problem("HARD_SL_HIT", f"{coin} close px {px} at or through 4H Filter {hard_px:.6g}", coin))
         ts = datetime.fromtimestamp(int(x["time"]) / 1000, tz=rules.HKT).isoformat()
@@ -447,34 +510,47 @@ def build_journal(inputs: Dict[str, Any], now: datetime, env: Dict[str, str]) ->
             "time": ts, "coin": coin, "side": side, "size": sz, "price": px,
             "fee": hlparse.num(x.get("fee")), "pnl": hlparse.num(x.get("closedPnl")),
             "decider": who, "soft": both["soft"], "hard": both["hard"], "hard_sl_hit": hit,
-            "kind": "fill",
+            "kind": "fill", "fill_id": fid, "account": account,
+            "order_actor": order_actor, "close_actor": close_actor,
         })
+    insert_fills = dedupe_ok and known_ids is not None
     for rec in dec.get("records") or []:
         if not isinstance(rec, dict):
             continue
         coin = str(rec.get("symbol") or "")
         if coin in seen:
             continue
-        who = "unknown"
+        who = decider.decider_of(rec)
         rows.append({
             "time": rec.get("timestamp"), "coin": coin, "side": rec.get("decision"), "size": rec.get("size_pct"),
             "price": None, "fee": None, "pnl": None, "decider": who,
             "soft": None, "hard": None, "hard_sl_hit": False, "kind": "decision",
+            "fill_id": None, "account": account, "order_actor": "", "close_actor": "",
         })
     status = "problem" if problems else "ok"
-    lines = ["## Trade journal", "", "time | coin | side | size | price | fee | pnl | decider | soft | hard | hard_sl_hit", ""]
+    lines = ["## Trade journal", "",
+             "time | coin | side | size | price | fee | pnl | decider | order | close | soft | hard | hard_sl_hit", ""]
     for r in rows:
+        actor = ""
+        if r.get("order_actor"):
+            actor = f"order: {r['order_actor']}"
+        elif r.get("close_actor"):
+            actor = f"close: {r['close_actor']}"
         lines.append(
             f"{r['time']} | {r['coin']} | {r['side']} | {r['size']} | {r['price']} | {r['fee']} | {r['pnl']} | "
-            f"{r['decider']} | {stops.fmt_level(r['soft']) if r.get('soft') else '未知'} | "
+            f"{r['decider']} | {actor} | "
+            f"{stops.fmt_level(r['soft']) if r.get('soft') else '未知'} | "
             f"{stops.fmt_level(r['hard']) if r.get('hard') else '未知'} | {r['hard_sl_hit']}")
     if not rows:
         lines.append("(no fills or decisions today)")
     md = "\n".join(lines) + "\n"
     values = []
-    for r in rows:
+    stored = rows if insert_fills else [r for r in rows if r.get("kind") != "fill"]
+    for r in stored:
         values.append((now.isoformat(), r["time"], r["coin"], r["side"], r["size"], r["price"], r["fee"], r["pnl"],
-                       r["decider"], r.get("soft"), r.get("hard"), bool(r["hard_sl_hit"]), {"kind": r["kind"]}))
+                       r["decider"], r.get("soft"), r.get("hard"), bool(r["hard_sl_hit"]),
+                       {"kind": r["kind"], "fill_id": r.get("fill_id"), "account": r.get("account") or None,
+                        "order_actor": r.get("order_actor") or None, "close_actor": r.get("close_actor") or None}))
     brain = []
     if values:
         brain.append({

@@ -7,7 +7,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
-from ops_cron import bo_report, decider, desk_missing, gc_levels, harbor, hlparse, main as ops_main, rules, stops
+from ops_cron import bo_report, decider, desk_missing, gc_levels, harbor, hlparse, main as ops_main, persist, report, rules, stops
 from ops_cron import river_jobs
 
 ENV = {"COCKPIT_URL": "https://cockpit.example.invalid", "COCKPIT_AI_KEY": "ai-key-SECRET-123",
@@ -154,10 +154,13 @@ class TestDecider(unittest.TestCase):
                "history": [{"symbol": "SOL", "source": "claude", "timestamp": "2026-10-06T00:10:00+00:00"}]}
         self.assertEqual(decider.decider_for_coin("SOL", dec, "2026-10-06"), "unknown")
 
-    def test_source_is_not_an_actor(self):
+    def test_fallback_source_is_the_0850_job(self):
         dec = {"history": [{"symbol": "SOL", "source": "fallback", "timestamp": "2026-10-06T00:40:00+00:00"}],
                "records": [{"symbol": "SOL", "source": "forge", "timestamp": "2026-10-06T00:40:00+00:00"}]}
-        self.assertEqual(decider.decider_for_coin("SOL", dec, "2026-10-06"), "unknown")
+        self.assertEqual(decider.decider_for_coin("SOL", dec, "2026-10-06"), "Railway 08:50 fallback")
+        self.assertEqual(decider.decider_of({"source": "claude"}), "unknown")
+        self.assertEqual(decider.decider_of({"source": "forge"}), "unknown")
+        self.assertEqual(decider.decider_of({"source": "fallback", "actor": "Forge"}), "Forge")
 
     def test_explicit_actor_is_kept(self):
         dec = {"history": [{"symbol": "SOL", "actor": "Forge", "timestamp": "2026-10-06T00:10:00+00:00"}]}
@@ -343,7 +346,8 @@ class TestSpotUsdc(unittest.TestCase):
                           "hl_orders": orders, "all_mids": mids, "fills_7d": {"ok": True, "data": []},
                           "fills_all": {"ok": True, "data": []}, "funding_7d": {"ok": True, "data": []},
                           "run_report": {"ok": True, "data": {}}, "bx_status": {"ok": False}}, NOW, {})
-        self.assertIn("spot USDC unknown", h["markdown"])
+        self.assertIn("spot USDC 未知", h["markdown"])
+        self.assertIn("NAV: 未核實", h["markdown"])
         self.assertIn("perp accountValue 1,000.00", h["markdown"])
         self.assertNotIn("spot USDC 0", h["markdown"])
         self.assertNotIn("spot USDC 1,000.00", h["markdown"])
@@ -356,8 +360,9 @@ class TestSpotUsdc(unittest.TestCase):
                                "run_report": {"ok": True, "data": {"decisions": {"ok": True, "records": [
                                    {"symbol": "BTC", "source": "claude", "timestamp": "2026-10-06T00:10:00+00:00"}]}}}},
                               NOW, {})
-        self.assertIn("perp accountValue unknown", rep["markdown"])
-        self.assertIn("spot USDC unknown", rep["markdown"])
+        self.assertIn("perp accountValue 未知", rep["markdown"])
+        self.assertIn("spot USDC 未知", rep["markdown"])
+        self.assertIn("NAV: 未核實", rep["markdown"])
         self.assertNotIn("accountValue 0", rep["markdown"])
 
     def test_bo_tp_only_is_no_and_proper_sl_prints_distance(self):
@@ -470,6 +475,278 @@ class TestRiverFixes(unittest.TestCase):
         }, t, ENV)
         self.assertIn("brain_rows", rep)
         self.assertNotIn("window closed", rep["summary"])
+
+
+class TestRound3(unittest.TestCase):
+    def test_open_fill_is_railway_only_with_a_matching_executed_record(self):
+        fill_ms = 1_700_000_000_000
+        iso = datetime.fromtimestamp(fill_ms / 1000, tz=timezone.utc).isoformat()
+        open_fill = {"coin": "SOL", "dir": "Open Long", "side": "B", "time": fill_ms, "tid": 1}
+        matched = [{"symbol": "SOL", "side": "B", "run_ts": iso}]
+        self.assertEqual(hlparse.order_actor(open_fill, matched), "Railway")
+        self.assertEqual(hlparse.order_actor(open_fill, []), "unknown")
+        late = datetime.fromtimestamp((fill_ms + 16 * 60 * 1000) / 1000, tz=timezone.utc).isoformat()
+        self.assertEqual(hlparse.order_actor(open_fill, [{"symbol": "SOL", "side": "B", "run_ts": late}]), "unknown")
+        self.assertEqual(hlparse.order_actor(open_fill, [{"symbol": "SOL", "side": "A", "run_ts": iso}]), "unknown")
+        lines = bo_report._actors("SOL", {}, "2026-10-06", [open_fill], matched, [], [])
+        self.assertTrue(any(x.startswith("order: Railway") for x in lines))
+        self.assertTrue(all(not x.startswith("close: Railway") for x in lines))
+
+    def test_close_fill_is_hard_sl_or_unknown_never_railway(self):
+        fill_ms = 1_700_000_000_000
+        stop = {"coin": "SOL", "dir": "Close Long", "orderType": "Stop Market", "time": fill_ms}
+        plain = {"coin": "SOL", "dir": "Close Long", "time": fill_ms, "oid": 9}
+        self.assertEqual(hlparse.close_actor(stop), "hard_sl")
+        self.assertEqual(hlparse.close_actor(plain, []), "unknown")
+        resting = [{"coin": "SOL", "oid": 9, "isTrigger": True, "reduceOnly": True, "orderType": "Stop Market"}]
+        self.assertEqual(hlparse.close_actor(plain, resting), "hard_sl")
+        lines = bo_report._actors("SOL", {}, "2026-10-06", [plain], [], [], [])
+        self.assertIn("order: unknown", lines)
+        self.assertIn("close: unknown", lines)
+        self.assertFalse(any(x.startswith("close: Railway") or x.startswith("order: Railway") for x in lines))
+        stopped = bo_report._actors("SOL", {}, "2026-10-06", [stop], [], [], [])
+        self.assertIn("close: hard_sl", stopped)
+
+    def test_nav_is_perp_plus_spot_and_unverified_when_spot_fails(self):
+        perp = {"marginSummary": {"accountValue": "1000", "totalRawUsd": "9000", "totalMarginUsed": "800"}}
+        only = hlparse.portfolio_nav(perp, {"balances": [{"coin": "USDC", "total": "0"}]}, perp_ok=True, spot_ok=True)
+        self.assertEqual(only["nav"], 1000.0)
+        self.assertIsNone(only["warning"])
+        both = hlparse.portfolio_nav(perp, {"balances": [{"coin": "USDC", "total": "250"}]}, perp_ok=True, spot_ok=True)
+        self.assertEqual(both["nav"], 1250.0)
+        self.assertIn("1,250.00", both["label"])
+        failed = hlparse.portfolio_nav(perp, None, perp_ok=True, spot_ok=False)
+        self.assertIsNone(failed["nav"])
+        self.assertEqual(failed["label"], "NAV: 未核實")
+        state, orders, mids = _hl_book(order=_sl_order())
+        common = {"day": "2026-10-06", "hl_state": state, "hl_orders": orders, "all_mids": mids,
+                  "fills_7d": {"ok": True, "data": []}, "fills_all": {"ok": True, "data": []},
+                  "funding_7d": {"ok": True, "data": []}, "run_report": {"ok": True, "data": {}},
+                  "bx_status": {"ok": False}}
+        plus = harbor.build({**common, "hl_spot": {"ok": True, "data": {"balances": [
+            {"coin": "USDC", "total": "250"}]}}}, NOW, {})
+        self.assertEqual(plus["brain_rows"][0]["values"][0][3]["nav"], 1250.0)
+        report.reset_nav_warning()
+        err = io.StringIO()
+        spot_down = {"ok": False, "error": "down"}
+        hot = {"ok": True, "data": {"marginSummary": {"accountValue": "1000", "totalMarginUsed": "800",
+                                                      "totalRawUsd": "9000"}, "assetPositions": []}}
+        bo_in = {"day": "2026-10-06", "hl_state": hot, "hl_spot": spot_down,
+                 "hl_orders": {"ok": True, "data": []}, "all_mids": {"ok": True, "data": {}},
+                 "fills": {"ok": True, "data": []},
+                 "run_report": {"ok": True, "data": {"decisions": {"ok": True, "records": [
+                     {"symbol": "SOL", "source": "claude", "timestamp": "2026-10-06T00:10:00+00:00"}]}}}}
+        with redirect_stderr(err):
+            rep = bo_report.build(bo_in, NOW, {})
+            bo_report.build(bo_in, NOW, {})
+        self.assertIsNone(rep["brain_rows"][0]["values"][0][3])
+        self.assertIn("NAV: 未核實", rep["markdown"])
+        self.assertIn("margin% 未核實", rep["markdown"])
+        self.assertIn("已實現 P&L (realized, excl. funding & unrealized)", rep["markdown"])
+        self.assertNotIn("MARGIN_HIGH", [p["code"] for p in rep["problems"]])
+        self.assertEqual(len([ln for ln in err.getvalue().splitlines() if "未核實" in ln]), 1)
+        board = river_jobs.build_scoreboard({
+            "state": hot, "spot": spot_down, "orders": {"ok": True, "data": []},
+            "fills": {"ok": True, "data": []}, "nav_start": "1000"}, NOW, ENV)
+        self.assertIsNone(board["brain_rows"][0]["values"][0][2])
+        self.assertNotIn("C48_ALLOC", [p["code"] for p in board["problems"]])
+        self.assertIn("margin% 未核實", board["markdown"])
+
+    def test_exit_monitor_and_daily_audit_use_the_nav_helper(self):
+        data = _exit_with([_sl_order(sz="2.5", triggerPx="140")], {"SOL": "155"})
+        data["hl_state"]["data"]["marginSummary"]["accountValue"] = "1000"
+        data["hl_spot"] = {"ok": True, "data": {"balances": [{"coin": "USDC", "total": "250"}]}}
+        rep = rules.exit_monitor(data, NOW, {"bx_enabled": False, "lookback_min": 65})
+        self.assertEqual(rep["nav"], 1250.0)
+        self.assertIn("NAV: 1,250.00", rules.to_markdown(rep))
+        audit = _audit_with([_sl_order()])
+        audit["hl_spot"] = {"ok": True, "data": {"balances": [{"coin": "USDC", "total": "0"}]}}
+        aud = rules.daily_audit(audit, NOW, {"bx_enabled": True, "window_h": 24, "slippage_max_bp": 60,
+                                              "expect_bx_live": None, "bx_country": "SG",
+                                              "bx_region_prefix": "asia-southeast1"})
+        self.assertEqual(aud["nav"], 1000.0)
+
+    def test_fallback_decider_on_veto_and_journal(self):
+        veto = river_jobs.build_veto({
+            "day": "2026-10-06", "signal_day": "2026-10-04",
+            "decisions": {"ok": True, "data": {"decisions": {"ok": True, "records": [
+                {"symbol": "SOL", "decision": "approve", "source": "fallback", "type": "BASE",
+                 "timestamp": "2026-10-04T00:55:00+00:00"}]}}},
+            "candles": {"SOL": {"1h": {"ok": False}, "4h": {"ok": False}},
+                        "BTC": {"1h": {"ok": False}, "4h": {"ok": False}}},
+            "bx": {},
+        }, datetime(2026, 10, 6, 1, 5, tzinfo=timezone.utc), {})
+        self.assertEqual(veto["rows"][0]["decider"], "Railway 08:50 fallback")
+        rep = river_jobs.build_journal({
+            "day": "2026-10-06",
+            "fills": {"ok": True, "data": []},
+            "run_report": {"ok": True, "data": {"decisions": {"ok": True, "records": [
+                {"symbol": "SOL", "decision": "approve", "source": "fallback",
+                 "timestamp": "2026-10-06T00:40:00+00:00"}]}}},
+            "candles": {}, "orders": {"ok": True, "data": []}, "mids": {"ok": True, "data": {}},
+        }, NOW, {})
+        self.assertEqual(rep["rows"][0]["decider"], "Railway 08:50 fallback")
+
+    def test_incomplete_48h_window_is_out_of_the_continuation_rate(self):
+        now = datetime(2026, 10, 6, 1, 5, tzinfo=timezone.utc)
+        morning = datetime(2026, 10, 4, 0, 55, tzinfo=timezone.utc)
+        afternoon = datetime(2026, 10, 4, 8, 0, tzinfo=timezone.utc)
+
+        def bars(signal, after):
+            out = []
+            t = int((signal - timedelta(hours=3)).timestamp() * 1000)
+            end = int(now.timestamp() * 1000)
+            sig_ms = int(signal.timestamp() * 1000)
+            while t < end:
+                c = 100.0 if t + 3_600_000 <= sig_ms else after
+                out.append({"t": t, "o": c, "h": c, "l": c, "c": c})
+                t += 3_600_000
+            return out
+
+        veto = river_jobs.build_veto({
+            "day": "2026-10-06", "signal_day": "2026-10-04", "symbols": ["SOL", "ETH"],
+            "decisions": {"ok": True, "data": {"decisions": {"ok": True, "records": [
+                {"symbol": "SOL", "decision": "approve", "source": "claude", "type": "BASE",
+                 "timestamp": morning.isoformat()},
+                {"symbol": "ETH", "decision": "approve", "source": "claude", "type": "CHASE",
+                 "timestamp": afternoon.isoformat()}]}}},
+            "candles": {
+                "SOL": {"1h": {"ok": True, "data": bars(morning, 110)}, "4h": {"ok": False}},
+                "ETH": {"1h": {"ok": True, "data": bars(afternoon, 90)}, "4h": {"ok": False}},
+                "BTC": {"1h": {"ok": True, "data": bars(morning, 100)}, "4h": {"ok": False}},
+            },
+            "bx": {},
+        }, now, {})
+        by = {r["coin"]: r for r in veto["rows"]}
+        self.assertTrue(by["SOL"]["window_complete"])
+        self.assertFalse(by["ETH"]["window_complete"])
+        self.assertEqual(by["ETH"]["outcome"], "down")
+        self.assertEqual(by["SOL"]["outcome"], "up")
+        self.assertIn("窗口未夠 48h", veto["markdown"])
+        self.assertIn("continuation rate (complete 48h windows only): 1.0000", veto["markdown"])
+        self.assertNotIn("0.5000", veto["markdown"])
+        cols = veto["brain_rows"][0]["columns"]
+        self.assertIn("window_complete", cols)
+        idx = cols.index("window_complete")
+        flags = {row[2]: row[idx] for row in veto["brain_rows"][0]["values"]}
+        self.assertEqual(flags, {"SOL": True, "ETH": False})
+
+    def test_journal_watermark_survives_a_problem_and_a_failed_write(self):
+        self.assertNotIn("ops_check_run", persist.JOURNAL_FILL_WATERMARK_SQL)
+        self.assertNotIn("status", persist.JOURNAL_FILL_WATERMARK_SQL)
+        fill_ms = int((NOW - timedelta(hours=1)).timestamp() * 1000)
+        fill = {"coin": "SOL", "px": "1", "sz": "1", "side": "A", "time": fill_ms, "dir": "Close Long",
+                "closedPnl": "-5", "fee": "0.1", "tid": 42}
+
+        class Src:
+            def __init__(self):
+                self.hl_address = ENV["HL_ADDRESS"]
+                self.starts = []
+
+            def hl(self, body):
+                kind = body.get("type")
+                if kind == "userFillsByTime":
+                    self.starts.append(body["startTime"])
+                    return {"ok": True, "data": [fill]}
+                if kind == "candleSnapshot":
+                    step = 14_400_000 if body["req"]["interval"] == "4h" else 3_600_000
+                    return {"ok": True, "data": _bars(90, step, px=100)}
+                if kind == "clearinghouseState":
+                    return {"ok": True, "data": {"assetPositions": []}}
+                return {"ok": True, "data": []}
+
+            def cockpit(self, path):
+                return {"ok": True, "data": {"executed": [], "decisions": {"ok": True, "records": [], "history": []}}}
+
+        stored = []
+
+        def watermark(dsn, account):
+            times = [r["trade_time"] for r in stored]
+            return max(times) if times else None
+
+        def ids(dsn, account):
+            return {r["fill_id"] for r in stored}
+
+        env = {**ENV, "BRAIN_DATABASE_URL": "postgresql://brain.example/db"}
+        src = Src()
+        with patch("ops_cron.persist.last_journal_fill_time", watermark), \
+                patch("ops_cron.persist.existing_journal_fill_ids", ids):
+            first = river_jobs.fetch_journal(src, NOW, env)
+            rep = river_jobs.build_journal(first, NOW, env)
+            self.assertEqual(rep["status"], "problem")
+            self.assertTrue(any(p["code"] == "HARD_SL_HIT" for p in rep["problems"]))
+            self.assertIn("tid:42", [r.get("fill_id") for r in rep["rows"]])
+            stored.append({"fill_id": "tid:42", "trade_time": datetime.fromtimestamp(fill_ms / 1000, tz=timezone.utc)})
+            second = river_jobs.fetch_journal(src, NOW, env)
+            again = river_jobs.build_journal(second, NOW, env)
+            self.assertNotIn("tid:42", [r.get("fill_id") for r in again["rows"]])
+            brain_ids = [v[-1].get("fill_id") for spec in again.get("brain_rows") or [] for v in spec["values"]]
+            self.assertNotIn("tid:42", brain_ids)
+
+            stored.clear()
+            src.starts.clear()
+            lost = river_jobs.fetch_journal(src, NOW, env)
+            lost_rep = river_jobs.build_journal(lost, NOW, env)
+            self.assertIn("tid:42", [r.get("fill_id") for r in lost_rep["rows"]])
+            retry = river_jobs.fetch_journal(src, NOW, env)
+            retry_rep = river_jobs.build_journal(retry, NOW, env)
+        self.assertLessEqual(src.starts[-1], fill_ms)
+        self.assertIn("tid:42", [r.get("fill_id") for r in retry_rep["rows"]])
+
+    def test_trade_log_insert_skips_known_ids_and_is_written_first(self):
+        ops = []
+
+        class Cur:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def execute(self, sql, params=None):
+                ops.append((sql, params))
+                self.sql = sql
+
+            def fetchall(self):
+                if "fill_id" in getattr(self, "sql", ""):
+                    return [("tid:1",)]
+                return []
+
+            def fetchone(self):
+                return (None,)
+
+        class Conn:
+            def cursor(self):
+                return Cur()
+
+            def commit(self):
+                pass
+
+            def close(self):
+                pass
+
+        with patch("ops_cron.persist._connect", return_value=Conn()):
+            skipped = persist.insert_rows("postgresql://brain", "raw.river_trade_log", ["report"],
+                                          [({"kind": "fill", "fill_id": "tid:1"},)])
+            kept = persist.insert_rows("postgresql://brain", "raw.river_trade_log", ["report"],
+                                       [({"kind": "fill", "fill_id": "tid:2"},)])
+        self.assertEqual(skipped, "ok")
+        self.assertEqual(kept, "ok")
+        inserts = [(s, p) for s, p in ops if str(s).upper().startswith("INSERT")]
+        self.assertEqual(len(inserts), 1)
+        self.assertIn("tid:2", str(inserts[0][1]))
+        self.assertNotIn("tid:1", str(inserts[0][1]))
+        order = []
+        rep = {"check": "river_trade_log", "status": "problem", "summary": "hit", "problems": [{"code": "HARD_SL_HIT"}],
+               "notify": None, "markdown": "m", "run_at": NOW.isoformat(), "run_at_hkt": "t", "info": [],
+               "brain_rows": [{"table": "raw.river_trade_log", "columns": ["report"],
+                               "values": [({"kind": "fill", "fill_id": "tid:9"},)]}]}
+        with patch("ops_cron.persist.ensure_tables", return_value="ok"), \
+                patch("ops_cron.persist.insert_rows", side_effect=lambda *a, **k: order.append("trade_log") or "error: fail"), \
+                patch("ops_cron.persist.insert", side_effect=lambda *a, **k: order.append("ops_check_run") or "ok"), \
+                patch("ops_cron.main.build_report", return_value=rep):
+            ops_main.run("trade-journal", {**ENV, "BRAIN_DATABASE_URL": "postgresql://brain"}, now=NOW)
+        self.assertEqual(order, ["trade_log", "ops_check_run"])
 
 
 def _exit_with(orders, mids):

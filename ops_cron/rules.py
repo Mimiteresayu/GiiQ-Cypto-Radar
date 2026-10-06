@@ -412,7 +412,7 @@ def exit_monitor(inp: Dict[str, Any], now: datetime, cfg: Dict[str, Any]) -> Dic
         "sources": _source_status(inp, names), "lookback_min": int(cfg.get("lookback_min", 65))})
     # Silent when nothing is wrong. The old 20:xx daily OK line is not sent.
     res["notify"] = "problem" if res["status"] == "problem" else None
-    return res
+    return _attach_nav(res, inp)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -612,15 +612,30 @@ def daily_audit(inp: Dict[str, Any], now: datetime, cfg: Dict[str, Any]) -> Dict
         "sources": _source_status(inp, names)})
     # The 09:22 audit always produces one summary. Problems are inside that message.
     res["notify"] = "report"
-    return res
+    return _attach_nav(res, inp)
 
 
 # ---------------------------------------------------------------------------------------------
 # markdown
 # ---------------------------------------------------------------------------------------------
+def _attach_nav(res: Dict[str, Any], inp: Dict[str, Any]) -> Dict[str, Any]:
+    """NAV from hlparse.portfolio_nav when this run fetched spot USDC. Missing key: leave the report alone."""
+    if "hl_spot" not in inp:
+        return res
+    from . import hlparse, report
+    info = hlparse.nav_from_envelopes(inp.get("hl_state"), inp.get("hl_spot"))
+    if info.get("warning"):
+        report.warn_nav_unverified(info["warning"])
+    res["nav"] = info["nav"]
+    res["nav_label"] = info["label"]
+    return res
+
+
 def to_markdown(r: Dict[str, Any]) -> str:
     title = "Exit monitor" if r["check"] == "exit_monitor" else "Daily live audit"
     lines = [f"## {title} — {r['run_at_hkt']} HKT — **{r['status'].upper()}**", "", r["summary"], ""]
+    if r.get("nav_label"):
+        lines += [r["nav_label"], ""]
     if r["problems"]:
         lines += ["### Problems", ""] + [f"- `{p['code']}`{' ' + str(p['coin']) if p.get('coin') else ''}: {p['msg']}"
                                           for p in r["problems"]] + [""]

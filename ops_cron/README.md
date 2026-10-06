@@ -60,19 +60,24 @@ River's three jobs write insert-only rows to giiq-brain:
   radar crosses. `ret_48h` is the move in the 48 hours **after** that signal (did it continue). Candles are
   HL 1h, else Bitunix public `{COIN}USDT`. If a 1h low in that forward window trades through the 4H Filter
   as of the signal, `ret_48h_sl_aware` uses that stop. BTC is the benchmark over the same forward window.
-  Strategy comes from the decision `type` (BASE / CHASE). Cap 25.
-- **Trade journal** (09:15) loads fills from the last successful journal run (`raw.ops_check_run` run_at,
-  else `raw.river_trade_log` trade_time). The first run looks back 26 hours, so a close after yesterday's
-  09:15 is not dropped. One row per fill in that window, plus decision symbols with no fill.
-  Long size is positive and short size is negative. The decider column is `unknown` until cockpit stores
-  an actor. `source` is not treated as an actor.
+  Strategy comes from the decision `type` (BASE / CHASE). Cap 25. A row whose 48h has not elapsed yet
+  (an afternoon signal is still short at the next 09:05) is `window_complete=false` and flagged
+  `窗口未夠 48h`. Those rows stay in the table and are left out of the continuation rate.
+- **Trade journal** (09:15) loads fills from the newest fill time already stored in `raw.river_trade_log`
+  for this account (`MAX(trade_time)` where the row is a fill). `raw.ops_check_run` is not the watermark:
+  a Hard SL hit (`status=problem`) still advances once the fill is stored, and a failed trade-log write
+  does not. The first run (empty table) looks back 26 hours. Re-runs skip fills whose HL `tid` or `hash`
+  is already stored. One row per new fill, plus decision symbols with no fill.
+  Long size is positive and short size is negative. `order: Railway` is written only when the open fill
+  matches an `executed` row on `/api/exec/run-report` (same coin, same side, fill time within ±15 minutes).
+  A close is `close: hard_sl`, `close: exit_job_1h` (only when an exit-job record is already on the payload),
+  or `close: unknown`. An HL fill alone is not Railway.
 
 ### Decider
 
-Cockpit does not record who posted. The column is `unknown`. An explicit `actor` or `decider` value is
-copied only when it is already `Claude.ai`, `Forge`, `Railway 08:50 fallback`, or `unknown`.
-`source=claude`, `source=forge`, and `source=fallback` are not an actor. Recording the actor in cockpit
-is a follow-up.
+An explicit `actor` or `decider` value is copied only when it is already `Claude.ai`, `Forge`,
+`Railway 08:50 fallback`, or `unknown`. `source=fallback` is that Railway 08:50 job and is labelled
+`Railway 08:50 fallback`. `source=claude` and `source=forge` stay `unknown`.
 
 Missing numbers are written `未知` or `未核實`. A previous run's number is never reused.
 BX NAV is `未知` (owner Harbor): there is no read-only Bitunix key and no BX NAV table.
@@ -174,7 +179,8 @@ Desk-missing calls cockpit only, but it still requires `HL_ADDRESS` so a missing
 C48 does not need `COCKPIT_URL` and does not call mainnet. It still requires `HL_ADDRESS` (the public master address) in addition to `TESTNET_WALLET_ADDRESS`.
 
 Spot USDC is `spotClearinghouseState` balances where `coin` is USDC (`total`). Perp `accountValue` is printed
-separately and is not used as cash. A failed spot or perp read is the word `unknown`, never `0`.
+separately and is not used as cash. A failed spot or perp read is `未知`, never `0`.
+NAV = perp `marginSummary.accountValue` + spot USDC `total`, once (`hlparse.portfolio_nav`); a failed spot read is `NAV: 未核實` (margin% is `未核實` and the margin alert is suppressed).
 
 A Hard SL is a trigger/stop, reduce-only or `isPositionTpsl`, on the same coin, opposite the position,
 with the trigger on the losing side of the mark (long: trigger < mark, short: trigger > mark) and size
@@ -251,7 +257,7 @@ For each service:
 
 ## Known gaps
 
-- The decider column is `unknown`. Cockpit `source` is not an actor. Storing the actor is a follow-up.
+- `source=claude` and `source=forge` are not an actor. Only `source=fallback` is labelled `Railway 08:50 fallback`.
 - BX NAV is `未知`. Public Bitunix klines are used only as a candle fallback on the veto job.
 - `userFills` is capped at 2000. All-time realised P&L is then `未核實`.
 - BX slippage and BX exit efficiency are not computed. The daily BX entry cap counts open positions only.

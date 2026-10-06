@@ -10,6 +10,12 @@ from . import decider, hlparse, rules, stops
 def build(inputs: Dict[str, Any], now: datetime) -> str:
     day = now.astimezone(rules.HKT).strftime("%Y-%m-%d")
     lines = ["### Today's 08:55 run report", ""]
+    if "hl_spot" in inputs:
+        from . import report
+        info = hlparse.nav_from_envelopes(inputs.get("hl_state"), inputs.get("hl_spot"))
+        if info.get("warning"):
+            report.warn_nav_unverified(info["warning"])
+        lines += [info["label"], ""]
     rr = (inputs.get("run_report_today") or {}).get("data") if (inputs.get("run_report_today") or {}).get("ok") else None
     if not isinstance(rr, dict):
         lines.append("- 未知 (run report unavailable)")

@@ -94,6 +94,7 @@ def exit_monitor_inputs(src: Sources, now: datetime, lookback_min: int, bx_enabl
         "exit_health": src.cockpit("/api/exit/health"),
         "scheduler": src.cockpit("/api/scheduler/status"),
         "hl_state": src.hl({"type": "clearinghouseState", "user": src.hl_address}),
+        "hl_spot": src.hl({"type": "spotClearinghouseState", "user": src.hl_address}),
         "hl_orders": src.hl({"type": "frontendOpenOrders", "user": src.hl_address}),
         "all_mids": src.hl({"type": "allMids"}),
         "hl_fills": src.hl({"type": "userFillsByTime", "user": src.hl_address,
@@ -119,6 +120,7 @@ def daily_audit_inputs(src: Sources, now: datetime, bx_enabled: bool, window_h: 
         inp["bx_status"] = src.cockpit("/api/bx/status")
         inp["bx_day"] = src.cockpit(f"/api/bx/day?date={today}")
     inp["hl_state"] = src.hl({"type": "clearinghouseState", "user": src.hl_address})
+    inp["hl_spot"] = src.hl({"type": "spotClearinghouseState", "user": src.hl_address})
     inp["hl_orders"] = src.hl({"type": "frontendOpenOrders", "user": src.hl_address})
     inp["all_mids"] = src.hl({"type": "allMids"})
     candles: Dict[str, Any] = {}

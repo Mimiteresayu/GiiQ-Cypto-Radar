@@ -1,8 +1,8 @@
 """Who actually decided a trade.
 
-Cockpit does not record an actor yet. source=claude, source=forge and source=fallback are not
-an actor, so the column is unknown. Guessing from source is a follow-up once cockpit stores one.
 An explicit actor/decider field is used only when it is already one of the known labels.
+The one source value that is an actor is `fallback`: that POST is the Railway 08:50 job.
+`source=claude` and `source=forge` stay unknown. They are not a trustworthy actor.
 """
 from __future__ import annotations
 
@@ -29,6 +29,8 @@ def decider_of(rec: Optional[dict]) -> str:
     explicit = str(rec.get("decider") or rec.get("actor") or "").strip()
     if explicit in _EXPLICIT:
         return explicit
+    if str(rec.get("source") or "").strip().lower() == "fallback":
+        return RAILWAY_FALLBACK
     return UNKNOWN
 
 
