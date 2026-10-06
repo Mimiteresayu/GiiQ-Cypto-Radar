@@ -21,6 +21,10 @@ Rules (MMT, 2026-09-28):
   never re-armed; a CONTINUATION whose coin is already held is cancelled; an ADD_ON whose base
   position is gone is cancelled.
 
+DISABLED (Cove HEALTH FAIL 2026-10-05): no new CONTINUATION / ADD_ON pendings are created and active
+ones are cancelled (boot, executor, pending worker) unless PENDING_CONTINUATION_DISABLED=0 is set.
+Chase approvals become "acknowledged, no entry". Base entries are not affected.
+
 Storage: JSON list at out/pending_entries.json (Railway volume), override with PENDING_PATH.
 """
 from __future__ import annotations
@@ -41,6 +45,37 @@ ADD_ON = "ADD_ON"
 CONTINUATION = "CONTINUATION"
 BAND_TF = {ADD_ON: "4h", CONTINUATION: "1d"}
 ACTIVE = "pending"
+PENDING_KINDS = (ADD_ON, CONTINUATION)
+DISABLE_ENV = "PENDING_CONTINUATION_DISABLED"
+DISABLED_REASON = "disabled by Cove HEALTH FAIL 2026-10-05"
+
+
+def pending_disabled() -> bool:
+    """CONTINUATION / ADD_ON pendings are OFF by default (Cove HEALTH FAIL 2026-10-05, formal disable
+    until Cove re-signs CONTINUATION health). Only PENDING_CONTINUATION_DISABLED=0/false/no/off re-enables."""
+    return (os.environ.get(DISABLE_ENV) or "").strip().lower() not in ("0", "false", "no", "off")
+
+
+def cancel_active_pending(entries: List[dict], now: datetime, reason: str = DISABLED_REASON) -> List[dict]:
+    """Mark every ACTIVE CONTINUATION / ADD_ON record cancelled (mutates `entries`). Returns those records."""
+    gone = []
+    for e in entries:
+        if e.get("status") == ACTIVE and e.get("kind") in PENDING_KINDS:
+            e.update(status="cancelled", closed_at=now.isoformat(), close_reason=reason)
+            gone.append(e)
+    return gone
+
+
+def enforce_disabled(now: Optional[datetime] = None) -> Dict[str, Any]:
+    """If disabled: cancel active CONTINUATION / ADD_ON in the store and save (boot hook, one-shot clear)."""
+    if not pending_disabled():
+        return {"disabled": False, "cancelled": []}
+    now = now or datetime.now(timezone.utc)
+    entries = load_pending()
+    gone = cancel_active_pending(entries, now)
+    if gone:
+        save_pending(entries)
+    return {"disabled": True, "reason": DISABLED_REASON, "cancelled": [e.get("id") for e in gone]}
 
 
 def pending_path() -> Path:

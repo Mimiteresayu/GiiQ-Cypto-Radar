@@ -9,8 +9,11 @@ Surfaces, BEFORE the 08:55 executor, every reason LIVE entries would fail:
   4. signing: side-effect-free signed probe (cancel of a non-existent oid) is accepted by HL
   5. decisions/candidates (informational before 08:55): today's approvals, candidate freshness,
      approved coins listed on HL with maxLeverage >= requested (clamped) leverage, and the
-     at-entry Upper guard (Base only: live mid vs 1D Upper; Chase approvals become pending)
-  6. pending pullback entries (ADD_ON / CONTINUATION) with trigger zones
+     at-entry Upper guard (Base only: live mid vs 1D Upper; Chase approvals become pending, or
+     "no entry" while CONTINUATION / ADD_ON pending is disabled). Approvals are matched against
+     today's frozen entry_candidates_decision_YYYYMMDD.json (fallback: latest). An approval missing
+     from the list is OK when an active CONTINUATION / ADD_ON pending already exists for it.
+  6. pending pullback entries (ADD_ON / CONTINUATION) with trigger zones, and whether they are disabled
   7. GIIQ-SoT-1 guardrails preview: radar row-count (1D/4H/1H; entries fail closed below the
      threshold), NAV snapshot definition, minimum order = max($10, 1% NAV)
 
@@ -152,13 +155,36 @@ def run_preflight(hl: Any = None, signed_probe: bool = True, now: Optional[datet
         add("decisions", False, f"cannot read decisions: {e}", blocking=False)
     approved = {s: r for s, r in decisions.items() if r.get("decision") == "approve"}
     res["approved"] = sorted(approved)
+    from pending_entries import (DISABLE_ENV, DISABLED_REASON, PENDING_KINDS, load_pending,
+                                 pending_disabled)
+    disabled = pending_disabled()
+    res["pending_disabled"] = disabled
+    add("pending_mode", True, (f"CONTINUATION/ADD_ON pending DISABLED ({DISABLED_REASON}): Chase approvals -> "
+                               f"no entry; re-enable with {DISABLE_ENV}=0") if disabled
+        else f"CONTINUATION/ADD_ON pending enabled ({DISABLE_ENV}=0)", blocking=False)
+    try:
+        pend_all = load_pending()
+    except Exception:  # noqa: BLE001
+        pend_all = []
+    active_pend = {e.get("symbol"): e for e in pend_all
+                   if e.get("status") == "pending" and e.get("kind") in PENDING_KINDS}
     if approved:
         try:
-            cand = json.loads((ROOT / "out" / "entry_candidates_latest.json").read_text(encoding="utf-8"))
+            cand_latest = json.loads((ROOT / "out" / "entry_candidates_latest.json").read_text(encoding="utf-8"))
         except Exception:  # noqa: BLE001
-            cand = {}
-        fresh, why = candidates_fresh(cand, now=now)
+            cand_latest = {}
+        fresh, why = candidates_fresh(cand_latest, now=now)
         add("candidates", fresh, why, blocking=False)
+        try:
+            from entry_candidates import load_decision_candidates
+            cand, cand_label, frozen = load_decision_candidates(now)
+        except Exception as e:  # noqa: BLE001
+            cand, cand_label, frozen = cand_latest, f"entry_candidates_latest.json (snapshot load failed: {e})", False
+        if not frozen:
+            cand = cand_latest
+            _log(f"no decision-day snapshot -> matching approvals against {cand_label}")
+        res["candidates_source"] = cand_label
+        add("candidates_match", True, f"approvals matched against {cand_label}", blocking=False)
         try:
             meta = hl.meta()
             for sym, rec in sorted(approved.items()):
@@ -185,11 +211,28 @@ def run_preflight(hl: Any = None, signed_probe: bool = True, now: Optional[datet
             for sym in sorted(approved):
                 c = cmap.get(sym)
                 if not c:
+                    p = active_pend.get(sym)
+                    if p:
+                        guard[sym] = {"type": None, "pending_kind": p.get("kind"), "note": "already pending"}
+                        add(f"guard:{sym}", True, f"already pending {p.get('kind')} (id {p.get('id')}, "
+                            f"exp {p.get('expires_at')}); not in the candidate list -> no new entry", blocking=False)
+                        continue
+                    if disabled and str(approved[sym].get("type") or "").upper() == "CHASE":
+                        guard[sym] = {"type": "Chase", "pending_kind": None, "no_entry": True,
+                                      "note": "not in candidate list"}
+                        add(f"guard:{sym}", True, f"Chase approval -> no entry (CONTINUATION/ADD_ON pending "
+                            f"disabled: {DISABLED_REASON})", blocking=False)
+                        continue
                     guard[sym] = {"type": None, "note": "not in current candidate list"}
                     add(f"guard:{sym}", False, "approved but not in the current candidate list -> executor will skip",
                         blocking=False)
                     continue
                 if c.get("type") == "Chase" and not c.get("is_base"):
+                    if disabled:
+                        guard[sym] = {"type": "Chase", "pending_kind": None, "no_entry": True}
+                        add(f"guard:{sym}", True, f"Chase -> no entry (CONTINUATION/ADD_ON pending disabled: "
+                            f"{DISABLED_REASON})", blocking=False)
+                        continue
                     kind = "ADD_ON" if sym in held else "CONTINUATION"
                     guard[sym] = {"type": "Chase", "pending_kind": kind}
                     add(f"guard:{sym}", True, f"Chase -> no 08:55 entry; becomes pending {kind} "
