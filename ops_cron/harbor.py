@@ -23,6 +23,7 @@ def fetch(src, now: datetime, env: Dict[str, str]) -> Dict[str, Any]:
     inp: Dict[str, Any] = {
         "day": day,
         "hl_state": src.hl({"type": "clearinghouseState", "user": src.hl_address}),
+        "hl_spot": src.hl({"type": "spotClearinghouseState", "user": src.hl_address}),
         "hl_orders": src.hl({"type": "frontendOpenOrders", "user": src.hl_address}),
         "all_mids": src.hl({"type": "allMids"}),
         "fills_7d": src.hl({"type": "userFillsByTime", "user": src.hl_address,
@@ -85,8 +86,9 @@ def build(inputs: Dict[str, Any], now: datetime, env: Dict[str, str]) -> Dict[st
     state = state_res.get("data") if state_res.get("ok") else None
     if not state_res.get("ok"):
         problems.append(report.problem("DATA_UNAVAILABLE", f"HL account unreadable: {state_res.get('error') or 'missing'}"))
-    nav = hlparse.account_value(state)
-    usdc = hlparse.raw_usdc(state)
+    nav = hlparse.account_value(state) if state_res.get("ok") else None
+    spot_res = inputs.get("hl_spot") or {}
+    usdc = hlparse.spot_usdc(spot_res.get("data")) if spot_res.get("ok") else None
     pos = hlparse.positions(state)
     upnl = sum(p["unrealized_pnl"] or 0.0 for p in pos) if pos else (None if state is None else 0.0)
 
@@ -128,12 +130,12 @@ def build(inputs: Dict[str, Any], now: datetime, env: Dict[str, str]) -> Dict[st
         c1 = (candles.get("1h") or {}).get("data") if (candles.get("1h") or {}).get("ok") else None
         c4 = (candles.get("4h") or {}).get("data") if (candles.get("4h") or {}).get("ok") else None
         both = stops.both_stops(mark, p.get("entry_px"), p.get("szi"), c1, c4, now_ms)
-        resting = hlparse.hard_sl_order(orders, coin) if isinstance(orders, list) else None
-        if isinstance(orders, list) and resting is None:
+        resting = hlparse.hard_sl_status(orders, coin, p["side"], p.get("szi"), mark) if isinstance(orders, list) else None
+        if isinstance(orders, list) and not (resting or {}).get("ok"):
             problems.append(report.problem("NO_SL", f"Hard SL missing on open HL position {coin}", coin))
         hard_px = (both["hard"] or {}).get("price")
-        if resting is not None:
-            hard_px = hlparse.trigger_px(resting) or hard_px
+        if resting and resting.get("ok"):
+            hard_px = resting.get("trigger_px") or hard_px
         if stops.liq_closer_than_hard(mark, p.get("liq"), hard_px):
             problems.append(report.problem("LIQ_INSIDE_SL", f"liq is closer than Hard SL on {coin}", coin))
         who = decider.decider_for_coin(coin, dec, day)
@@ -143,7 +145,7 @@ def build(inputs: Dict[str, Any], now: datetime, env: Dict[str, str]) -> Dict[st
             f"uPnL {report.usd(p.get('unrealized_pnl'))} decider {who}\n"
             f"  soft (1H Lower) {stops.fmt_level(both['soft'])}\n"
             f"  hard (4H Filter) {stops.fmt_level(both['hard'])}\n"
-            f"  HL trigger {'yes @ ' + str(hlparse.trigger_px(resting)) if resting else 'MISSING'}"
+            f"  {hlparse.fmt_hard_sl(resting or {'ok': False})}"
         )
 
     close_lines = []
@@ -201,7 +203,9 @@ def build(inputs: Dict[str, Any], now: datetime, env: Dict[str, str]) -> Dict[st
     lines = [
         f"# Harbor P&L {day}",
         "",
-        f"HL USDC {report.usd(usdc if usdc is not None else nav)} · unrealized {report.usd(upnl)} · "
+        f"perp accountValue {report.known_usd(nav, state_res.get('ok') and nav is not None)} · "
+        f"spot USDC {report.known_usd(usdc, spot_res.get('ok') and usdc is not None)} · "
+        f"unrealized {report.usd(upnl)} · "
         f"yesterday realized {report.usd(y_pnl)} · 7d realized {report.usd(w_pnl)} · "
         f"since open realized {UNKNOWN + ' (userFills capped at 2000)' if all_truncated else report.usd(all_pnl)}",
         f"funding yesterday {report.usd(y_fund)} · funding 7d {report.usd(w_fund)}",

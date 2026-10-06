@@ -20,6 +20,7 @@
       "assetPositions": [{"type": "oneWay", "position": {"coin": "SOL", "szi": "2.5", "entryPx": "150.2",
         "leverage": {"type": "isolated", "value": 3}, "unrealizedPnl": "4.1", "marginUsed": "125.0"}}],
       "marginSummary": {"accountValue": "0.0", "totalMarginUsed": "125.0"}}},
+    "all_mids": {"ok": true, "http": 200, "error": "", "data": {"SOL": "155.0"}},
     "hl_orders": {"ok": true, "http": 200, "error": "", "data": [
       {"coin": "SOL", "side": "A", "limitPx": "133.0", "sz": "2.5", "oid": 111, "timestamp": 1791075321000,
        "isTrigger": true, "triggerPx": "140.0", "triggerCondition": "Price below 140.0", "reduceOnly": true,

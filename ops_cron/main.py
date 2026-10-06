@@ -54,6 +54,23 @@ def _parse_now(v: Optional[str]) -> Optional[datetime]:
     return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
 
 
+_CHECK_ID = {
+    "exit-monitor": "exit_monitor", "daily-audit": "daily_audit", "desk-missing": "desk_missing",
+    "harbor-pnl": "harbor_pnl", "bo-report": "bo_live_report", "c48-scoreboard": "river_c48_ft_score",
+    "desk-veto": "river_desk_veto", "trade-journal": "river_trade_log",
+}
+_ALWAYS_SEND = {"daily-audit", "harbor-pnl", "bo-report"}
+HL_ADDRESS_MISSING = "HL_ADDRESS not set"
+
+
+def _missing_hl_address(check: str, now: datetime) -> Dict[str, Any]:
+    from . import report
+    problems = [report.problem("DATA_UNAVAILABLE", HL_ADDRESS_MISSING)]
+    md = f"## {check}\n\n{HL_ADDRESS_MISSING}\n\nunknown\n"
+    notify = "report" if check in _ALWAYS_SEND else "problem"
+    return report.shell(_CHECK_ID.get(check, check), now, "problem", HL_ADDRESS_MISSING, problems, notify, md)
+
+
 def build_report(check: str, env: Mapping[str, str], fixture: Optional[str] = None,
                  now: Optional[datetime] = None) -> Dict[str, Any]:
     cfg = config(env)
@@ -64,6 +81,8 @@ def build_report(check: str, env: Mapping[str, str], fixture: Optional[str] = No
         now = now or _parse_now(fx.get("now")) or sources.utcnow()
     else:
         now = now or sources.utcnow()
+        if not (env.get("HL_ADDRESS") or "").strip():
+            return _missing_hl_address(check, now)
         src = sources.Sources(env.get("COCKPIT_URL") or "", env.get("COCKPIT_AI_KEY") or "",
                               env.get("HL_ADDRESS") or "", env.get("HL_INFO_URL") or "https://api.hyperliquid.xyz/info",
                               cfg["timeout_s"])

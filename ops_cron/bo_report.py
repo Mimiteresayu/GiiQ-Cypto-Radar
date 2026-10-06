@@ -18,6 +18,7 @@ def fetch(src, now: datetime, env: Dict[str, str]) -> Dict[str, Any]:
     inp: Dict[str, Any] = {
         "day": day,
         "hl_state": src.hl({"type": "clearinghouseState", "user": src.hl_address}),
+        "hl_spot": src.hl({"type": "spotClearinghouseState", "user": src.hl_address}),
         "hl_orders": src.hl({"type": "frontendOpenOrders", "user": src.hl_address}),
         "all_mids": src.hl({"type": "allMids"}),
         "fills": src.hl({"type": "userFillsByTime", "user": src.hl_address,
@@ -73,8 +74,10 @@ def build(inputs: Dict[str, Any], now: datetime, env: Dict[str, str]) -> Dict[st
     state = state_res.get("data") if state_res.get("ok") else None
     if not state_res.get("ok"):
         problems.append(report.problem("DATA_UNAVAILABLE", f"HL account unreadable: {state_res.get('error') or 'missing'}"))
-    nav = hlparse.account_value(state)
-    margin = hlparse.margin_used(state)
+    nav = hlparse.account_value(state) if state_res.get("ok") else None
+    spot_res = inputs.get("hl_spot") or {}
+    usdc = hlparse.spot_usdc(spot_res.get("data")) if spot_res.get("ok") else None
+    margin = hlparse.margin_used(state) if state_res.get("ok") else None
     if nav and margin is not None and nav > 0 and (margin / nav * 100.0) > stops.MARGIN_CAP_PCT:
         problems.append(report.problem(
             "MARGIN_HIGH", f"margin {margin / nav * 100:.1f}% of NAV is above the {stops.MARGIN_CAP_PCT:.0f}% cap"))
@@ -112,8 +115,8 @@ def build(inputs: Dict[str, Any], now: datetime, env: Dict[str, str]) -> Dict[st
         c1 = (candles.get("1h") or {}).get("data") if (candles.get("1h") or {}).get("ok") else None
         c4 = (candles.get("4h") or {}).get("data") if (candles.get("4h") or {}).get("ok") else None
         both = stops.both_stops(mark, p.get("entry_px"), p.get("szi"), c1, c4, now_ms)
-        resting = hlparse.hard_sl_order(orders, coin) if isinstance(orders, list) else None
-        if isinstance(orders, list) and resting is None:
+        resting = hlparse.hard_sl_status(orders, coin, p["side"], p.get("szi"), mark) if isinstance(orders, list) else None
+        if isinstance(orders, list) and not (resting or {}).get("ok"):
             problems.append(report.problem("NO_SL", f"Hard SL is not on HL for {coin}", coin))
         coin_fills = [x for x in (fills or []) if x.get("coin") == coin]
         who = _actors(coin, dec if isinstance(dec, dict) else {}, day, coin_fills)
@@ -121,8 +124,8 @@ def build(inputs: Dict[str, Any], now: datetime, env: Dict[str, str]) -> Dict[st
             f"### {coin}",
             f"entry {p.get('entry_px')} mark {mark} unrealized {report.usd(p.get('unrealized_pnl'))}",
             f"soft exit (1H close < 1H Lower): {stops.fmt_level(both['soft'])}",
-            f"Hard SL (4H Filter, HL trigger): {stops.fmt_level(both['hard'])}",
-            f"HL trigger {'yes @ ' + str(hlparse.trigger_px(resting)) if resting else 'not on HL'}",
+            f"Hard SL (4H Filter level): {stops.fmt_level(both['hard'])}",
+            hlparse.fmt_hard_sl(resting or {"ok": False}),
             *who,
         ]))
 
@@ -131,7 +134,9 @@ def build(inputs: Dict[str, Any], now: datetime, env: Dict[str, str]) -> Dict[st
     lines = [
         f"# BO live {day} {session}",
         "",
-        f"NAV {report.usd(nav)} · today P&L {report.usd(day_pnl)} · week P&L {report.usd(week_pnl)} · "
+        f"perp accountValue {report.known_usd(nav, state_res.get('ok') and nav is not None)} · "
+        f"spot USDC {report.known_usd(usdc, spot_res.get('ok') and usdc is not None)} · "
+        f"today P&L {report.usd(day_pnl)} · week P&L {report.usd(week_pnl)} · "
         f"week cost ~${cost:.0f} · week P&L minus cost {report.usd(vs)}",
         "",
         "## Positions",

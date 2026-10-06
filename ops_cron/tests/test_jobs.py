@@ -2,11 +2,12 @@
 import io
 import json
 import unittest
+from pathlib import Path
 from contextlib import redirect_stderr, redirect_stdout
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
-from ops_cron import bo_report, decider, desk_missing, gc_levels, harbor, main as ops_main, stops
+from ops_cron import bo_report, decider, desk_missing, gc_levels, harbor, hlparse, main as ops_main, rules, stops
 from ops_cron import river_jobs
 
 ENV = {"COCKPIT_URL": "https://cockpit.example.invalid", "COCKPIT_AI_KEY": "ai-key-SECRET-123",
@@ -60,6 +61,8 @@ class FakeHTTP:
                         "assetPositions": []}
             elif t == "allMids":
                 data = {"BTC": "100"}
+            elif t == "spotClearinghouseState":
+                data = {"balances": [{"coin": "USDC", "total": "12.5", "hold": "0"}]}
             elif t == "candleSnapshot":
                 data = _bars(80, 3_600_000)
             else:
@@ -93,7 +96,8 @@ class TestStops(unittest.TestCase):
                                           "coin": "SOL", "szi": "2", "entryPx": "100", "unrealizedPnl": "4",
                                           "liquidationPx": "50", "leverage": {"type": "isolated", "value": 3},
                                           "positionValue": "210"}}]}}
-        orders = {"ok": True, "data": [{"coin": "SOL", "isTrigger": True, "triggerPx": "90", "reduceOnly": True}]}
+        orders = {"ok": True, "data": [{"coin": "SOL", "side": "A", "sz": "2", "isTrigger": True,
+                                         "triggerPx": "90", "reduceOnly": True}]}
         candles = {"SOL": {"1h": {"ok": True, "data": c1}, "4h": {"ok": True, "data": c4}}}
         mids = {"ok": True, "data": {"SOL": "105"}}
         dec = {"ok": True, "data": {"decisions": {"ok": True, "posted": True, "records": [
@@ -150,10 +154,14 @@ class TestDecider(unittest.TestCase):
                "history": [{"symbol": "SOL", "source": "claude", "timestamp": "2026-10-06T00:10:00+00:00"}]}
         self.assertEqual(decider.decider_for_coin("SOL", dec, "2026-10-06"), "unknown")
 
-    def test_fallback_before_0855(self):
+    def test_source_is_not_an_actor(self):
         dec = {"history": [{"symbol": "SOL", "source": "fallback", "timestamp": "2026-10-06T00:40:00+00:00"}],
-               "records": []}
-        self.assertEqual(decider.decider_for_coin("SOL", dec, "2026-10-06"), "Railway 08:50 fallback")
+               "records": [{"symbol": "SOL", "source": "forge", "timestamp": "2026-10-06T00:40:00+00:00"}]}
+        self.assertEqual(decider.decider_for_coin("SOL", dec, "2026-10-06"), "unknown")
+
+    def test_explicit_actor_is_kept(self):
+        dec = {"history": [{"symbol": "SOL", "actor": "Forge", "timestamp": "2026-10-06T00:10:00+00:00"}]}
+        self.assertEqual(decider.decider_for_coin("SOL", dec, "2026-10-06"), "Forge")
 
 
 class TestRiver(unittest.TestCase):
@@ -221,7 +229,8 @@ class TestRiver(unittest.TestCase):
         }, NOW, {})
         self.assertEqual(rep["brain_rows"][0]["table"], "raw.river_trade_log")
         deciders = [r["decider"] for r in rep["rows"]]
-        self.assertIn("Forge", deciders)
+        self.assertTrue(deciders)
+        self.assertTrue(all(d == "unknown" for d in deciders))
         self.assertEqual(rep["notify"], "problem")
         self.assertTrue(any(p["code"] == "HARD_SL_HIT" for p in rep["problems"]))
 
@@ -243,8 +252,9 @@ class TestEntrypoint(unittest.TestCase):
                 if "/api/public/radar" not in r["url"]:
                     self.assertEqual(r["headers"].get("X-ai-key"), ENV["COCKPIT_AI_KEY"])
             if "hyperliquid" in r["url"]:
-                self.assertIn(r["body"]["type"], {"clearinghouseState", "frontendOpenOrders", "userFills",
-                                                   "userFillsByTime", "userFunding", "candleSnapshot", "allMids"})
+                self.assertIn(r["body"]["type"], {"clearinghouseState", "spotClearinghouseState",
+                                                   "frontendOpenOrders", "userFills", "userFillsByTime",
+                                                   "userFunding", "candleSnapshot", "allMids"})
         blob = out.getvalue() + err.getvalue()
         self.assertNotIn("ai-key-SECRET-123", blob)
 
@@ -254,6 +264,239 @@ class TestEntrypoint(unittest.TestCase):
         self.assertIn("${{cockpit.ENTRY_READ_KEY}}", text)
         self.assertNotIn("cockpit.AI_DECISION_KEY", text)
         self.assertIn("python -m ops_cron.main", text)
+        self.assertIn("HL_ADDRESS", text)
+
+
+def _hl_book(mark="100", szi="2", order=None):
+    state = {"ok": True, "data": {"marginSummary": {"accountValue": "1000", "totalMarginUsed": "10"},
+                                  "assetPositions": [{"position": {
+                                      "coin": "SOL", "szi": szi, "entryPx": "100", "unrealizedPnl": "1",
+                                      "positionValue": str(float(mark) * float(szi)),
+                                      "leverage": {"type": "isolated", "value": 2}}}]}}
+    orders = {"ok": True, "data": [] if order is None else [order]}
+    mids = {"ok": True, "data": {"SOL": mark}}
+    return state, orders, mids
+
+
+def _sl_order(**over):
+    order = {"coin": "SOL", "side": "A", "sz": "2", "isTrigger": True, "reduceOnly": True,
+             "triggerPx": "95", "orderType": "Stop Market"}
+    order.update(over)
+    return order
+
+
+class TestHardSL(unittest.TestCase):
+    def test_tp_only_alerts(self):
+        st = hlparse.hard_sl_status([_sl_order(triggerPx="110")], "SOL", "LONG", 2, 100)
+        self.assertEqual(st["status"], "NO")
+        state, orders, mids = _hl_book(order=_sl_order(triggerPx="110"))
+        h = harbor.build({"day": "2026-10-06", "hl_state": state, "hl_spot": {"ok": False},
+                          "hl_orders": orders, "all_mids": mids, "fills_7d": {"ok": True, "data": []},
+                          "fills_all": {"ok": True, "data": []}, "funding_7d": {"ok": True, "data": []},
+                          "run_report": {"ok": True, "data": {}}, "bx_status": {"ok": False}}, NOW, {})
+        self.assertTrue(any(p["code"] == "NO_SL" for p in h["problems"]))
+        self.assertIn("Hard SL: NO", h["markdown"])
+        self.assertNotIn("Hard SL: YES", h["markdown"])
+
+    def test_proper_sl_is_ok_with_distance(self):
+        st = hlparse.hard_sl_status([_sl_order()], "SOL", "LONG", 2, 100)
+        self.assertTrue(st["ok"])
+        self.assertAlmostEqual(st["distance_pct"], 5.0)
+        state, orders, mids = _hl_book(order=_sl_order())
+        h = harbor.build({"day": "2026-10-06", "hl_state": state, "hl_spot": {"ok": True, "data": {
+                          "balances": [{"coin": "USDC", "total": "12.5"}]}},
+                          "hl_orders": orders, "all_mids": mids, "fills_7d": {"ok": True, "data": []},
+                          "fills_all": {"ok": True, "data": []}, "funding_7d": {"ok": True, "data": []},
+                          "run_report": {"ok": True, "data": {}}, "bx_status": {"ok": False}}, NOW, {})
+        self.assertFalse(any(p["code"] == "NO_SL" for p in h["problems"]))
+        self.assertIn("Hard SL: YES 5.00% from mark", h["markdown"])
+
+    def test_sl_on_the_winning_side_alerts(self):
+        st = hlparse.hard_sl_status([_sl_order(triggerPx="110")], "SOL", "LONG", 2, 100)
+        self.assertFalse(st["ok"])
+        state, orders, mids = _hl_book(order=_sl_order(triggerPx="110"))
+        rep = rules.exit_monitor(_exit_with(orders["data"], mids["data"]), NOW, {"bx_enabled": False, "lookback_min": 65})
+        self.assertIn(("NO_SL", "SOL"), [(p["code"], p["coin"]) for p in rep["problems"]])
+
+    def test_non_reduce_only_stop_alerts(self):
+        order = _sl_order(reduceOnly=False, isPositionTpsl=False)
+        st = hlparse.hard_sl_status([order], "SOL", "LONG", 2, 100)
+        self.assertFalse(st["ok"])
+        state, orders, mids = _hl_book(order=order)
+        h = harbor.build({"day": "2026-10-06", "hl_state": state, "hl_orders": orders, "all_mids": mids,
+                          "fills_7d": {"ok": True, "data": []}, "fills_all": {"ok": True, "data": []},
+                          "funding_7d": {"ok": True, "data": []}, "run_report": {"ok": True, "data": {}},
+                          "bx_status": {"ok": False}}, NOW, {})
+        self.assertTrue(any(p["code"] == "NO_SL" for p in h["problems"]))
+
+    def test_daily_audit_uses_the_same_helper(self):
+        tp = _sl_order(triggerPx="110")
+        good = _sl_order()
+        self.assertTrue(any(p["code"] == "NO_SL" for p in rules.daily_audit(_audit_with([tp]), NOW, {"bx_enabled": True})["problems"]))
+        self.assertFalse(any(p["code"] == "NO_SL" for p in rules.daily_audit(_audit_with([good]), NOW, {"bx_enabled": True})["problems"]))
+
+
+class TestSpotUsdc(unittest.TestCase):
+    def test_spot_failure_is_unknown_not_zero_or_perp(self):
+        state, orders, mids = _hl_book(order=_sl_order())
+        h = harbor.build({"day": "2026-10-06", "hl_state": state, "hl_spot": {"ok": False, "error": "down"},
+                          "hl_orders": orders, "all_mids": mids, "fills_7d": {"ok": True, "data": []},
+                          "fills_all": {"ok": True, "data": []}, "funding_7d": {"ok": True, "data": []},
+                          "run_report": {"ok": True, "data": {}}, "bx_status": {"ok": False}}, NOW, {})
+        self.assertIn("spot USDC unknown", h["markdown"])
+        self.assertIn("perp accountValue 1,000.00", h["markdown"])
+        self.assertNotIn("spot USDC 0", h["markdown"])
+        self.assertNotIn("spot USDC 1,000.00", h["markdown"])
+
+    def test_bo_nav_unreadable_is_unknown(self):
+        rep = bo_report.build({"day": "2026-10-06", "hl_state": {"ok": False, "error": "down"},
+                               "hl_spot": {"ok": False, "error": "down"},
+                               "hl_orders": {"ok": True, "data": []}, "all_mids": {"ok": True, "data": {}},
+                               "fills": {"ok": True, "data": []},
+                               "run_report": {"ok": True, "data": {"decisions": {"ok": True, "records": [
+                                   {"symbol": "BTC", "source": "claude", "timestamp": "2026-10-06T00:10:00+00:00"}]}}}},
+                              NOW, {})
+        self.assertIn("perp accountValue unknown", rep["markdown"])
+        self.assertIn("spot USDC unknown", rep["markdown"])
+        self.assertNotIn("accountValue 0", rep["markdown"])
+
+    def test_bo_tp_only_is_no_and_proper_sl_prints_distance(self):
+        state, orders, mids = _hl_book(order=_sl_order(triggerPx="110"))
+        spot = {"ok": True, "data": {"balances": [{"coin": "USDC", "total": "4"}]}}
+        common = {"day": "2026-10-06", "hl_state": state, "hl_spot": spot, "all_mids": mids,
+                  "fills": {"ok": True, "data": []},
+                  "run_report": {"ok": True, "data": {"decisions": {"ok": True, "posted": True, "records": [
+                      {"symbol": "SOL", "source": "claude", "timestamp": "2026-10-06T00:10:00+00:00"}]}}}}
+        tp = bo_report.build({**common, "hl_orders": orders}, NOW, {})
+        self.assertIn("Hard SL: NO", tp["markdown"])
+        self.assertNotIn("Hard SL: YES", tp["markdown"])
+        good = bo_report.build({**common, "hl_orders": {"ok": True, "data": [_sl_order()]}}, NOW, {})
+        self.assertIn("Hard SL: YES 5.00% from mark", good["markdown"])
+        self.assertIn("spot USDC 4.00", good["markdown"])
+        self.assertIn("perp accountValue 1,000.00", good["markdown"])
+
+
+class TestHlAddress(unittest.TestCase):
+    def test_every_job_alerts_when_the_address_is_missing(self):
+        env = {k: v for k, v in ENV.items() if k != "HL_ADDRESS"}
+        jobs = ("exit-monitor", "daily-audit", "desk-missing", "harbor-pnl", "bo-report",
+                "c48-scoreboard", "desk-veto", "trade-journal")
+        for job in jobs:
+            with patch("ops_cron.alerts.send", return_value={"telegram": "sent"}) as send, \
+                    patch("urllib.request.urlopen", side_effect=AssertionError(job)):
+                rc = ops_main.main([job, "--now", NOW.isoformat()], env)
+            self.assertEqual(rc, 0, job)
+            text = send.call_args.args[1]
+            self.assertIn("HL_ADDRESS not set", send.call_args.args[0])
+            self.assertIn("unknown", text)
+
+
+class TestRiverFixes(unittest.TestCase):
+    def test_veto_measures_48h_after_the_d2_signal(self):
+        signal = datetime(2026, 10, 4, 0, 55, tzinfo=timezone.utc)
+        now = datetime(2026, 10, 6, 1, 5, tzinfo=timezone.utc)
+        sig_ms = int(signal.timestamp() * 1000)
+        fwd_end = sig_ms + 48 * 3_600_000
+        start = signal - timedelta(hours=60)
+        bars = []
+        t = int(start.timestamp() * 1000)
+        while t < int(now.timestamp() * 1000):
+            close_at = t + 3_600_000
+            if close_at <= sig_ms:
+                c = 100.0 if close_at > sig_ms - 48 * 3_600_000 else 50.0
+            elif close_at <= fwd_end:
+                c = 110.0
+            else:
+                c = 300.0
+            bars.append({"t": t, "o": c, "h": c, "l": c, "c": c})
+            t += 3_600_000
+        before = river_jobs._ret_forward(bars, sig_ms - 48 * 3_600_000, sig_ms)
+        after = river_jobs._ret_forward(bars, sig_ms, min(int(now.timestamp() * 1000), fwd_end))
+        self.assertAlmostEqual(before, 1.0)
+        self.assertAlmostEqual(after, 0.1)
+        self.assertNotAlmostEqual(before, after)
+        veto = river_jobs.build_veto({
+            "day": "2026-10-06",
+            "signal_day": "2026-10-04",
+            "radar": {"ok": True, "data": {"gc_radar_1d": {"rows": [{"symbol": "ETH", "dual_cross_up": True}]}}},
+            "decisions": {"ok": True, "data": {"decisions": {"ok": True, "records": [
+                {"symbol": "SOL", "decision": "veto", "source": "claude", "type": "BASE",
+                 "timestamp": "2026-10-04T00:55:00+00:00"}]}}},
+            "candles": {"SOL": {"1h": {"ok": True, "data": bars}, "4h": {"ok": False}},
+                        "BTC": {"1h": {"ok": True, "data": bars}, "4h": {"ok": False}}},
+            "bx": {},
+        }, now, {})
+        coins = [r["coin"] for r in veto["rows"]]
+        self.assertEqual(coins, ["SOL"])
+        self.assertNotIn("ETH", coins)
+        self.assertAlmostEqual(veto["rows"][0]["ret_48h"], after)
+        self.assertNotAlmostEqual(veto["rows"][0]["ret_48h"], before)
+        self.assertEqual(veto["rows"][0]["decider"], "unknown")
+
+    def test_journal_window_and_size_signs(self):
+        self.assertEqual(river_jobs.journal_window_start(NOW, None), NOW - timedelta(hours=26))
+        last = datetime(2026, 10, 5, 1, 15, tzinfo=timezone.utc)
+        self.assertEqual(river_jobs.journal_window_start(NOW, last), last)
+        late_yesterday = datetime(2026, 10, 5, 2, 0, tzinfo=timezone.utc)
+        self.assertGreater(late_yesterday, last)
+        self.assertEqual(river_jobs.signed_fill_size({"sz": "2", "dir": "Open Long", "side": "B"}), 2)
+        self.assertEqual(river_jobs.signed_fill_size({"sz": "3", "dir": "Open Short", "side": "A"}), -3)
+        rep = river_jobs.build_journal({
+            "day": "2026-10-06",
+            "fills": {"ok": True, "data": [
+                {"coin": "SOL", "px": "10", "sz": "2", "side": "B", "time": int(NOW.timestamp() * 1000),
+                 "dir": "Open Long", "closedPnl": "0", "fee": "0"},
+                {"coin": "ETH", "px": "10", "sz": "3", "side": "A", "time": int(NOW.timestamp() * 1000),
+                 "dir": "Open Short", "closedPnl": "0", "fee": "0"}]},
+            "state": {"ok": True, "data": {"assetPositions": []}},
+            "orders": {"ok": True, "data": []},
+            "mids": {"ok": True, "data": {}},
+            "run_report": {"ok": True, "data": {"decisions": {"ok": True, "records": [], "history": []}}},
+            "candles": {},
+        }, NOW, {})
+        sizes = {r["coin"]: r["size"] for r in rep["rows"]}
+        self.assertEqual(sizes["SOL"], 2)
+        self.assertEqual(sizes["ETH"], -3)
+        self.assertTrue(all(r["decider"] == "unknown" for r in rep["rows"]))
+
+    def test_scoreboard_includes_the_2040_hkt_run(self):
+        t = datetime(2026, 10, 7, 12, 40, tzinfo=timezone.utc)
+        rep = river_jobs.build_scoreboard({
+            "state": {"ok": True, "data": {"marginSummary": {"accountValue": "1000", "totalMarginUsed": "1"},
+                                           "assetPositions": []}},
+            "orders": {"ok": True, "data": []},
+            "fills": {"ok": True, "data": []},
+            "nav_start": "1000",
+        }, t, ENV)
+        self.assertIn("brain_rows", rep)
+        self.assertNotIn("window closed", rep["summary"])
+
+
+def _exit_with(orders, mids):
+    fx = json.loads(Path("ops_cron/tests/fixtures/exit_ok.json").read_text(encoding="utf-8"))
+    data = fx["inputs"]
+    data["hl_orders"]["data"] = orders
+    data["all_mids"]["data"] = mids
+    data.pop("bx_status", None)
+    return data
+
+
+def _audit_with(orders):
+    bx = {"ok": True, "breaker": {"tripped": False}, "open": [], "bx_live": False, "rules": {},
+          "jobs": {}, "problems": [], "egress": {"ok": True}}
+    return {
+        "bx_status": {"ok": True, "data": bx},
+        "bx_day": {"ok": True, "data": {"orders": [], "skipped": []}},
+        "run_report_today": {"ok": True, "data": {"executed": [], "skipped": [], "failed": [], "runs": []}},
+        "run_report_yesterday": {"ok": True, "data": {"executed": [], "skipped": [], "failed": []}},
+        "pending": {"ok": True, "data": {"all": []}},
+        "hl_fills": {"ok": True, "data": []},
+        "hl_state": {"ok": True, "data": {"marginSummary": {"accountValue": "1000"}, "assetPositions": [{
+            "position": {"coin": "SOL", "szi": "2", "entryPx": "100", "positionValue": "200",
+                         "leverage": {"value": 2}}}]}},
+        "hl_orders": {"ok": True, "data": orders},
+        "all_mids": {"ok": True, "data": {"SOL": "100"}},
+    }
 
 
 if __name__ == "__main__":

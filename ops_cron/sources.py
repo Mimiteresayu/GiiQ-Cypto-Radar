@@ -14,8 +14,8 @@ from typing import Any, Dict, Optional
 from . import rules
 
 HL_READ_TYPES = frozenset({
-    "clearinghouseState", "frontendOpenOrders", "userFills", "userFillsByTime",
-    "userFunding", "candleSnapshot", "allMids",
+    "clearinghouseState", "spotClearinghouseState", "frontendOpenOrders", "userFills",
+    "userFillsByTime", "userFunding", "candleSnapshot", "allMids",
 })
 _HL_NO_USER = frozenset({"candleSnapshot", "allMids"})
 HL_FILLS_LOOKBACK_DAYS = 30
@@ -95,6 +95,7 @@ def exit_monitor_inputs(src: Sources, now: datetime, lookback_min: int, bx_enabl
         "scheduler": src.cockpit("/api/scheduler/status"),
         "hl_state": src.hl({"type": "clearinghouseState", "user": src.hl_address}),
         "hl_orders": src.hl({"type": "frontendOpenOrders", "user": src.hl_address}),
+        "all_mids": src.hl({"type": "allMids"}),
         "hl_fills": src.hl({"type": "userFillsByTime", "user": src.hl_address,
                             "startTime": int(start.timestamp() * 1000), "endTime": int(now.timestamp() * 1000)}),
     }

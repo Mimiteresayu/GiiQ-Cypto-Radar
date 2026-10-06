@@ -6,7 +6,7 @@
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from . import decider, gc_levels, hlparse, report, rules, stops
@@ -94,8 +94,10 @@ def build_scoreboard(inputs: Dict[str, Any], now: datetime, env: Dict[str, str])
         problems.append(report.problem("HARD_SL_HIT", "a testnet close went through the ~3% price stop"))
     orders = (inputs.get("orders") or {}).get("data") if (inputs.get("orders") or {}).get("ok") else None
     for p in pos:
-        if isinstance(orders, list) and hlparse.hard_sl_order(orders, p["coin"]) is None:
-            problems.append(report.problem("NO_SL", f"no trigger stop on {p['coin']}", p["coin"]))
+        mark = abs(p["position_value"] / p["szi"]) if p.get("position_value") and p.get("szi") else None
+        if isinstance(orders, list) and not hlparse.hard_sl_status(
+                orders, p["coin"], p["side"], p["szi"], mark)["ok"]:
+            problems.append(report.problem("NO_SL", f"no Hard SL on {p['coin']}", p["coin"]))
     status = "problem" if problems else "ok"
     summary = (f"C48 NAV {report.usd(nav)} net {report.usd(net)} dd {report.pct(dd)} "
                f"lev {lev if lev is not None else '未知'} notional {report.pct(notional_pct)}")
@@ -128,37 +130,56 @@ def _radar_rows(radar: Any, tf: str) -> List[dict]:
     return [r for r in (block.get("rows") or []) if isinstance(r, dict)]
 
 
-def _ret_48h(bars: List[dict], now_ms: int) -> Optional[float]:
-    closed = [b for b in bars if b["t"] + 3_600_000 <= now_ms]
-    if len(closed) < 2:
-        return None
-    now_c = closed[-1]["c"]
-    cutoff = now_ms - 48 * 3_600_000
-    then = [b for b in closed if b["t"] <= cutoff]
-    if not then or not then[-1]["c"]:
-        return None
-    return (now_c - then[-1]["c"]) / then[-1]["c"]
+def signal_day(now: datetime) -> str:
+    """The desk batch from two HKT dates ago. The 09:05 report scores that batch, not today's crosses."""
+    return (now.astimezone(rules.HKT) - timedelta(days=2)).strftime("%Y-%m-%d")
 
 
-def _sl_aware(bars_1h: List[dict], bars_4h: List[dict], now_ms: int, raw_ret: Optional[float]) -> tuple:
-    """Return (ret_sl_aware, hard_sl_hit). Hit when a 1h low after the 48h mark trades through the 4H Filter then."""
+def signal_anchor(day: str) -> datetime:
+    """08:55 HKT on the signal day, when the desk POST is in."""
+    y, m, d = (int(x) for x in day.split("-"))
+    return datetime(y, m, d, 8, 55, tzinfo=rules.HKT)
+
+
+def _close_asof(bars: List[dict], ms: int) -> Optional[float]:
+    closed = [b for b in bars if b.get("t") is not None and int(b["t"]) + 3_600_000 <= ms and b.get("c")]
+    if not closed:
+        return None
+    return float(closed[-1]["c"])
+
+
+def _ret_forward(bars: List[dict], start_ms: int, end_ms: int) -> Optional[float]:
+    """Price change from the signal time forward to `end_ms` (the 48h after the signal, capped at now)."""
+    if not bars or end_ms <= start_ms:
+        return None
+    base = _close_asof(bars, start_ms)
+    last = _close_asof(bars, end_ms)
+    if not base or not last:
+        return None
+    return (last - base) / base
+
+
+def _sl_aware(bars_1h: List[dict], bars_4h: List[dict], start_ms: int, end_ms: int,
+              raw_ret: Optional[float]) -> tuple:
+    """Return (ret_sl_aware, hard_sl_hit) over the 48h AFTER the signal.
+
+    Hit when a 1h low in that forward window trades through the 4H Filter as of the signal.
+    """
     if raw_ret is None:
         return None, None
     ch = gc_levels.channel_at(
-        [{"t": b["t"], "o": b["o"], "h": b["h"], "l": b["l"], "c": b["c"]} for b in bars_4h], "4h",
-        now_ms - 48 * 3_600_000)
+        [{"t": b["t"], "o": b["o"], "h": b["h"], "l": b["l"], "c": b["c"]} for b in bars_4h], "4h", start_ms)
     hard = ch.get("filter")
     if hard is None:
         return raw_ret, None
-    cutoff = now_ms - 48 * 3_600_000
-    later = [b for b in bars_1h if b["t"] >= cutoff and b["t"] + 3_600_000 <= now_ms]
-    base = [b for b in bars_1h if b["t"] + 3_600_000 <= now_ms and b["t"] <= cutoff]
-    if not base or not base[-1]["c"]:
+    base = _close_asof(bars_1h, start_ms)
+    if not base:
         return raw_ret, None
-    hit = any(b["l"] <= hard for b in later)
+    later = [b for b in bars_1h if int(b["t"]) >= start_ms and int(b["t"]) + 3_600_000 <= end_ms]
+    hit = any(float(b["l"]) <= hard for b in later)
     if not hit:
         return raw_ret, False
-    return (hard - base[-1]["c"]) / base[-1]["c"], True
+    return (hard - base) / base, True
 
 
 def _bars_from_hl(raw) -> List[dict]:
@@ -182,23 +203,26 @@ def _bars_from_bx(raw) -> List[dict]:
     return out
 
 
-def fetch_veto(src, now: datetime, env: Dict[str, str]) -> Dict[str, Any]:
-    day = now.astimezone(rules.HKT).strftime("%Y-%m-%d")
-    end_ms = int(now.timestamp() * 1000)
-    start_ms = end_ms - 80 * 3_600_000
-    radar = src.cockpit_public("/api/public/radar")
-    decisions = src.cockpit(f"/api/exec/run-report?date={day}")
+def _batch_symbols(dec: Any) -> List[str]:
     symbols = []
-    if radar.get("ok"):
-        for tf in ("1d", "4h"):
-            for row in _radar_rows(radar.get("data"), tf):
-                if row.get("dual_cross_up") and row.get("symbol"):
-                    symbols.append(str(row["symbol"]))
-    dec = ((decisions.get("data") or {}).get("decisions") if decisions.get("ok") else None) or {}
-    for rec in (dec.get("records") or []) if isinstance(dec, dict) else []:
+    if not isinstance(dec, dict):
+        return symbols
+    for rec in dec.get("records") or []:
         if isinstance(rec, dict) and rec.get("symbol"):
             symbols.append(str(rec["symbol"]))
-    symbols = list(dict.fromkeys(symbols))[:25]
+    return list(dict.fromkeys(symbols))[:25]
+
+
+def fetch_veto(src, now: datetime, env: Dict[str, str]) -> Dict[str, Any]:
+    day = now.astimezone(rules.HKT).strftime("%Y-%m-%d")
+    sig_day = signal_day(now)
+    anchor = signal_anchor(sig_day)
+    end_ms = int(now.timestamp() * 1000)
+    # Candles cover the signal and the 48h after it, plus the 48h before so a wrong window is visible in tests.
+    start_ms = int((anchor - timedelta(hours=60)).timestamp() * 1000)
+    decisions = src.cockpit(f"/api/exec/run-report?date={sig_day}")
+    dec = ((decisions.get("data") or {}).get("decisions") if decisions.get("ok") else None) or {}
+    symbols = _batch_symbols(dec)
     if "BTC" not in symbols:
         symbols.append("BTC")
     candles = {}
@@ -212,42 +236,49 @@ def fetch_veto(src, now: datetime, env: Dict[str, str]) -> Dict[str, Any]:
         }
         sym = coin if coin.endswith("USDT") else coin + "USDT"
         bx[coin] = src.bx_klines(sym, "1h", 80)
-    return {"day": day, "radar": radar, "decisions": decisions, "symbols": symbols, "candles": candles, "bx": bx}
+    return {"day": day, "signal_day": sig_day, "decisions": decisions, "symbols": symbols,
+            "candles": candles, "bx": bx}
 
 
 def build_veto(inputs: Dict[str, Any], now: datetime, env: Dict[str, str]) -> Dict[str, Any]:
     day = inputs.get("day") or now.astimezone(rules.HKT).strftime("%Y-%m-%d")
+    sig_day = inputs.get("signal_day") or signal_day(now)
+    anchor = signal_anchor(sig_day)
     problems: List[dict] = []
-    radar_res = inputs.get("radar") or {}
-    if not radar_res.get("ok"):
-        problems.append(report.problem("DATA_UNAVAILABLE", f"public radar unreadable: {radar_res.get('error') or 'missing'}"))
     dec_res = inputs.get("decisions") or {}
     dec = ((dec_res.get("data") or {}).get("decisions") if dec_res.get("ok") else None)
     if not isinstance(dec, dict):
+        problems.append(report.problem("DATA_UNAVAILABLE", "D-2 signal batch unreadable"))
         dec = {"ok": False, "records": [], "history": []}
     now_ms = int(now.timestamp() * 1000)
+    anchor_ms = int(anchor.timestamp() * 1000)
     rows = []
     btc_bars = _bars_from_hl(((inputs.get("candles") or {}).get("BTC") or {}).get("1h", {}).get("data"))
     if not btc_bars:
         btc_bars = _bars_from_bx((inputs.get("bx") or {}).get("BTC", {}).get("data"))
-    btc_ret = _ret_48h(btc_bars, now_ms)
-    radar = radar_res.get("data") if radar_res.get("ok") else {}
-    base = {str(r.get("symbol")) for r in _radar_rows(radar, "1d") if r.get("dual_cross_up")}
-    chase = {str(r.get("symbol")) for r in _radar_rows(radar, "4h") if r.get("dual_cross_up")}
-    symbols = [s for s in (inputs.get("symbols") or []) if s != "BTC"] or sorted(base | chase)
+    btc_end = min(now_ms, anchor_ms + 48 * 3_600_000)
+    btc_ret = _ret_forward(btc_bars, anchor_ms, btc_end)
+    symbols = [s for s in (inputs.get("symbols") or _batch_symbols(dec)) if s != "BTC"]
     for coin in symbols:
-        if coin in base:
-            strategy = "Base"
-        elif coin in chase:
-            strategy = "Chase"
-        else:
-            strategy = "unknown"
         rec = None
         for r in dec.get("records") or []:
             if isinstance(r, dict) and str(r.get("symbol")) == coin:
                 rec = r
+        kind = str((rec or {}).get("type") or "").upper()
+        if kind == "BASE":
+            strategy = "Base"
+        elif kind in {"CHASE", "CONTINUATION"}:
+            strategy = "Chase"
+        else:
+            strategy = "unknown"
         decision = (rec or {}).get("decision") or "none"
-        who = decider.decider_for_coin(coin, dec, day)
+        who = "unknown"
+        sig_ts = decider._ts((rec or {}).get("timestamp")) if rec else None
+        if sig_ts is not None and sig_ts.astimezone(rules.HKT).strftime("%Y-%m-%d") != sig_day:
+            sig_ts = None
+        start_at = sig_ts or anchor
+        start_ms = int(start_at.timestamp() * 1000)
+        end_ms = min(now_ms, start_ms + 48 * 3_600_000)
         pack = (inputs.get("candles") or {}).get(coin) or {}
         bars_1h = _bars_from_hl((pack.get("1h") or {}).get("data") if (pack.get("1h") or {}).get("ok") else None)
         bars_4h = _bars_from_hl((pack.get("4h") or {}).get("data") if (pack.get("4h") or {}).get("ok") else None)
@@ -257,8 +288,8 @@ def build_veto(inputs: Dict[str, Any], now: datetime, env: Dict[str, str]) -> Di
             if bx.get("ok"):
                 bars_1h = _bars_from_bx(bx.get("data"))
                 source = "BX"
-        raw = _ret_48h(bars_1h, now_ms)
-        aware, hit = _sl_aware(bars_1h, bars_4h, now_ms, raw)
+        raw = _ret_forward(bars_1h, start_ms, end_ms)
+        aware, hit = _sl_aware(bars_1h, bars_4h, start_ms, end_ms, raw)
         excess = (aware - btc_ret) if aware is not None and btc_ret is not None else None
         if hit is True:
             outcome = "hard_sl"
@@ -277,8 +308,6 @@ def build_veto(inputs: Dict[str, Any], now: datetime, env: Dict[str, str]) -> Di
             "ret_48h": raw, "ret_48h_sl_aware": aware, "excess_vs_btc": excess,
             "hard_sl_hit": hit, "outcome": outcome, "candle_source": source,
         })
-    if radar_res.get("ok") is False and not rows:
-        pass
     status = "problem" if problems else "ok"
     lines = ["## Desk veto + CONT", "",
              "coin | strategy | desk_decision | decider | ret_48h | ret_48h_sl_aware | excess_vs_btc | hard_sl_hit | outcome",
@@ -293,7 +322,7 @@ def build_veto(inputs: Dict[str, Any], now: datetime, env: Dict[str, str]) -> Di
     md = "\n".join(lines) + "\n"
     brain_values = []
     for r in rows:
-        brain_values.append((now.isoformat(), day, r["coin"], r["strategy"], r["desk_decision"], r["decider"],
+        brain_values.append((now.isoformat(), sig_day, r["coin"], r["strategy"], r["desk_decision"], r["decider"],
                              r["ret_48h"], r["ret_48h_sl_aware"], r["excess_vs_btc"], r["hard_sl_hit"],
                              r["outcome"], r))
     brain = []
@@ -305,7 +334,7 @@ def build_veto(inputs: Dict[str, Any], now: datetime, env: Dict[str, str]) -> Di
             "values": brain_values,
         })
     notify = "problem" if problems else None
-    summary = f"desk veto {day}: {len(rows)} signals" + (f", {len(problems)} problem(s)" if problems else "")
+    summary = f"desk veto {day} on {sig_day} signals: {len(rows)}" + (f", {len(problems)} problem(s)" if problems else "")
     return report.shell("river_desk_veto", now, status, summary, problems, notify, md, brain_rows=brain, rows=rows)
 
 
@@ -318,9 +347,38 @@ def _n(v) -> str:
         return "未知"
 
 
+def signed_fill_size(fill: dict) -> Optional[float]:
+    """Long exposure positive, short exposure negative. Open Short was previously stored positive."""
+    sz = hlparse.num(fill.get("sz"))
+    if sz is None:
+        return None
+    d = str(fill.get("dir") or "")
+    side = str(fill.get("side") or "").upper()
+    if d.startswith("Open Short") or d.startswith("Close Long"):
+        return -abs(sz)
+    if d.startswith("Open Long") or d.startswith("Close Short"):
+        return abs(sz)
+    if side == "A":
+        return -abs(sz)
+    if side == "B":
+        return abs(sz)
+    return sz
+
+
+def journal_window_start(now: datetime, last_run: Optional[datetime]) -> datetime:
+    """From the last successful journal run. First run looks back 26h so yesterday's late closes are kept."""
+    if last_run is None:
+        return now - timedelta(hours=26)
+    if last_run.tzinfo is None:
+        last_run = last_run.replace(tzinfo=timezone.utc)
+    return last_run
+
+
 def fetch_journal(src, now: datetime, env: Dict[str, str]) -> Dict[str, Any]:
+    from . import persist
     day = now.astimezone(rules.HKT).strftime("%Y-%m-%d")
-    start, _ = hlparse.window_today(now)
+    last = persist.last_journal_run(persist.brain_dsn(env)) if persist.brain_dsn(env) else None
+    start = journal_window_start(now, last)
     end_ms = int(now.timestamp() * 1000)
     inp = {
         "day": day,
@@ -349,6 +407,7 @@ def fetch_journal(src, now: datetime, env: Dict[str, str]) -> Dict[str, Any]:
                                                              "startTime": end_ms - 450 * 14_400_000, "endTime": end_ms}}),
         }
     inp["candles"] = candles
+    inp["window_start"] = start.isoformat()
     return inp
 
 
@@ -371,14 +430,13 @@ def build_journal(inputs: Dict[str, Any], now: datetime, env: Dict[str, str]) ->
         coin = str(x.get("coin") or "")
         seen.add(coin)
         px = hlparse.num(x.get("px"))
-        sz = hlparse.num(x.get("sz"))
+        sz = signed_fill_size(x)
         side = str(x.get("side") or x.get("dir") or "")
-        who = decider.decider_for_coin(coin, dec, day)
+        who = "unknown"
         pack = (inputs.get("candles") or {}).get(coin) or {}
         c1 = (pack.get("1h") or {}).get("data") if (pack.get("1h") or {}).get("ok") else None
         c4 = (pack.get("4h") or {}).get("data") if (pack.get("4h") or {}).get("ok") else None
-        both = stops.both_stops(px, px, sz if "Open" in str(x.get("dir") or "") or str(x.get("side")) == "B" else -(sz or 0),
-                                 c1, c4, now_ms)
+        both = stops.both_stops(px, px, sz, c1, c4, now_ms)
         hard_px = (both["hard"] or {}).get("price")
         hit = False
         if hard_px and px and str(x.get("dir") or "").startswith("Close") and px <= hard_px:
@@ -397,7 +455,7 @@ def build_journal(inputs: Dict[str, Any], now: datetime, env: Dict[str, str]) ->
         coin = str(rec.get("symbol") or "")
         if coin in seen:
             continue
-        who = decider.decider_for_coin(coin, dec, day)
+        who = "unknown"
         rows.append({
             "time": rec.get("timestamp"), "coin": coin, "side": rec.get("decision"), "size": rec.get("size_pct"),
             "price": None, "fee": None, "pnl": None, "decider": who,

@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import re
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -124,6 +125,40 @@ def insert_rows(dsn: str, table: str, columns: Sequence[str], rows: Sequence[Seq
         return "ok"
     except Exception as e:  # noqa: BLE001
         return f"error: {type(e).__name__}: {str(e).replace(dsn, '***')[:160]}"
+
+
+def last_journal_run(dsn: str) -> Optional[datetime]:
+    """Watermark for the trade journal. Read-only. None on a first run or a missing table.
+
+    Prefers the last successful ops_check_run for river_trade_log, else the latest trade_time.
+    """
+    if not dsn:
+        return None
+    queries = (
+        "SELECT MAX(run_at) FROM raw.ops_check_run WHERE check_name = 'river_trade_log' AND status = 'ok'",
+        "SELECT MAX(trade_time) FROM raw.river_trade_log",
+    )
+    try:
+        conn = _connect(dsn)
+        try:
+            with conn.cursor() as cur:
+                for sql in queries:
+                    if not sql.upper().startswith("SELECT "):
+                        return None
+                    cur.execute(sql)
+                    row = cur.fetchone()
+                    val = row[0] if row else None
+                    if val is None:
+                        continue
+                    if isinstance(val, datetime):
+                        return val if val.tzinfo else val.replace(tzinfo=timezone.utc)
+                    parsed = datetime.fromisoformat(str(val).replace("Z", "+00:00"))
+                    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001
+        return None
+    return None
 
 
 def insert(report: Dict[str, Any], dsn: str) -> str:

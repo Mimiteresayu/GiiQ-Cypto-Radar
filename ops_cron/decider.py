@@ -1,8 +1,8 @@
 """Who actually decided a trade.
 
-Cockpit stores the last decision per coin. source \"claude\" is written for every non-fallback
-POST today, so it does not prove Claude.ai versus Forge. With no stronger evidence the decider
-is unknown. source fallback is the Railway 08:50 path.
+Cockpit does not record an actor yet. source=claude, source=forge and source=fallback are not
+an actor, so the column is unknown. Guessing from source is a follow-up once cockpit stores one.
+An explicit actor/decider field is used only when it is already one of the known labels.
 """
 from __future__ import annotations
 
@@ -16,14 +16,6 @@ CLAUDE = "Claude.ai"
 FORGE = "Forge"
 UNKNOWN = "unknown"
 
-_BY_SOURCE = {
-    "fallback": RAILWAY_FALLBACK,
-    "railway": RAILWAY_FALLBACK,
-    "railway_fallback": RAILWAY_FALLBACK,
-    "forge": FORGE,
-    "claude.ai": CLAUDE,
-    "claudeai": CLAUDE,
-}
 _EXPLICIT = {CLAUDE, FORGE, RAILWAY_FALLBACK, UNKNOWN}
 
 
@@ -37,9 +29,6 @@ def decider_of(rec: Optional[dict]) -> str:
     explicit = str(rec.get("decider") or rec.get("actor") or "").strip()
     if explicit in _EXPLICIT:
         return explicit
-    src = str(rec.get("source") or "").strip().lower()
-    if src in _BY_SOURCE:
-        return _BY_SOURCE[src]
     return UNKNOWN
 
 

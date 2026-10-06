@@ -68,12 +68,13 @@ def build(inputs: Dict[str, Any], now: datetime) -> str:
             c1 = (candles.get("1h") or {}).get("data") if (candles.get("1h") or {}).get("ok") else None
             c4 = (candles.get("4h") or {}).get("data") if (candles.get("4h") or {}).get("ok") else None
             both = stops.both_stops(mark, p.get("entry_px"), p.get("szi"), c1, c4, now_ms)
-            resting = hlparse.hard_sl_order(orders, coin) if isinstance(orders, list) else None
+            resting = (hlparse.hard_sl_status(orders, coin, p["side"], p.get("szi"), mark)
+                       if isinstance(orders, list) else {"ok": False})
             lines.append(f"- {coin} {p['side']} sz {p['szi']} entry {p.get('entry_px')} mark {mark} "
                          f"uPnL {p.get('unrealized_pnl')}")
             lines.append(f"  soft {stops.fmt_level(both['soft'])}")
             lines.append(f"  hard {stops.fmt_level(both['hard'])}")
-            lines.append(f"  HL trigger {'yes @ ' + str(hlparse.trigger_px(resting)) if resting else 'MISSING'}")
+            lines.append(f"  {hlparse.fmt_hard_sl(resting)}")
     lines += ["", "### BX status", ""]
     bx = (inputs.get("bx_status") or {}).get("data") if (inputs.get("bx_status") or {}).get("ok") else None
     if not isinstance(bx, dict):

@@ -47,10 +47,24 @@ def margin_used(state: Any) -> Optional[float]:
 
 
 def raw_usdc(state: Any) -> Optional[float]:
+    """Perp marginSummary.totalRawUsd. Not the spot USDC balance. Do not use this as cash."""
     if not isinstance(state, dict):
         return None
     ms = state.get("marginSummary") or {}
     return num(ms.get("totalRawUsd"))
+
+
+def spot_usdc(state: Any) -> Optional[float]:
+    """Spot USDC `total` from spotClearinghouseState. None when the row is absent (not a guessed 0)."""
+    if not isinstance(state, dict):
+        return None
+    balances = state.get("balances")
+    if not isinstance(balances, list):
+        return None
+    for row in balances:
+        if isinstance(row, dict) and str(row.get("coin") or "").upper() == "USDC":
+            return num(row.get("total"))
+    return None
 
 
 def fills(data: Any) -> List[dict]:
@@ -90,8 +104,78 @@ def mids(data: Any) -> Dict[str, float]:
     return out
 
 
+def _order_size(order: dict) -> Optional[float]:
+    raw = order.get("sz")
+    if raw in (None, ""):
+        raw = order.get("origSz")
+    return num(raw)
+
+
+def _is_sell(order: dict) -> bool:
+    return str(order.get("side") or "").strip().upper() in {"A", "SELL", "S", "ASK"}
+
+
+def _is_buy(order: dict) -> bool:
+    return str(order.get("side") or "").strip().upper() in {"B", "BUY", "BID"}
+
+
+def hard_sl_status(orders: Any, coin: str, side: str, size: Optional[float], mark: Optional[float]) -> dict:
+    """One Hard SL check for exit-monitor, daily-audit, Harbor, and the BO report.
+
+    A Hard SL is a trigger/stop, reduce-only or position-TPSL, on this coin, on the opposite
+    side of the position, with the trigger on the losing side of the mark (long: trigger < mark,
+    short: trigger > mark), and size covering the position. A take-profit is not a Hard SL.
+    """
+    out = {"ok": False, "status": "NO", "trigger_px": None, "distance_pct": None, "order": None}
+    try:
+        need = abs(float(size)) if size is not None else None
+        mk = float(mark) if mark is not None else None
+    except (TypeError, ValueError):
+        return out
+    if not need or mk is None or mk == 0:
+        return out
+    long = str(side or "").upper() != "SHORT"
+    best = None
+    best_dist = None
+    for o in orders or []:
+        if not isinstance(o, dict) or str(o.get("coin") or "") != coin:
+            continue
+        otype = str(o.get("orderType") or "")
+        is_trigger = bool(o.get("isTrigger")) or "stop" in otype.lower()
+        protective = bool(o.get("reduceOnly")) or bool(o.get("isPositionTpsl"))
+        if not (is_trigger and protective):
+            continue
+        if long and not _is_sell(o):
+            continue
+        if not long and not _is_buy(o):
+            continue
+        px = trigger_px(o)
+        if px is None:
+            continue
+        if long and not px < mk:
+            continue
+        if not long and not px > mk:
+            continue
+        have = _order_size(o)
+        if have is None or abs(have) + 1e-9 < need:
+            continue
+        dist = abs(mk - px) / abs(mk) * 100.0
+        if best_dist is None or dist < best_dist:
+            best, best_dist = o, dist
+    if best is None:
+        return out
+    out.update(ok=True, status="YES", trigger_px=trigger_px(best), distance_pct=best_dist, order=best)
+    return out
+
+
+def fmt_hard_sl(status: dict) -> str:
+    if not status or not status.get("ok"):
+        return "Hard SL: NO"
+    return f"Hard SL: YES {status['distance_pct']:.2f}% from mark"
+
+
 def hard_sl_order(orders: Any, coin: str) -> Optional[dict]:
-    """Resting trigger / position-TPSL on this coin. A plain reduce-only limit is not a Hard SL."""
+    """Deprecated loose match. Callers that decide 'Hard SL present' use hard_sl_status."""
     for o in orders or []:
         if not isinstance(o, dict) or o.get("coin") != coin:
             continue

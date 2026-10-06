@@ -29,6 +29,13 @@ def problem(code: str, msg: str, coin: Optional[str] = None, source: str = "ops_
     return {"code": code, "coin": coin, "msg": msg[:300], "source": source}
 
 
+def known_usd(v, readable: bool) -> str:
+    """A failed or missing balance is the word unknown. Never a zero standing in for a missed read."""
+    if not readable or v is None:
+        return "unknown"
+    return usd(v)
+
+
 def usd(v) -> str:
     if v is None:
         return "未知"

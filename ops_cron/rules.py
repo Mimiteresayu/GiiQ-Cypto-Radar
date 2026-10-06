@@ -111,13 +111,9 @@ def hl_positions(state: Any) -> List[dict]:
         lev = p.get("leverage") or {}
         out.append({"coin": str(p["coin"]), "side": "LONG" if szi > 0 else "SHORT", "szi": szi,
                     "entry_px": _f(p.get("entryPx")), "lev": _f(lev.get("value")), "lev_type": lev.get("type"),
-                    "unrealized_pnl": _f(p.get("unrealizedPnl"))})
+                    "unrealized_pnl": _f(p.get("unrealizedPnl")),
+                    "position_value": _f(p.get("positionValue"))})
     return out
-
-
-def hl_sl_coins(orders: Any) -> set:
-    return {o.get("coin") for o in orders or [] if isinstance(o, dict)
-            and (o.get("isTrigger") or o.get("reduceOnly") or o.get("isPositionTpsl"))}
 
 
 def _fills(fills: Any) -> List[dict]:
@@ -221,14 +217,29 @@ def exit_efficiency(trip: dict, candles: Any) -> dict:
 # ---------------------------------------------------------------------------------------------
 # shared checks
 # ---------------------------------------------------------------------------------------------
-def check_hl_positions(rep: _Report, state: Any, orders: Any) -> List[dict]:
+def hlparse_mids(inp: Dict[str, Any]) -> Dict[str, float]:
+    from . import hlparse
+    if not (inp.get("all_mids") or {}).get("ok"):
+        return {}
+    return hlparse.mids(_data(inp.get("all_mids")))
+
+
+def check_hl_positions(rep: _Report, state: Any, orders: Any, mids: Optional[Dict[str, float]] = None) -> List[dict]:
+    """Hard SL present uses hlparse.hard_sl_status (same helper as Harbor and the BO report)."""
+    from . import hlparse
     pos = hl_positions(state)
     if orders is not None:
-        sl = hl_sl_coins(orders)
         for p in pos:
-            if p["coin"] not in sl:
-                rep.problem("NO_SL", p["coin"], f"HL {p['side']} position without a reduce-only / trigger "
-                            "order (Hard SL)", "hl_public")
+            mark = (mids or {}).get(p["coin"])
+            if mark is None and p.get("position_value") and p.get("szi"):
+                mark = abs(p["position_value"] / p["szi"])
+            st = hlparse.hard_sl_status(orders, p["coin"], p["side"], p["szi"], mark)
+            if not st["ok"]:
+                rep.problem("NO_SL", p["coin"],
+                            f"HL {p['side']} {p['coin']} has no Hard SL "
+                            f"(trigger/stop, reduce-only or position TP/SL, opposite side, "
+                            f"trigger on the losing side of the mark, size covering the position)",
+                            "hl_public")
     return pos
 
 
@@ -336,7 +347,7 @@ def _result(check: str, now: datetime, rep: _Report, summary_ok: str, body: Dict
 # ---------------------------------------------------------------------------------------------
 # 1. exit monitor (hourly)
 # ---------------------------------------------------------------------------------------------
-EXIT_SOURCES = ("exit_health", "scheduler", "hl_state", "hl_orders", "hl_fills", "bx_status")
+EXIT_SOURCES = ("exit_health", "scheduler", "hl_state", "hl_orders", "hl_fills", "all_mids", "bx_status")
 
 
 def exit_monitor(inp: Dict[str, Any], now: datetime, cfg: Dict[str, Any]) -> Dict[str, Any]:
@@ -354,7 +365,8 @@ def exit_monitor(inp: Dict[str, Any], now: datetime, cfg: Dict[str, Any]) -> Dic
                 rep.problem(str(p.get("code")), p.get("coin"), str(p.get("msg") or ""), "cockpit_exit_health")
 
     state, orders, fills = _data(inp.get("hl_state")), _data(inp.get("hl_orders")), _data(inp.get("hl_fills"))
-    pos = check_hl_positions(rep, state, orders if isinstance(orders, list) else None) if isinstance(state, dict) else []
+    mids = hlparse_mids(inp)
+    pos = check_hl_positions(rep, state, orders if isinstance(orders, list) else None, mids) if isinstance(state, dict) else []
     since = now - timedelta(minutes=int(cfg.get("lookback_min", 65)))
     hl_today = [o for o in hl_orders_in_window(fills, hkt_day_start(now)) if _is_open(o)] if fills is not None else []
     if len(hl_today) > HL_MAX_NEW_ENTRIES_PER_DAY:
@@ -514,6 +526,12 @@ def daily_audit(inp: Dict[str, Any], now: datetime, cfg: Dict[str, Any]) -> Dict
             bx_orders.append({"symbol": o.get("bx_symbol"), "status": "filled", "entry_px": o.get("entry_px"),
                               "hard_sl": o.get("hard_sl"), "sl_confirmed": None, "at": o.get("entry_time"),
                               "source": "open_position"})
+
+    # Open HL positions: same Hard SL helper as the exit monitor and Harbor.
+    if "hl_state" in inp and isinstance(_data(inp.get("hl_state")), dict):
+        check_hl_positions(rep, _data(inp.get("hl_state")),
+                           _data(inp.get("hl_orders")) if isinstance(_data(inp.get("hl_orders")), list) else None,
+                           hlparse_mids(inp))
 
     # --- HL: orders, realised P&L, round trips
     fills = _data(inp.get("hl_fills"))

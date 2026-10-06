@@ -18,7 +18,8 @@ Railway cron is UTC. HKT = UTC+8. The four-hour exit monitor uses the same clock
 |---|---|---|---|---|---|
 | `exit-monitor` | `ops-exit-monitor` | every 4h at :17 | `17 0,4,8,12,16,20 * * *` | no — alert only on problems | `railway.exit-monitor.json` |
 | `desk-missing` | `ops-desk-missing` | 08:30 | `30 0 * * *` | no | `railway.desk-missing.json` |
-| `c48-scoreboard` | `ops-c48-scoreboard` | every 3h UTC | `0 */3 * * *` | no; silent after 2026-10-07 21:00 HKT | `railway.c48-scoreboard.json` |
+| `c48-scoreboard` | `ops-c48-scoreboard` | every 3h UTC (last slot on 10/7 is 20:00 HKT) | `0 */3 * * *` | no; silent at and after 2026-10-07 21:00 HKT | `railway.c48-scoreboard.json` |
+| `c48-scoreboard` | `ops-c48-scoreboard-final` | 2026-10-07 20:40 (before the 20:44 cutoff) | `40 12 7 10 *` | same job, one extra run | `railway.c48-scoreboard-final.json` |
 | `desk-veto` | `ops-desk-veto` | 09:05 | `5 1 * * *` | no | `railway.desk-veto.json` |
 | `harbor-pnl` | `ops-harbor-pnl` | 09:15 | `15 1 * * *` | yes, one message | `railway.harbor-pnl.json` |
 | `trade-journal` | `ops-trade-journal` | 09:15 | `15 1 * * *` | no — alert on failure or a Hard SL hit | `railway.trade-journal.json` |
@@ -52,23 +53,26 @@ River's three jobs write insert-only rows to giiq-brain:
 
 - **C48-3 FT scoreboard** reads the HL **testnet** public info API (`TESTNET_WALLET_ADDRESS` only).
   Checks: margin ≤ 2% NAV, notional ≤ 8% NAV, leverage ≤ 3x, drawdown ≤ 4% from `C48_NAV_START`.
-  BTC only. After 2026-10-07 21:00 HKT the job exits ok, sends nothing, and inserts no score row.
-- **Desk veto** (09:05) uses public `GET /api/public/radar` (no key): 1D `dual_cross_up` = Base,
-  4H `dual_cross_up` = Chase, plus decision symbols, cap 25, BTC always included.
-  `ret_48h` is from 1h candles (HL, else Bitunix public `{COIN}USDT`). If a later 1h low trades through
-  the 4H Filter as of 48h ago, `ret_48h_sl_aware` uses that stop instead of the raw return.
-- **Trade journal** (09:15) is one row per today's fill, plus decision symbols with no fill.
-  The `decider` column is the last cockpit decision for that coin posted **before 08:55 HKT** that day.
+  BTC only. The every-3h cron's last slot on 2026-10-07 is 20:00 HKT, which is before the 20:44 cutoff,
+  so a second service runs once at 20:40 HKT (`40 12 7 10 *`). At and after 21:00 HKT the job exits ok,
+  sends nothing, and inserts no score row.
+- **Desk veto** (09:05) scores the **D-2** cockpit decision batch (run-report two HKT dates ago), not today's
+  radar crosses. `ret_48h` is the move in the 48 hours **after** that signal (did it continue). Candles are
+  HL 1h, else Bitunix public `{COIN}USDT`. If a 1h low in that forward window trades through the 4H Filter
+  as of the signal, `ret_48h_sl_aware` uses that stop. BTC is the benchmark over the same forward window.
+  Strategy comes from the decision `type` (BASE / CHASE). Cap 25.
+- **Trade journal** (09:15) loads fills from the last successful journal run (`raw.ops_check_run` run_at,
+  else `raw.river_trade_log` trade_time). The first run looks back 26 hours, so a close after yesterday's
+  09:15 is not dropped. One row per fill in that window, plus decision symbols with no fill.
+  Long size is positive and short size is negative. The decider column is `unknown` until cockpit stores
+  an actor. `source` is not treated as an actor.
 
 ### Decider
 
-| Evidence | Column |
-|---|---|
-| explicit actor in {Claude.ai, Forge, Railway 08:50 fallback, unknown} | that label |
-| `source=fallback` | `Railway 08:50 fallback` |
-| `source=forge` | `Forge` |
-| `source=claude` | `unknown` (Forge and Claude both write `claude` today) |
-| no decision before 08:55 HKT | `unknown` |
+Cockpit does not record who posted. The column is `unknown`. An explicit `actor` or `decider` value is
+copied only when it is already `Claude.ai`, `Forge`, `Railway 08:50 fallback`, or `unknown`.
+`source=claude`, `source=forge`, and `source=fallback` are not an actor. Recording the actor in cockpit
+is a follow-up.
 
 Missing numbers are written `未知` or `未核實`. A previous run's number is never reused.
 BX NAV is `未知` (owner Harbor): there is no read-only Bitunix key and no BX NAV table.
@@ -124,8 +128,13 @@ HL calls use wallet **address** env vars only (no private keys).
 
 ### Every service
 
+`HL_ADDRESS` is required on every cron service, including desk-missing and the C48 scoreboard. It is the
+public master wallet address (not a secret, not a private key). If it is unset the job alerts
+`HL_ADDRESS not set` and writes `unknown`. It does not skip quietly.
+
 | Variable | Required | Meaning |
 |---|---|---|
+| `HL_ADDRESS` | yes | public master wallet address |
 | `TELEGRAM_BOT_TOKEN` | one sink | Telegram bot token |
 | `TELEGRAM_CHAT_ID` | with the token | chat that receives alerts and reports |
 | `SMTP_HOST`, `ALERT_EMAIL_TO` | email fallback | used only when both Telegram vars are unset |
@@ -139,10 +148,10 @@ HL calls use wallet **address** env vars only (no private keys).
 |---|---|---|
 | `COCKPIT_URL` | yes | cockpit base URL |
 | `COCKPIT_AI_KEY` | yes | `${{cockpit.ENTRY_READ_KEY}}` |
-| `HL_ADDRESS` | yes except desk-missing | main HL wallet address (public info API) |
+| `HL_ADDRESS` | yes (also listed under every service) | public master wallet address |
 | `HL_INFO_URL` | no | default `https://api.hyperliquid.xyz/info` |
 
-Desk-missing needs only `COCKPIT_URL`, `COCKPIT_AI_KEY`, and a sink. It does not call Hyperliquid.
+Desk-missing calls cockpit only, but it still requires `HL_ADDRESS` so a missing address alerts instead of a silent ok.
 
 ### Extra
 
@@ -162,7 +171,15 @@ Desk-missing needs only `COCKPIT_URL`, `COCKPIT_AI_KEY`, and a sink. It does not
 | c48-scoreboard | `HL_TESTNET_INFO_URL` | default `https://api.hyperliquid-testnet.xyz/info` |
 | c48-scoreboard | `C48_NAV_START` | NAV baseline for the 4% drawdown check. Unset → drawdown `未知` and a problem |
 
-C48 does not need `COCKPIT_URL`. It does not call mainnet.
+C48 does not need `COCKPIT_URL` and does not call mainnet. It still requires `HL_ADDRESS` (the public master address) in addition to `TESTNET_WALLET_ADDRESS`.
+
+Spot USDC is `spotClearinghouseState` balances where `coin` is USDC (`total`). Perp `accountValue` is printed
+separately and is not used as cash. A failed spot or perp read is the word `unknown`, never `0`.
+
+A Hard SL is a trigger/stop, reduce-only or `isPositionTpsl`, on the same coin, opposite the position,
+with the trigger on the losing side of the mark (long: trigger < mark, short: trigger > mark) and size
+covering the position. Distance from the mark is printed in percent. A take-profit alone is `Hard SL: NO`.
+Exit monitor, daily audit, Harbor, and the BO report share `hlparse.hard_sl_status`.
 
 ## What each job reads
 
@@ -170,7 +187,7 @@ C48 does not need `COCKPIT_URL`. It does not call mainnet.
 |---|---|---|
 | cockpit | `GET /api/exit/health`, `/api/scheduler/status`, `/api/bx/status`, `/api/bx/day?date=`, `/api/exec/pending`, `/api/exec/run-report?date=` | `X-AI-Key: COCKPIT_AI_KEY` |
 | cockpit | `GET /api/public/radar` | none |
-| Hyperliquid public info | the seven types listed above | none (`HL_ADDRESS` or `TESTNET_WALLET_ADDRESS`) |
+| Hyperliquid public info | the types above, plus `spotClearinghouseState` for spot USDC | none (`HL_ADDRESS` or `TESTNET_WALLET_ADDRESS`) |
 | Bitunix public | `GET /api/v1/futures/market/kline` | none |
 
 `/api/exec/run-report` includes a `decisions` object for that HKT date (posted, count, records, history).
@@ -234,8 +251,7 @@ For each service:
 
 ## Known gaps
 
-- `source=claude` cannot tell Claude.ai from Forge. The decider column stays `unknown` unless the record
-  carries an explicit actor or `source=forge` / `source=fallback`.
+- The decider column is `unknown`. Cockpit `source` is not an actor. Storing the actor is a follow-up.
 - BX NAV is `未知`. Public Bitunix klines are used only as a candle fallback on the veto job.
 - `userFills` is capped at 2000. All-time realised P&L is then `未核實`.
 - BX slippage and BX exit efficiency are not computed. The daily BX entry cap counts open positions only.
