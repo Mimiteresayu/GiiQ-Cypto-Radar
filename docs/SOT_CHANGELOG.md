@@ -12,6 +12,66 @@ header, the executor / pending run reports, the preflight JSON and `[DESK_DATA]`
 
 ---
 
+## GIIQ-SoT-5 (2026-10-06, MMT decision 2026-10-06 21:00 HKT)
+
+Remove unnecessary ENTRY gates, add real safety protections from Signum platform. Exit logic unchanged.
+
+### REMOVED gates
+
+1. **HL daily 3-new-fills cap** (`MAX_NEW_ENTRIES_PER_DAY` removed). Owner: "no need limitation, as many as we can until total cap reach". The combined 80% NAV margin cap is the real protection.
+2. **BX 1-entry-per-day and approve_max=1** (`MAX_NEW_PER_DAY`, approval rules in BX decisions). Same reasoning as HL.
+3. **BX max-2-open-positions limit** (`MAX_OPEN`). Replaced by BX total margin cap (ADD-2 below).
+4. **BX $2M 24h-volume floor** (`VOL_MIN`). Kept spread limit, volume-based sizing, and minimum quantity checks.
+5. **Dead BTC bearish 4% sizing code** (`SIZE_BANDS`, `BTC_BEARISH_FIXED_SIZE_PCT`, `_clamp_size_leverage`). The live path never called it; removed entirely.
+6. **V1–V8 rule IDs as blockers in code**. These are now statistics tags only; the desk prompt will be updated so V1–V7 and dimension scores never veto an order in the prompt either (tags only, default APPROVE).
+
+### CHANGED rules
+
+1. **Minimum leverage 2x** (was 3x). MMT rule: leverage 2x–5x by confidence; never above coin max leverage. `SOT2_MIN_LEV = 2`, leverage step-down now goes 5x → 2x.
+2. **One total margin cap: 80% NAV** (replaces 70% margin + 80% utilisation pair). `MAX_TOTAL_MARGIN_NAV_PCT = 80.0`. HL+BX combined if the code can see both; otherwise apply 80% per venue.
+3. **Minimum order: $10 only** (drop the extra 1%-of-NAV minimum). `min_order_usd` returns only `MIN_NOTIONAL_USD`.
+4. **Process approvals in desk priority order** (Chase first, then alphabetical), not pure alphabetical. Executor iterates `approved_list` sorted by candidate type and symbol.
+5. **Fallback approves every executable candidate at floor size** (2% margin, 2x leverage), not just Base. Chase still becomes pending, not an immediate entry. `build_fallback_decisions` approves all with `size_pct=2.0, leverage=2`.
+6. **BX size/leverage from desk decision** (within 2x–5x bounds), not fixed 1%/3x. `check_entry` reads `approval.get("size_pct")` and `approval.get("leverage")`, clamps to 2–5x and coin max leverage. Pending Chase fills also use desk size/leverage from the stored approval.
+7. **Min SL distance 0.6%** (was 1.5%). Cove number: IOC slippage 0.5% + fees 0.09% = 0.59%. Below that the trade is "impossible" → safety/data. `MIN_SL_DIST_PCT = 0.6` for both HL and BX.
+
+### ADDED protections (Signum parity)
+
+1. **ADD-1: BX radar data freshness and minimum row-count check**. Before any BX order, `bx_radar_fresh` checks:
+   - 1D radar age ≤ 36h, 4H radar age ≤ 4.5h
+   - Row count ≥ 70% of normal (120 rows baseline)
+   - Fail-closed: skip all BX entries with `[BX_ALERT]` log if check fails.
+
+2. **ADD-2: BX total margin cap**. Sum of isolated margin of open BX positions + new ≤ 80% NAV. `BX_TOTAL_MARGIN_CAP_PCT = 80.0`. This replaces the removed max-2-open limit with a real margin-based cap. Checked in `check_entry` with `bx_margin_used` passed in.
+
+3. **ADD-3: HL post-fill reconciliation**. After each HL fill, `_reconcile_position` re-reads `clearinghouseState` and `open_orders` and verifies:
+   - Position size matches filled size
+   - Isolated margin mode (not cross)
+   - Leverage matches requested
+   - Liquidation price is beyond Hard SL
+   - SL order is resting
+   - Updates `cum_margin` with exchange's `totalMarginUsed`
+   - On any mismatch: fix if possible (place missing SL) or close + alert. If close fails, status is `reconcile_failed_CLOSE_FAILED` (manual action required).
+
+4. **ADD-4: Deterministic client order IDs** (idempotent orders). Prevents double-sends on retries:
+   - HL: `cloid` from `_make_cloid(coin, HKT_date, "entry")` → hash-based, e.g. `giiq<sha256[:16]>`
+   - BX: `clientId` with same deterministic scheme
+   - A rerun or retry on the same day produces the same cloid, preventing duplicate orders.
+
+5. **ADD-5: Conservative NAV for sizing**. `nav_snapshot` now returns `nav = min(equity_nav, free_usdc + margin_used)`:
+   - `equity_nav` = the existing definition (spot USDC total for unified, or perp accountValue + spot for split)
+   - `conservative_nav` = free USDC + isolated margin collateral
+   - Sizing uses the minimum of the two, so NAV is conservative in both directions.
+
+### NOT changed (hard constraints)
+
+- **Exit logic**: `exit_worker`, 1H/4H channel exits, tier exit timeframes, Hard SL placement and levels, CONT Hard SL level. No item moves a stop.
+- **Hard floors**: exchange Hard SL on every entry, total margin cap, kill switch, liquidation price must be beyond Hard SL, data-integrity checks (stale/missing data, stop above entry, coin max leverage, exchange minimums), price sanity check.
+- **Left as-is (owner hasn't decided)**: Chase/CONT pending freeze, Chase immediate entry, Base 1D-Green requirement, live-mid > 1D Upper check, size clamp >4%, Tiny tier 3x/2%, 20% per-coin notional cap, BTC regime rule, API key handling.
+- **Never touched**: `secrets/.env`, no live orders, no Railway changes, no deploys.
+
+---
+
 ## Cove HEALTH FAIL 2026-10-05: CONTINUATION / ADD_ON disabled + decision-day candidate freeze
 Cove sign-off `cove/bo_health_sign_2026-10-05.md` (decisions (a) + (b)); Forge diagnosis
 `forge/bo_health_gate_2026-10-05.md`. SoT id left at `GIIQ-SoT-4`: this turns a path **off**
