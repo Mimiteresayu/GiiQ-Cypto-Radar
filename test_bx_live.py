@@ -1,4 +1,5 @@
-"""Bitunix live pilot — fail-closed tests (MMT 2026-09-30). No network: every exchange call goes to FakeAPI."""
+"""Bitunix live pilot — fail-closed tests (MMT 2026-09-30, GIIQ-SoT-5 2026-10-06).
+No network: every exchange call goes to FakeAPI, HL NAV / margin are injected."""
 import hashlib
 import io
 import json
@@ -55,6 +56,7 @@ class FakeAPI:
         self.liq, self.account_fails, self.unrealized = liq, account_fails, unrealized
         self.positions = positions if positions is not None else []
         self.history = []
+        self.lev = {}
 
     def account(self):
         self.calls.append(("account",))
@@ -67,12 +69,14 @@ class FakeAPI:
 
     def set_leverage(self, s, lev):
         self.calls.append(("set_leverage", s, lev))
+        self.lev[s] = lev
 
     def open_long(self, s, qty, px, sl, cid):
         self.calls.append(("open_long", s, qty, px, sl))
         if self.fill:
-            self.positions.append({"positionId": "P1", "symbol": s, "side": "LONG", "qty": qty, "avgOpenPrice": "2.0005",
-                                   "leverage": 3, "marginMode": "ISOLATION", "liqPrice": str(self.liq),
+            pid = "P1" if not self.positions else f"P{len(self.positions) + 1}"
+            self.positions.append({"positionId": pid, "symbol": s, "side": "LONG", "qty": qty, "avgOpenPrice": "2.0005",
+                                   "leverage": self.lev.get(s, 2), "marginMode": "ISOLATION", "liqPrice": str(self.liq),
                                    "unrealizedPNL": str(self.unrealized), "fee": "0", "funding": "0"})
         return {"orderId": "O1"}
 
@@ -132,9 +136,21 @@ class Tmp(unittest.TestCase):
         if decisions is not None:
             L.store_decisions(decisions, "claude", now=now - timedelta(minutes=30))
 
-    def entries(self, api, egress=SG, nav=10_000.0, now=T0):
+    def touch_radar(self, now):
+        """A fresh, full radar (bx_radar writes "ts"; >= 70% of 120 rows) so the SoT-5 freshness gate passes."""
+        for tf in ("1d", "4h"):
+            p = self.tmp / f"bx_radar_{tf}.json"
+            d = json.loads(p.read_text()) if p.exists() else {"rows": []}
+            rows = list(d.get("rows") or [])
+            rows += [{"bx_symbol": f"PAD{i}USDT"} for i in range(max(0, 130 - len(rows)))]
+            p.write_text(json.dumps({"tf": tf, "ts": now.isoformat(), "rows": rows}))
+
+    def entries(self, api, egress=SG, nav=10_000.0, now=T0, hl_margin=0.0, fresh=True):
+        if fresh:
+            self.touch_radar(now)
         return L.run_entries(now=now, trade_api=api, egress=egress, nav_fn=lambda: nav,
-                             market=lambda s: dict(LIVE), tiers_fn=lambda s: TIERS, conn=self.conn)
+                             market=lambda s: dict(LIVE), tiers_fn=lambda s: TIERS, conn=self.conn,
+                             hl_margin_fn=lambda: hl_margin)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -265,17 +281,53 @@ class TestEntriesFailClosed(Tmp):
         o = api.orders()[0]
         self.assertEqual(o[4], "1.8600")                       # Hard SL attached to the entry order
         self.assertIn(("set_isolated", "FOOUSDT"), api.calls)
-        self.assertIn(("set_leverage", "FOOUSDT", 3), api.calls)
+        self.assertIn(("set_leverage", "FOOUSDT", 2), api.calls)   # desk sent none -> default 2x
         t = L.open_live_trades(self.conn)[0]
-        self.assertEqual((t["mode"], t["position_id"], t["size_pct_nav"]), ("live", "P1", 1.0))
+        self.assertEqual((t["mode"], t["position_id"], t["size_pct_nav"]), ("live", "P1", 2.0))  # default 2%
 
-    def test_one_new_entry_per_day(self):
-        self.seed([cand(), cand("BARUSDT")], [meta(), meta("BARUSDT")],
-                  [{"symbol": "FOOUSDT", "decision": "approve"}, {"symbol": "BARUSDT", "decision": "approve"}])
+    def test_desk_size_and_leverage_used(self):
+        self.seed([cand()], [meta()], [{"symbol": "FOOUSDT", "decision": "approve", "size_pct": 3, "leverage": 4}])
         api = FakeAPI()
         rep = self.entries(api)
-        self.assertEqual(len(api.orders()), 1)
-        self.assertIn("new BX entry already today", rep["skipped"][-1]["reason"])
+        self.assertEqual(rep["entered"][0]["status"], "filled", rep)
+        self.assertIn(("set_leverage", "FOOUSDT", 4), api.calls)
+        self.assertEqual(L.open_live_trades(self.conn)[0]["size_pct_nav"], 3.0)
+
+    def test_three_approvals_all_executed(self):
+        """GIIQ-SoT-5: no daily approval limit -- 3 approvals -> 3 orders (within the 80% HL+BX cap)."""
+        syms = ["FOOUSDT", "BARUSDT", "BAZUSDT"]
+        self.seed([cand(s) for s in syms], [meta(s) for s in syms],
+                  [{"coin": s.replace("USDT", ""), "action": "APPROVE", "size_pct": 2, "leverage": 2} for s in syms])
+        api = FakeAPI()
+        rep = self.entries(api)
+        self.assertEqual(len(api.orders()), 3, rep)
+        self.assertEqual([e["status"] for e in rep["entered"]], ["filled"] * 3)
+        self.assertEqual(rep["skipped"], [])
+
+    def test_total_margin_cap_hl_plus_bx(self):
+        """NAV = 10k HL + 1k BX = 11k. HL margin 8,500 + 1st BX 220 (2%) = 79.3% ok; 2nd -> 81.3% > 80% refused."""
+        syms = ["FOOUSDT", "BARUSDT"]
+        self.seed([cand(s) for s in syms], [meta(s) for s in syms],
+                  [{"symbol": s, "decision": "approve"} for s in syms])
+        api = FakeAPI()
+        rep = self.entries(api, hl_margin=8_500.0)
+        self.assertEqual(len(api.orders()), 1, rep)
+        self.assertIn("total margin HL+BX", rep["skipped"][0]["reason"])
+
+    def test_hl_margin_unreadable_refuses(self):
+        self.seed([cand()], [meta()], [{"symbol": "FOOUSDT", "decision": "approve"}])
+        api = FakeAPI()
+        rep = self.entries(api, hl_margin=None)
+        self.assertEqual(api.orders(), [])
+        self.assertIn("margin in use unknown", rep["skipped"][0]["reason"])
+
+    def test_stale_radar_refuses(self):
+        self.seed([cand()], [meta()], [{"symbol": "FOOUSDT", "decision": "approve"}])
+        self.touch_radar(T0 - timedelta(hours=40))
+        api = FakeAPI()
+        rep = self.entries(api, fresh=False)
+        self.assertEqual(api.orders(), [])
+        self.assertIn("stale", rep["skipped"][0]["reason"])
 
     def test_fallback_decisions_rejected(self):
         self.seed([cand()], [meta()])
@@ -320,16 +372,31 @@ class TestProtection(Tmp):
 
 
 class TestPilotRules(unittest.TestCase):
-    def chk(self, c=None, m=None, live=None, nav=10_000.0, avail=1_000.0, open_live=(), today=0, appr=APPROVED,
+    def chk(self, c=None, m=None, live=None, nav=10_000.0, avail=1_000.0, open_live=(), used=0.0, appr=APPROVED,
             tiers=TIERS):
-        return L.check_entry(c or cand(), m or meta(), live or dict(LIVE), nav, avail, list(open_live), today, appr, tiers)
+        return L.check_entry(c or cand(), m or meta(), live or dict(LIVE), nav, avail, list(open_live), used, appr, tiers)
 
     def test_ok_plan(self):
         r = self.chk()
         self.assertTrue(r["ok"], r)
-        self.assertEqual(r["plan"]["leverage"], 3)
-        self.assertAlmostEqual(r["plan"]["margin_usd"], 100.0)   # 1% of 10k NAV
+        self.assertEqual(r["plan"]["leverage"], 2)                # no desk value -> default 2x
+        self.assertAlmostEqual(r["plan"]["margin_usd"], 200.0)   # default 2% of 10k NAV
         self.assertLess(r["plan"]["liq_est"], 1.86)
+
+    def test_desk_sizing_bounds(self):
+        r = self.chk(appr=dict(APPROVED, size_pct=4, leverage=5))
+        self.assertTrue(r["ok"], r)
+        self.assertEqual((r["plan"]["margin_usd"], r["plan"]["leverage"]), (400.0, 5))
+        self.assertEqual(L.desk_sizing({"size_pct": 10, "leverage": 9}), (4.0, 5))     # clamped to 4% / 5x
+        self.assertEqual(L.desk_sizing({"size_pct": 0.5, "leverage": 1}), (2.0, 2))    # floor 2% / 2x
+        self.assertEqual(L.desk_sizing({}), (2.0, 2))                                  # default
+        self.assertEqual(L.desk_sizing({"size_pct": 3, "leverage": 5}, 3), (3.0, 3))  # never above max_leverage
+        self.assertIn("minimum", self.chk(m=meta(max_leverage=1), appr=dict(APPROVED, leverage=3))["reason"])
+
+    def test_total_margin_cap(self):
+        self.assertTrue(self.chk(used=7_800.0)["ok"])                     # 78% + 2% = 80% -> ok
+        self.assertIn("80", self.chk(used=7_801.0)["reason"])            # > 80% -> refused
+        self.assertIn("unknown", self.chk(used=None)["reason"])           # unreadable -> refuse
 
     def test_tier_and_universe_limits(self):
         self.assertFalse(self.chk(m=meta(liq_tier="watch"))["ok"])
@@ -339,23 +406,24 @@ class TestPilotRules(unittest.TestCase):
         self.assertFalse(self.chk(m=meta(ex="HL+BX"))["ok"])
         self.assertFalse(self.chk(m=meta(spread_bp=10.0))["ok"])                     # must be < 10 bp
         self.assertFalse(self.chk(live=dict(LIVE, spread_bp=10.5))["ok"])            # live re-check
-        self.assertFalse(self.chk(live=dict(LIVE, vol24h=1.9e6))["ok"])
-        self.assertFalse(self.chk(m=meta(vol24h_usd=1.5e6))["ok"])
+        # GIIQ-SoT-5: the $2M volume floor is gone; volume only downsizes (0.5% of 24h vol)
+        self.assertTrue(self.chk(m=meta(vol24h_usd=1.5e6))["ok"])
 
     def test_position_caps(self):
-        two = [{"bx_symbol": "A"}, {"bx_symbol": "B"}]
-        self.assertIn("max 2", self.chk(open_live=two)["reason"])
+        three = [{"bx_symbol": "A"}, {"bx_symbol": "B"}, {"bx_symbol": "C"}]
+        self.assertTrue(self.chk(open_live=three)["ok"])                  # SoT-5: no max-open limit
         self.assertIn("already holding", self.chk(open_live=[{"bx_symbol": "FOOUSDT"}])["reason"])
-        self.assertIn("max 1", self.chk(today=1)["reason"])
 
     def test_sl_distance_and_liquidation(self):
         self.assertIn("1.5%", self.chk(c=cand(hard_sl=1.98))["reason"])
         # SL below the 3x liquidation price (~1.36) -> liq not beyond the SL -> skip
-        self.assertIn("liq", self.chk(c=cand(hard_sl=1.30))["reason"])
-        self.assertIn("liq", self.chk(tiers=[{"startValue": "0", "endValue": "1e9", "maintenanceMarginRate": "0.30"}])["reason"])
+        lev3 = dict(APPROVED, leverage=3)
+        self.assertIn("liq", self.chk(c=cand(hard_sl=1.30), appr=lev3)["reason"])
+        self.assertIn("liq", self.chk(appr=lev3, tiers=[{"startValue": "0", "endValue": "1e9",
+                                                         "maintenanceMarginRate": "0.30"}])["reason"])
 
     def test_downsized_to_half_percent_of_volume(self):
-        r = self.chk(nav=2_000_000.0, avail=1e9)            # 1% x 3 = $60k notional > $40k (0.5% of $8M)
+        r = self.chk(nav=2_000_000.0, avail=1e9)            # 2% x 2 = $80k notional > $40k (0.5% of $8M)
         self.assertTrue(r["ok"])
         self.assertLessEqual(float(r["plan"]["qty"]) * 2.0004, 0.005 * 8e6 + 1e-6)
         self.assertIn("0.5% of 24h vol", r["plan"]["note"])
@@ -522,9 +590,48 @@ class TestDryRun(unittest.TestCase):
         self.assertEqual(order["effect"], "IOC")
         self.assertEqual(order["slPrice"], r["plan"]["sl_price"])
         self.assertEqual(order["slStopType"], "MARK_PRICE")
-        self.assertEqual(json.loads(reqs[1]["body"])["leverage"], 3)
+        self.assertEqual(json.loads(reqs[1]["body"])["leverage"], 2)               # default 2x
         self.assertEqual(json.loads(reqs[0]["body"])["marginMode"], "ISOLATION")
         self.assertTrue(all(x["headers"]["api-key"] == "***" for x in reqs))
+
+
+class TestStatusAndRulesBuild(Tmp):
+    """P0 regression (GIIQ-SoT-5 / PR #48): /api/bx/status raised NameError MARGIN_PCT_NAV."""
+
+    def test_status_payload_builds(self):
+        import bx_service
+        orig = (bx_service.OUT_DIR, bx_egress.check)
+        bx_service.OUT_DIR = self.tmp
+        bx_egress.check = lambda force=False, opener=None: SG
+        try:
+            with patch.dict(os.environ, {"BX_API_KEY": "", "BX_API_SECRET": ""}):   # no signed call in a test
+                st = bx_service.status_payload()
+        finally:
+            bx_service.OUT_DIR, bx_egress.check = orig
+        self.assertTrue(st["ok"])
+        r = st["rules"]
+        self.assertIsNone(r["approve_max"])
+        self.assertEqual((r["size_pct_range"], r["leverage_range"]), ([2.0, 4.0], [2, 5]))
+        self.assertEqual((r["default_size_pct"], r["default_leverage"]), (2.0, 2))
+        self.assertEqual(r["total_margin_cap_pct_nav"], 80.0)
+        json.dumps(st, default=str)                                        # serialisable for the HTTP reply
+
+    def test_candidates_rules_have_no_approve_limit(self):
+        (self.tmp / "bx_meta.json").write_text(json.dumps({"scanned": []}))
+        doc = L.build_candidates(now=T0)
+        self.assertIsNone(doc["rules"]["approve_max"])
+        self.assertEqual(doc["rules"]["sizing"], "desk")
+        self.assertNotIn("MARGIN_PCT_NAV", json.dumps(doc))
+
+    def test_three_approvals_pass_validation(self):
+        syms = ["FOOUSDT", "BARUSDT", "BAZUSDT"]
+        (self.tmp / "bx_candidates_latest.json").write_text(json.dumps(
+            {"date": L.hkt_date(T0), "candidates": [cand(s) for s in syms]}))
+        res = L.store_decisions([{"coin": s.replace("USDT", ""), "action": "APPROVE", "size_pct": 3, "leverage": 3}
+                                 for s in syms], "claude", now=T0 - timedelta(minutes=30))
+        self.assertTrue(res["ok"])
+        self.assertEqual((res["stored"], res["rejected"]), (3, []))
+        self.assertTrue(all(L.approval_for(s, T0) for s in syms))
 
 
 class TestDayReport(Tmp):

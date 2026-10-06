@@ -11,10 +11,14 @@ FAIL CLOSED — a live ORDER is sent only when every one of these holds (live_ga
   4. the account answers a signed read (bad key / IP not whitelisted -> refuse)
   5. an ENTRY_DESK approval (source=claude, today HKT, this symbol) exists — no approval, no order
 Per trade (check_entry):
-  * pilot tier only: BX-only crypto, 24h vol >= $2M, spread < 10 bp (re-measured live), gc_tf 1d or 4h
+  * pilot tier only: BX-only crypto, spread < 10 bp (re-measured live), gc_tf 1d or 4h (SoT-5: no $2M floor)
     (no 1H signals, no watch tier, no stock / commodity / index contracts)
-  * isolated margin 1% NAV, 3x; notional <= 0.5% of 24h volume (downsized, skipped below the minimum qty)
-  * max 2 open BX positions, max 1 new BX entry per HKT day (pending Chase fills count)
+  * GIIQ-SoT-5: isolated margin = desk size_pct (2-4% NAV), leverage = desk leverage (2-5x, never above the
+    contract max leverage); default 2% / 2x when the desk sends none; notional <= 0.5% of 24h volume
+    (downsized, skipped below the minimum qty)
+  * no daily entry limit and no max-open limit: every approved candidate is tried; total margin in use
+    HL + BX combined (exchange values) <= 80% of NAV, fail closed if either margin is unreadable
+  * one position per contract
   * Hard SL (tier rule, 4H radar) >= 1.5% below the price; estimated isolated liquidation price below the
     Hard SL (maintenance rate from the public position tiers); else skip
   * order = IOC limit buy at ask + 0.5% with the Hard SL attached (MARK_PRICE trigger, market); then the
@@ -58,7 +62,11 @@ MAX_SIZE_OF_VOL = 0.005
 MIN_SL_DIST_PCT = 1.5           # kept at 1.5% (0.6% was suggestion, not approved)
 IOC_SLIP = 0.005                # IOC limit = ask x 1.005
 PRICE_SANITY = 0.5              # live price within 50% of the radar close
-BX_TOTAL_MARGIN_CAP_PCT = 80.0  # GIIQ-SoT-5 ADD-2: BX total margin cap (HL+BX combined if visible)
+BX_TOTAL_MARGIN_CAP_PCT = 80.0  # GIIQ-SoT-5 ADD-2: total margin cap, HL + BX combined, % of combined NAV
+# GIIQ-SoT-5 B19: size / leverage come from the ENTRY_DESK decision, clamped to these bounds.
+SIZE_PCT_MIN, SIZE_PCT_MAX = 2.0, 4.0     # isolated margin as % of NAV
+LEV_MIN, LEV_MAX = 2, 5
+DEFAULT_SIZE_PCT, DEFAULT_LEVERAGE = 2.0, 2   # when the desk sends no size_pct / leverage
 # BX radar freshness thresholds (GIIQ-SoT-5 ADD-1)
 BX_RADAR_MAX_AGE_H = {"1d": 36.0, "4h": 4.5}
 BX_RADAR_MIN_ROWS_PCT = 0.70    # 70% of normal row count
@@ -262,6 +270,49 @@ def bx_equity(account: dict) -> float:
                      ("available", "frozen", "margin", "crossUnrealizedPNL", "isolationUnrealizedPNL")), 6)
 
 
+def bx_margin_in_use(account: dict) -> float:
+    """Bitunix futures margin in use (position margin + margin frozen by open orders), from the exchange."""
+    return round(sum(_f(account.get(k)) or 0.0 for k in ("margin", "frozen")), 6)
+
+
+def hl_margin_used(address: Optional[str] = None, info: Callable[[dict], Any] = _hl_info) -> Optional[float]:
+    """HL perp margin in use (marginSummary.totalMarginUsed) from the PUBLIC info API. None if unreadable."""
+    addr = (address or os.environ.get("HL_ADDRESS") or "").strip()
+    if not addr:
+        return None
+    try:
+        perp = info({"type": "clearinghouseState", "user": addr}) or {}
+        return float((perp.get("marginSummary") or {}).get("totalMarginUsed") or 0.0)
+    except Exception as e:  # noqa: BLE001
+        _log(f"[BX_LIVE] HL margin unavailable: {str(e)[:120]}")
+        return None
+
+
+def desk_sizing(approval: Optional[dict], coin_max_leverage: Any = None) -> Tuple[float, int]:
+    """GIIQ-SoT-5 B19: (size_pct, leverage) from the desk decision. size_pct clamped to 2..4 % NAV, leverage to
+    2..5x and never above the contract max leverage. Missing / zero values -> 2% / 2x."""
+    a = approval or {}
+    size_pct = _f(a.get("size_pct")) or DEFAULT_SIZE_PCT
+    size_pct = max(SIZE_PCT_MIN, min(SIZE_PCT_MAX, size_pct))
+    leverage = int(_f(a.get("leverage")) or DEFAULT_LEVERAGE)
+    leverage = max(LEV_MIN, min(LEV_MAX, leverage))
+    cmax = _f(coin_max_leverage)
+    if cmax and leverage > cmax:
+        leverage = int(math.floor(cmax))      # may drop below LEV_MIN -> check_entry refuses
+    return size_pct, leverage
+
+
+def rules_summary() -> Dict[str, Any]:
+    """The live BX rules as shown to the desk (/api/ai/candidates bx.rules) and in /api/bx/status."""
+    return {"sot": "GIIQ-SoT-5", "veto": ["V1", "V2", "V3", "V5"], "approve_max": None,
+            "sizing": "desk", "size_pct_range": [SIZE_PCT_MIN, SIZE_PCT_MAX], "leverage_range": [LEV_MIN, LEV_MAX],
+            "default_size_pct": DEFAULT_SIZE_PCT, "default_leverage": DEFAULT_LEVERAGE,
+            "leverage_cap": "never above the contract max_leverage",
+            "total_margin_cap_pct_nav": BX_TOTAL_MARGIN_CAP_PCT, "total_margin_scope": "HL + BX combined",
+            "max_size_of_24h_vol": MAX_SIZE_OF_VOL, "min_sl_dist_pct": MIN_SL_DIST_PCT,
+            "breaker_pct_nav": BREAKER_PCT_NAV, "no_fallback": "no approval -> no order"}
+
+
 # ---------------------------------------------------------------------------------------------
 # candidates for ENTRY_DESK + decisions
 # ---------------------------------------------------------------------------------------------
@@ -329,12 +380,13 @@ def build_candidates(now: Optional[datetime] = None) -> dict:
             "narrative": bool(m.get("narrative")), "cat_tags": m.get("cat_tags"), "mcap_usd": m.get("mcap_usd"),
             "max_leverage": m.get("max_leverage"), "contract_age_days": m.get("contract_age_days"),
             "asset_age": m.get("asset_age"),
-            "size_rule": f"{MARGIN_PCT_NAV:g}% NAV margin, {LEVERAGE}x, <= 0.5% of 24h vol",
+            "size_rule": (f"desk size_pct {SIZE_PCT_MIN:g}-{SIZE_PCT_MAX:g}% NAV margin, {LEV_MIN}-{LEV_MAX}x "
+                          f"(<= max_leverage; default {DEFAULT_SIZE_PCT:g}% / {DEFAULT_LEVERAGE}x), "
+                          f"<= 0.5% of 24h vol, total margin HL+BX <= {BX_TOTAL_MARGIN_CAP_PCT:g}% NAV"),
         })
     doc = {"date": hkt_date(now), "generated_at": now.isoformat(), "ex": "BX", "candidates": out,
            "not_eligible": skipped[:100],
-           "rules": {"veto": ["V1", "V2", "V3", "V5"], "approve_max": MAX_NEW_PER_DAY,
-                     "no_fallback": "no approval -> no order"}}
+           "rules": rules_summary()}
     _write(candidates_path(), doc)
     return doc
 
@@ -408,7 +460,7 @@ def liq_price_long(entry: float, leverage: float, mmr: float) -> float:
 def bx_radar_fresh(radar_1d: dict, radar_4h: dict, now: datetime) -> Tuple[bool, str]:
     """GIIQ-SoT-5 ADD-1: BX radar freshness and row-count check (same as HL guardrail)."""
     def age_h(rd: dict) -> Optional[float]:
-        ts = rd.get("generated_at")
+        ts = rd.get("generated_at") or rd.get("ts")   # bx_radar writes "ts"
         if not ts:
             return None
         try:
@@ -445,9 +497,10 @@ def bx_radar_fresh(radar_1d: dict, radar_4h: dict, now: datetime) -> Tuple[bool,
 
 
 def check_entry(cand: dict, meta: dict, live: dict, nav: Optional[float], available: Optional[float],
-                open_live: List[dict], bx_margin_used: float, approval: Optional[dict],
+                open_live: List[dict], margin_used_total: Optional[float], approval: Optional[dict],
                 tiers: List[dict]) -> Dict[str, Any]:
-    """GIIQ-SoT-5: size/leverage from desk decision, daily cap and max-open removed, BX total margin cap added.
+    """GIIQ-SoT-5: size/leverage from desk decision, daily cap and max-open removed, total margin cap (HL+BX).
+    margin_used_total = HL + BX margin already in use (USD); None -> refuse (fail closed).
     Pure pilot checks for one entry. live = {price, ask, bid, spread_bp, vol24h}. -> {ok, reason, plan}."""
     sym = cand["symbol"]
 
@@ -481,16 +534,10 @@ def check_entry(cand: dict, meta: dict, live: dict, nav: Optional[float], availa
     if not nav or nav <= 0:
         return no("NAV unavailable (HL NAV + BX equity)")
     
-    # GIIQ-SoT-5: size/leverage from desk decision (B19), within 2-5x bounds
-    size_pct = _f(approval.get("size_pct")) or 2.0  # floor is 2%
-    leverage = int(_f(approval.get("leverage")) or 2)  # floor is 2x
-    leverage = max(2, min(5, leverage))  # clamp to 2-5x
-    # Check coin max leverage
-    coin_max_lev = _f(meta.get("max_leverage"))
-    if coin_max_lev and leverage > coin_max_lev:
-        leverage = int(math.floor(coin_max_lev))
-    if leverage < 2:
-        return no(f"leverage {leverage}x < 2x minimum after coin max leverage")
+    # GIIQ-SoT-5: size/leverage from desk decision (B19): 2-4% NAV, 2-5x, <= contract max leverage
+    size_pct, leverage = desk_sizing(approval, meta.get("max_leverage"))
+    if leverage < LEV_MIN:
+        return no(f"leverage {leverage}x < {LEV_MIN}x minimum after coin max leverage")
     
     margin = size_pct / 100.0 * nav
     notional = margin * leverage
@@ -503,11 +550,12 @@ def check_entry(cand: dict, meta: dict, live: dict, nav: Optional[float], availa
         margin = cap / leverage
         note = f"downsized to 0.5% of 24h vol (${cap:,.0f})"
     
-    # GIIQ-SoT-5 ADD-2: BX total margin cap
-    if nav > 0:
-        new_total_pct = (bx_margin_used + margin) / nav * 100.0
-        if new_total_pct > BX_TOTAL_MARGIN_CAP_PCT:
-            return no(f"BX total margin {new_total_pct:.1f}% > {BX_TOTAL_MARGIN_CAP_PCT:g}% cap")
+    # GIIQ-SoT-5 ADD-2: total margin cap, HL + BX combined (margin_used_total = HL + BX margin in use)
+    if margin_used_total is None:
+        return no("total margin in use unknown (HL or BX margin unreadable): refuse")
+    new_total_pct = (margin_used_total + margin) / nav * 100.0
+    if new_total_pct > BX_TOTAL_MARGIN_CAP_PCT:
+        return no(f"total margin HL+BX {new_total_pct:.1f}% > {BX_TOTAL_MARGIN_CAP_PCT:g}% NAV cap")
     
     if available is not None and margin > available:
         return no(f"BX available {available:.2f} USDT < margin {margin:.2f}")
@@ -743,7 +791,8 @@ def _trade_api(dry: bool = False):
 
 def run_entries(now: Optional[datetime] = None, trade_api=None, egress: Optional[dict] = None,
                 nav_fn: Callable[[], Optional[float]] = hl_nav, market: Callable[[str], dict] = live_market,
-                tiers_fn=None, conn=None) -> Dict[str, Any]:
+                tiers_fn=None, conn=None,
+                hl_margin_fn: Callable[[], Optional[float]] = hl_margin_used) -> Dict[str, Any]:
     """08:56 HKT: approved BX candidates -> live entries (Base / 4H NewToken) or live pending (Chase).
     GIIQ-SoT-5 ADD-1: BX radar freshness check before any orders."""
     import bx_egress
@@ -788,10 +837,15 @@ def run_entries(now: Optional[datetime] = None, trade_api=None, egress: Optional
         meta_all = {m["bx_symbol"]: m for m in (bx_radar.load_meta().get("scanned") or [])}
         tiers_fn = tiers_fn or bx_trade.position_tiers
         
-        # GIIQ-SoT-5 ADD-2: calculate BX margin used for the total margin cap
-        open_trades = open_live_trades(conn)
-        bx_margin_used = sum(_f(t.get("margin_used")) or 0.0 for t in open_trades)
-        
+        # GIIQ-SoT-5 ADD-2: total margin in use, HL + BX combined (exchange values, not the ledger)
+        hl_m = hl_margin_fn()
+        book = {"margin_used": (hl_m + bx_margin_in_use(acct)) if hl_m is not None else None,
+                "available": _f(acct.get("available"))}
+        rep["margin"] = {"hl_used": hl_m, "bx_used": bx_margin_in_use(acct), "nav": nav,
+                         "cap_pct": BX_TOTAL_MARGIN_CAP_PCT}
+
+        # GIIQ-SoT-5: no daily approval limit -- every approved candidate is tried, in list order,
+        # each one limited only by the checks in check_entry (incl. the running HL+BX margin cap).
         pend = load_live_pending()
         for c in cands:
             appr = approval_for(c["symbol"], now)
@@ -801,7 +855,7 @@ def run_entries(now: Optional[datetime] = None, trade_api=None, egress: Optional
             if c["type"] == "Chase":
                 rep["pending"].append(create_live_pending(pend, c, appr, now))
                 continue
-            _try_enter(api, conn, c, meta_all, acct, nav, bx_margin_used, now, market, tiers_fn, rep)
+            _try_enter(api, conn, c, meta_all, acct, nav, book, now, market, tiers_fn, rep)
         save_live_pending(pend)
     finally:
         if own:
@@ -809,7 +863,9 @@ def run_entries(now: Optional[datetime] = None, trade_api=None, egress: Optional
     return rep
 
 
-def _try_enter(api, conn, c, meta_all, acct, nav, bx_margin_used, now, market, tiers_fn, rep, kind=None) -> bool:
+def _try_enter(api, conn, c, meta_all, acct, nav, book, now, market, tiers_fn, rep, kind=None) -> bool:
+    """book = {"margin_used": HL+BX margin in use (None = unknown), "available": BX available USDT}; updated after
+    each fill so several approvals in one run share the same 80% cap and the same free balance."""
     meta = meta_all.get(c["symbol"]) or {}
     try:
         live = market(c["symbol"])
@@ -817,8 +873,8 @@ def _try_enter(api, conn, c, meta_all, acct, nav, bx_margin_used, now, market, t
     except Exception as e:  # noqa: BLE001
         rep["skipped"].append({"symbol": c["symbol"], "reason": f"market data failed: {str(e)[:120]}"})
         return False
-    chk = check_entry(c, meta, live, nav, _f(acct.get("available")), open_live_trades(conn),
-                      bx_margin_used, approval_for(c["symbol"], now), tiers)
+    chk = check_entry(c, meta, live, nav, book.get("available"), open_live_trades(conn),
+                      book.get("margin_used"), approval_for(c["symbol"], now), tiers)
     if not chk["ok"]:
         rep["skipped"].append({"symbol": c["symbol"], "reason": chk["reason"]})
         return False
@@ -827,8 +883,16 @@ def _try_enter(api, conn, c, meta_all, acct, nav, bx_margin_used, now, market, t
     except Exception as e:  # noqa: BLE001
         rep["skipped"].append({"symbol": c["symbol"], "reason": f"order error: {str(e)[:160]}"})
         _log(f"[BX_ALERT] {c['symbol']} order error: {str(e)[:160]}")
+        # the order may still have reached the exchange: stop further entries this run (fail closed)
+        book["margin_used"] = None
         return False
     rep["entered"].append(res)
+    if res.get("status") != "not_filled":
+        m = float(chk["plan"]["margin_usd"])
+        if book.get("margin_used") is not None:
+            book["margin_used"] += m
+        if book.get("available") is not None:
+            book["available"] -= m
     return res.get("status") in ("filled", "dry_run")
 
 
@@ -847,8 +911,7 @@ def save_live_pending(entries: List[dict]) -> None:
 def create_live_pending(entries: List[dict], cand: dict, approval: dict, now: datetime) -> dict:
     """GIIQ-SoT-5: size/leverage from approval instead of fixed 1%/3x."""
     from pending_entries import CONTINUATION, create_pending
-    size_pct = _f(approval.get("size_pct")) or 2.0
-    leverage = int(_f(approval.get("leverage")) or 2)
+    size_pct, leverage = desk_sizing(approval, cand.get("max_leverage"))
     rec, created = create_pending(entries, cand["symbol"], CONTINUATION,
                                   {"size_pct": size_pct, "leverage": leverage, "reason": approval.get("reason")},
                                   {"tier": cand.get("tier"), "type": "Chase"}, {"tf": "1d"}, now)
@@ -955,14 +1018,13 @@ def _try_enter_pending(api, conn, c, meta_all, acct, nav, now, market, tiers_fn,
     
     # Get size/leverage from the pending record's approval
     approval = {"decision": "approve", "source": "claude", "ts": rec.get("approved_at"),
-                "size_pct": rec.get("size_pct", 2.0), "leverage": rec.get("leverage", 2)} if rec.get("approved_at") else None
-    
-    # Calculate BX margin used for the total margin cap
-    open_trades = open_live_trades(conn)
-    bx_margin_used = sum(_f(t.get("margin_used")) or 0.0 for t in open_trades)
-    
-    chk = check_entry(c, meta, live, nav, _f(acct.get("available")), open_trades,
-                      bx_margin_used, approval, tiers)
+                "size_pct": rec.get("size_pct"), "leverage": rec.get("leverage")} if rec.get("approved_at") else None
+
+    # total margin in use, HL + BX combined (exchange values)
+    hl_m = hl_margin_used()
+    margin_used_total = (hl_m + bx_margin_in_use(acct)) if hl_m is not None else None
+    chk = check_entry(c, meta, live, nav, _f(acct.get("available")), open_live_trades(conn),
+                      margin_used_total, approval, tiers)
     if not chk["ok"]:
         rep["skipped"].append({"symbol": c["symbol"], "reason": chk["reason"]})
         return False
@@ -991,8 +1053,7 @@ def status(conn=None) -> Dict[str, Any]:
             "keys_present": bx_trade.keys_present(), "breaker": breaker_state(), "baseline_nav": st.get("baseline_nav"),
             "realized_pnl_usd": round(realized, 4), "open": opens, "closed_recent": closed,
             "pending": [e for e in load_live_pending() if e.get("status") == "pending"],
-            "rules": {"margin_pct_nav": MARGIN_PCT_NAV, "leverage": LEVERAGE, "max_open": MAX_OPEN,
-                      "max_new_per_day": MAX_NEW_PER_DAY, "breaker_pct_nav": BREAKER_PCT_NAV}}
+            "rules": rules_summary()}
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1008,16 +1069,17 @@ EXAMPLE_TIERS = [{"startValue": "0", "endValue": "50000", "leverage": 50, "maint
 
 
 def dry_run(cand: Optional[dict] = None, meta: Optional[dict] = None, live: Optional[dict] = None,
-            nav: float = 10_000.0, tiers: Optional[List[dict]] = None) -> Dict[str, Any]:
+            nav: float = 10_000.0, tiers: Optional[List[dict]] = None,
+            approval: Optional[dict] = None) -> Dict[str, Any]:
     from bx_trade import BXTrade
     cand, meta, live = cand or EXAMPLE_CAND, meta or EXAMPLE_META, live or EXAMPLE_LIVE
-    chk = check_entry(cand, meta, live, nav, 1_000.0, [], 0, {"decision": "approve", "source": "claude"},
+    chk = check_entry(cand, meta, live, nav, 1_000.0, [], 0.0, approval or {"decision": "approve", "source": "claude"},
                       tiers or EXAMPLE_TIERS)
     if not chk["ok"]:
         return {"ok": False, "reason": chk["reason"]}
     api = BXTrade(dry_run=True, api_key="DRYRUNKEY", secret="DRYRUNSECRET", clock=lambda: 1_790_000_000.0)
     api.set_isolated(cand["symbol"])
-    api.set_leverage(cand["symbol"], LEVERAGE)
+    api.set_leverage(cand["symbol"], chk["plan"]["leverage"])
     api.open_long(cand["symbol"], chk["plan"]["qty"], chk["plan"]["limit_price"], chk["plan"]["sl_price"],
                   "giiqbx2609300856abc123")
     api.place_position_sl(cand["symbol"], "<positionId>", chk["plan"]["sl_price"])
