@@ -2,6 +2,8 @@
 import io
 import json
 import unittest
+import urllib.error
+from email.message import Message
 from pathlib import Path
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
@@ -514,6 +516,12 @@ class TestRound3(unittest.TestCase):
         self.assertIsNone(only["warning"])
         both = hlparse.portfolio_nav(perp, {"balances": [{"coin": "USDC", "total": "250"}]}, perp_ok=True, spot_ok=True)
         self.assertEqual(both["nav"], 1250.0)
+        unified = hlparse.portfolio_nav(
+            {"marginSummary": {"accountValue": "39.53", "totalMarginUsed": "39.43"}},
+            {"balances": [{"coin": "USDC", "total": "1686.42", "hold": "39.43"}]},
+            perp_ok=True, spot_ok=True)
+        self.assertEqual(f"{unified['nav']:.2f}", "1686.52")
+        self.assertIsNone(unified["warning"])
         self.assertIn("1,250.00", both["label"])
         failed = hlparse.portfolio_nav(perp, None, perp_ok=True, spot_ok=False)
         self.assertIsNone(failed["nav"])
@@ -551,6 +559,21 @@ class TestRound3(unittest.TestCase):
         self.assertIsNone(board["brain_rows"][0]["values"][0][2])
         self.assertNotIn("C48_ALLOC", [p["code"] for p in board["problems"]])
         self.assertIn("margin% 未核實", board["markdown"])
+        book = bo_report.build({
+            "day": "2026-10-06",
+            "hl_state": {"ok": True, "data": {"marginSummary": {"accountValue": "39.53", "totalMarginUsed": "39.43"},
+                                              "assetPositions": []}},
+            "hl_spot": {"ok": True, "data": {"balances": [
+                {"coin": "USDC", "total": "1686.42", "hold": "39.43"}]}},
+            "hl_orders": {"ok": True, "data": []}, "all_mids": {"ok": True, "data": {}},
+            "fills": {"ok": True, "data": []},
+            "run_report": {"ok": True, "data": {"decisions": {"ok": True, "posted": True, "records": [
+                {"symbol": "BTC", "source": "claude", "timestamp": "2026-10-06T00:10:00+00:00"}]}}}},
+            NOW, {})
+        self.assertIn("NAV: 1,686.52", book["markdown"])
+        self.assertIn("margin% 2.34%", book["markdown"])
+        self.assertNotIn("1,725.95", book["markdown"])
+        self.assertIn("- none", book["markdown"])
 
     def test_exit_monitor_and_daily_audit_use_the_nav_helper(self):
         data = _exit_with([_sl_order(sz="2.5", triggerPx="140")], {"SOL": "155"})
@@ -774,6 +797,143 @@ def _audit_with(orders):
         "hl_orders": {"ok": True, "data": orders},
         "all_mids": {"ok": True, "data": {"SOL": "100"}},
     }
+
+
+class TestRound4(unittest.TestCase):
+    def test_null_body_is_unknown_and_alerts(self):
+        class NullState(FakeHTTP):
+            def __call__(self, req, timeout=None):
+                body = json.loads(req.data.decode()) if getattr(req, "data", None) else None
+                if body and body.get("type") == "clearinghouseState":
+                    return _Resp(None)
+                return super().__call__(req, timeout)
+
+        with patch("urllib.request.urlopen", NullState()):
+            rep = ops_main.run("exit-monitor", ENV, dry_run=True, now=NOW)
+        self.assertEqual(rep["notify"], "problem")
+        self.assertTrue(any(p["code"] == "DATA_UNAVAILABLE" and p.get("coin") == "hl_state" for p in rep["problems"]))
+        self.assertFalse(any(p["code"] == "NO_SL" for p in rep["problems"]))
+        md = rules.to_markdown(rep)
+        self.assertIn("HL positions: 未知", md)
+        self.assertNotIn("no position", md.lower())
+        self.assertNotIn("HL positions: 0", md)
+
+        class NullOrders(FakeHTTP):
+            def __call__(self, req, timeout=None):
+                body = json.loads(req.data.decode()) if getattr(req, "data", None) else None
+                if body and body.get("type") == "clearinghouseState":
+                    return _Resp({"marginSummary": {"accountValue": "1000", "totalMarginUsed": "10"},
+                                  "assetPositions": [{"position": {
+                                      "coin": "SOL", "szi": "1", "entryPx": "100", "positionValue": "100",
+                                      "leverage": {"value": 2}}}]})
+                if body and body.get("type") == "frontendOpenOrders":
+                    return _Resp(None)
+                return super().__call__(req, timeout)
+
+        with patch("urllib.request.urlopen", NullOrders()):
+            orders_rep = ops_main.run("exit-monitor", ENV, dry_run=True, now=NOW)
+        self.assertTrue(any(p["code"] == "DATA_UNAVAILABLE" and p.get("coin") == "hl_orders"
+                            for p in orders_rep["problems"]))
+        self.assertFalse(any(p["code"] == "NO_SL" for p in orders_rep["problems"]))
+        self.assertIn("SOL", rules.to_markdown(orders_rep))
+
+    def test_429_then_200_succeeds(self):
+        class Once429(FakeHTTP):
+            def __init__(self):
+                super().__init__()
+                self.state_calls = 0
+
+            def __call__(self, req, timeout=None):
+                body = json.loads(req.data.decode()) if getattr(req, "data", None) else None
+                if body and body.get("type") == "clearinghouseState":
+                    self.state_calls += 1
+                    if self.state_calls == 1:
+                        raise urllib.error.HTTPError(
+                            req.full_url, 429, "rate", Message(), io.BytesIO(b"null"))
+                return super().__call__(req, timeout)
+
+        fake = Once429()
+        sleeps = []
+        with patch("urllib.request.urlopen", fake), patch("ops_cron.sources.time.sleep", sleeps.append):
+            rep = ops_main.run("exit-monitor", ENV, dry_run=True, now=NOW)
+        self.assertEqual(fake.state_calls, 2)
+        self.assertEqual(sleeps, [1])
+        self.assertFalse(any(p["code"] == "DATA_UNAVAILABLE" and p.get("coin") == "hl_state" for p in rep["problems"]))
+        self.assertIn("HL positions: 0 (none)", rules.to_markdown(rep))
+
+    def test_hl_address_is_lowercased_on_info_calls(self):
+        checksum = "0xcFCd00000000000000000000000000000000B122"
+        env = {**ENV, "HL_ADDRESS": f"  {checksum}  ",
+               "TESTNET_WALLET_ADDRESS": f"  {checksum}  "}
+        fake = FakeHTTP()
+        with patch("urllib.request.urlopen", fake):
+            ops_main.run("exit-monitor", env, dry_run=True, now=NOW)
+            ops_main.run("harbor-pnl", env, dry_run=True, now=NOW)
+            ops_main.run("c48-scoreboard", env, dry_run=True, now=NOW)
+        users = [b["body"].get("user") for b in fake.requests if b.get("body") and "user" in (b.get("body") or {})]
+        self.assertTrue(users)
+        self.assertTrue(all(u == checksum.lower() for u in users))
+        self.assertNotIn(checksum, users)
+
+    def test_checksum_rows_match_a_checksum_env_and_new_rows_are_lowercase(self):
+        checksum = "0xcFCd00000000000000000000000000000000B122"
+        stored = datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc)
+
+        class Cur:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def execute(self, sql, params=None):
+                self.sql = sql
+                self.params = params or ()
+
+            def fetchone(self):
+                sql = getattr(self, "sql", "")
+                if "max(trade_time)" in sql.lower() and "lower(" in sql.lower():
+                    if str(self.params[0]).lower() == checksum.lower():
+                        return (stored,)
+                return (None,)
+
+            def fetchall(self):
+                return []
+
+        class Conn:
+            def cursor(self):
+                return Cur()
+
+            def close(self):
+                pass
+
+        class Src:
+            def __init__(self):
+                self.hl_address = checksum.lower()
+
+            def hl(self, body):
+                kind = body.get("type")
+                if kind == "clearinghouseState":
+                    return {"ok": True, "data": {"marginSummary": {"accountValue": "1"}, "assetPositions": []}}
+                if kind == "allMids":
+                    return {"ok": True, "data": {}}
+                return {"ok": True, "data": []}
+
+            def cockpit(self, path):
+                return {"ok": True, "data": {"decisions": {"ok": True, "records": [], "history": []}}}
+
+        env = {**ENV, "HL_ADDRESS": checksum, "BRAIN_DATABASE_URL": "postgresql://brain"}
+        with patch("ops_cron.persist._connect", return_value=Conn()):
+            got = river_jobs.fetch_journal(Src(), NOW, env)
+        self.assertEqual(got["account"], checksum.lower())
+        self.assertEqual(got["window_start"], stored.isoformat())
+        fill = {"coin": "SOL", "dir": "Open Long", "side": "B", "px": "1", "sz": "1",
+                "time": 1_700_000_000_000, "tid": 7}
+        built = river_jobs.build_journal({
+            **got, "fills": {"ok": True, "data": [fill]}, "existing_fill_ids": set(), "fill_dedupe_ok": True,
+        }, NOW, env)
+        accounts = [v[-1].get("account") for spec in built["brain_rows"] for v in spec["values"]]
+        self.assertEqual(accounts, [checksum.lower()])
 
 
 if __name__ == "__main__":

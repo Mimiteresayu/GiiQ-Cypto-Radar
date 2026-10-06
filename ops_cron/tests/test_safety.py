@@ -51,6 +51,8 @@ class FakeHTTP:
             coin = (body.get("req") or {}).get("coin")
             table = {
                 "clearinghouseState": (self.inputs.get("hl_state") or {}).get("data") or {},
+                "spotClearinghouseState": (self.inputs.get("hl_spot") or {}).get("data") or {
+                    "balances": [{"coin": "USDC", "total": "0", "hold": "0"}]},
                 "frontendOpenOrders": (self.inputs.get("hl_orders") or {}).get("data") or [],
                 "userFillsByTime": (self.inputs.get("hl_fills") or {}).get("data") or [],
                 "userFills": (self.inputs.get("hl_fills") or {}).get("data") or [],

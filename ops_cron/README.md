@@ -180,7 +180,7 @@ C48 does not need `COCKPIT_URL` and does not call mainnet. It still requires `HL
 
 Spot USDC is `spotClearinghouseState` balances where `coin` is USDC (`total`). Perp `accountValue` is printed
 separately and is not used as cash. A failed spot or perp read is `未知`, never `0`.
-NAV = perp `marginSummary.accountValue` + spot USDC `total`, once (`hlparse.portfolio_nav`); a failed spot read is `NAV: 未核實` (margin% is `未核實` and the margin alert is suppressed).
+NAV = (spot USDC `total` - spot USDC `hold`) + perp `marginSummary.accountValue` (`hlparse.portfolio_nav`); a failed spot read is `NAV: 未核實` (margin% uses that NAV, prints `未核實`, and the margin alert is suppressed). `HL_ADDRESS` is lowercased once. An HL `null` body or non-200 is a failed read (`未知`), never an empty book; HTTP 429 is retried 3 times (1s/2s/4s).
 
 A Hard SL is a trigger/stop, reduce-only or `isPositionTpsl`, on the same coin, opposite the position,
 with the trigger on the losing side of the mark (long: trigger < mark, short: trigger > mark) and size

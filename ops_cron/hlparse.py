@@ -54,8 +54,7 @@ def raw_usdc(state: Any) -> Optional[float]:
     return num(ms.get("totalRawUsd"))
 
 
-def spot_usdc(state: Any) -> Optional[float]:
-    """Spot USDC `total` from spotClearinghouseState. None when the row is absent (not a guessed 0)."""
+def _usdc_balance(state: Any) -> Optional[dict]:
     if not isinstance(state, dict):
         return None
     balances = state.get("balances")
@@ -63,31 +62,67 @@ def spot_usdc(state: Any) -> Optional[float]:
         return None
     for row in balances:
         if isinstance(row, dict) and str(row.get("coin") or "").upper() == "USDC":
-            return num(row.get("total"))
+            return row
     return None
 
 
+def spot_usdc(state: Any) -> Optional[float]:
+    """Spot USDC `total` from spotClearinghouseState. None when the row is absent (not a guessed 0)."""
+    row = _usdc_balance(state)
+    return num(row.get("total")) if row else None
+
+
+def spot_usdc_hold(state: Any) -> Optional[float]:
+    """Spot USDC `hold`. 0 when the USDC row is present and hold is blank. None when the row is absent."""
+    row = _usdc_balance(state)
+    if not row:
+        return None
+    if row.get("hold") in (None, ""):
+        return 0.0
+    return num(row.get("hold"))
+
+
 NAV_UNVERIFIED = "NAV: 未核實"
-# NAV = perp marginSummary.accountValue + spot USDC total, once. Do not add totalRawUsd.
-# A failed spot read is unverified (None): on a unified account accountValue may already
-# include that USDC, so a perp-only fallback would double-count or under-count.
+# NAV = (spot USDC total - spot USDC hold) + perp marginSummary.accountValue.
+# On a unified account the spot total already includes position margin (hold), and
+# accountValue is that same margin, so adding the raw total double-counts.
 
 
 def portfolio_nav(perp_state: Any, spot_state: Any, *, perp_ok: bool, spot_ok: bool) -> dict:
     """NAV used by exit-monitor, daily-audit, Harbor, the BO report, and the C48 scoreboard.
 
-    Both reads must succeed. Spot USDC total is added once (0 is a real perp-only balance).
-    If the spot read fails, or the USDC total is missing, nav is None and the label is
-    `NAV: 未核實`. Callers then print margin% as 未核實 and skip the margin alert.
+    NAV = (spot USDC total - spot USDC hold) + perp accountValue. Both reads must succeed.
+    A blank hold on a present USDC row is 0 (perp-only cash). A failed spot read, or a
+    missing USDC total, leaves nav None (`NAV: 未核實`). Margin% uses this same NAV and
+    is suppressed while it is unverified. Do not add totalRawUsd.
     """
-    perp = account_value(perp_state) if perp_ok else None
-    spot = spot_usdc(spot_state) if spot_ok else None
-    if perp_ok and perp is not None and spot_ok and spot is not None:
-        nav = perp + spot
+    from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+
+    def _d(v: Any) -> Optional[Decimal]:
+        if v is None or v == "":
+            return None
+        try:
+            return Decimal(str(v))
+        except (InvalidOperation, ValueError):
+            return None
+
+    perp = _d(account_value(perp_state)) if perp_ok else None
+    row = _usdc_balance(spot_state) if spot_ok else None
+    spot = _d(row.get("total")) if row else None
+    if row and row.get("hold") in (None, ""):
+        hold = Decimal("0")
+    else:
+        hold = _d(row.get("hold")) if row else None
+    if perp is not None and spot is not None and hold is not None:
+        nav = float((spot - hold + perp).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
         from . import report
-        return {"nav": nav, "perp": perp, "spot": spot, "label": f"NAV: {report.usd(nav)}", "warning": None}
+        return {"nav": nav, "perp": float(perp), "spot": float(spot), "hold": float(hold),
+                "label": f"NAV: {report.usd(nav)}", "warning": None}
     warning = "NAV: 未核實 (spot USDC or perp accountValue unreadable; margin% not computed)"
-    return {"nav": None, "perp": perp, "spot": spot, "label": NAV_UNVERIFIED, "warning": warning}
+    return {"nav": None, "perp": float(perp) if perp is not None else None,
+            "spot": float(spot) if spot is not None else None,
+            "hold": float(hold) if hold is not None else None,
+            "label": NAV_UNVERIFIED, "warning": warning}
 
 
 def nav_from_envelopes(state_res: Any, spot_res: Any) -> dict:

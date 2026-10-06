@@ -364,9 +364,21 @@ def exit_monitor(inp: Dict[str, Any], now: datetime, cfg: Dict[str, Any]) -> Dic
             if p.get("code") not in SUPERSEDED_EXIT_HEALTH_CODES:
                 rep.problem(str(p.get("code")), p.get("coin"), str(p.get("msg") or ""), "cockpit_exit_health")
 
-    state, orders, fills = _data(inp.get("hl_state")), _data(inp.get("hl_orders")), _data(inp.get("hl_fills"))
+    state_env, orders_env = inp.get("hl_state") or {}, inp.get("hl_orders") or {}
+    state = _data(state_env) if isinstance(state_env.get("data"), dict) else None
+    orders = _data(orders_env) if isinstance(orders_env.get("data"), list) else None
+    fills_env = inp.get("hl_fills") or {}
+    fills = _data(fills_env)
+    if fills_env.get("ok") and not isinstance(fills, (list, dict)):
+        rep.problem("DATA_UNAVAILABLE", "hl_fills", "HL fills unreadable (null or unexpected body)", "hl_public")
+        fills = None
+    if state_env.get("ok") and not isinstance(state_env.get("data"), dict):
+        rep.problem("DATA_UNAVAILABLE", "hl_state", "HL account unreadable (null or unexpected body)", "hl_public")
+    if orders_env.get("ok") and not isinstance(orders_env.get("data"), list):
+        rep.problem("DATA_UNAVAILABLE", "hl_orders", "HL open orders unreadable (null or unexpected body)", "hl_public")
     mids = hlparse_mids(inp)
-    pos = check_hl_positions(rep, state, orders if isinstance(orders, list) else None, mids) if isinstance(state, dict) else []
+    book_ok = isinstance(state, dict)
+    pos = check_hl_positions(rep, state, orders if isinstance(orders, list) else None, mids) if book_ok else []
     since = now - timedelta(minutes=int(cfg.get("lookback_min", 65)))
     hl_today = [o for o in hl_orders_in_window(fills, hkt_day_start(now)) if _is_open(o)] if fills is not None else []
     if len(hl_today) > HL_MAX_NEW_ENTRIES_PER_DAY:
@@ -405,7 +417,7 @@ def exit_monitor(inp: Dict[str, Any], now: datetime, cfg: Dict[str, Any]) -> Dic
                f"{'-' if not bx_body.get('checked') else int(bool(bx_body.get('bx_live')))} · "
                f"closes {len(hl_closes) + len(bx_body.get('closes_since_last_run') or [])} · {hk.strftime('%H:%M HKT %d-%b')}")
     res = _result("exit_monitor", now, rep, ok_line, {
-        "hl": {"n_positions": len(pos), "positions": pos, "entries_today": len(hl_today),
+        "hl": {"readable": book_ok, "n_positions": len(pos), "positions": pos, "entries_today": len(hl_today),
                "closes_since_last_run": hl_closes},
         "bx": bx_body, "pending": pend_body, "cockpit_jobs": jobs,
         "exit_health_summary": eh.get("summary") if isinstance(eh, dict) else None,
@@ -641,7 +653,12 @@ def to_markdown(r: Dict[str, Any]) -> str:
                                           for p in r["problems"]] + [""]
     if r["check"] == "exit_monitor":
         hl, bx = r["hl"], r["bx"]
-        lines += [f"- HL positions: {hl['n_positions']} ({', '.join(p['coin'] for p in hl['positions']) or 'none'}); "
+        book = bool(hl.get("readable"))
+        if book:
+            pos_txt = f"{hl['n_positions']} ({', '.join(p['coin'] for p in hl['positions']) or 'none'})"
+        else:
+            pos_txt = "未知"
+        lines += [f"- HL positions: {pos_txt}; "
                   f"opening orders today: {hl['entries_today']}; closes since last run: {len(hl['closes_since_last_run'])}"]
         if bx.get("checked"):
             lines += [f"- BX: BX_LIVE={int(bool(bx['bx_live']))}, live_ready={bx['live_ready']}, breaker "

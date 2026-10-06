@@ -83,9 +83,10 @@ def build(inputs: Dict[str, Any], now: datetime, env: Dict[str, str]) -> Dict[st
     day = inputs.get("day") or now.astimezone(rules.HKT).strftime("%Y-%m-%d")
     problems: List[dict] = []
     state_res = inputs.get("hl_state") or {}
-    state = state_res.get("data") if state_res.get("ok") else None
-    if not state_res.get("ok"):
-        problems.append(report.problem("DATA_UNAVAILABLE", f"HL account unreadable: {state_res.get('error') or 'missing'}"))
+    state_ok = bool(state_res.get("ok")) and isinstance(state_res.get("data"), dict)
+    state = state_res.get("data") if state_ok else None
+    if not state_ok:
+        problems.append(report.problem("DATA_UNAVAILABLE", f"HL account unreadable: {state_res.get('error') or 'unreadable'}"))
     spot_res = inputs.get("hl_spot") if "hl_spot" in inputs else {"ok": False}
     nav_info = hlparse.nav_from_envelopes(state_res, spot_res)
     if nav_info.get("warning"):
@@ -117,8 +118,10 @@ def build(inputs: Dict[str, Any], now: datetime, env: Dict[str, str]) -> Dict[st
 
     dec = _decisions(inputs)
     mids = hlparse.mids((inputs.get("all_mids") or {}).get("data")) if (inputs.get("all_mids") or {}).get("ok") else {}
-    orders = (inputs.get("hl_orders") or {}).get("data") if (inputs.get("hl_orders") or {}).get("ok") else None
-    if (inputs.get("hl_orders") or {}).get("ok") is False:
+    orders_res = inputs.get("hl_orders") or {}
+    orders_ok = bool(orders_res.get("ok")) and isinstance(orders_res.get("data"), list)
+    orders = orders_res.get("data") if orders_ok else None
+    if "hl_orders" in inputs and not orders_ok:
         problems.append(report.problem("DATA_UNAVAILABLE", "HL open orders unreadable"))
     now_ms = int(now.timestamp() * 1000)
 
@@ -148,7 +151,7 @@ def build(inputs: Dict[str, Any], now: datetime, env: Dict[str, str]) -> Dict[st
             f"uPnL {report.usd(p.get('unrealized_pnl'))} decider {who}\n"
             f"  soft (1H Lower) {stops.fmt_level(both['soft'])}\n"
             f"  hard (4H Filter) {stops.fmt_level(both['hard'])}\n"
-            f"  {hlparse.fmt_hard_sl(resting or {'ok': False})}"
+            f"  {hlparse.fmt_hard_sl(resting) if isinstance(orders, list) else 'Hard SL: 未知'}"
         )
 
     close_lines = []
@@ -216,7 +219,7 @@ def build(inputs: Dict[str, Any], now: datetime, env: Dict[str, str]) -> Dict[st
         "",
         "## Positions",
         "",
-        *(pos_lines or ["- none"]),
+        *(pos_lines or (["- 未知"] if not state_ok else ["- none"])),
         "",
         "## Yesterday closes",
         "",

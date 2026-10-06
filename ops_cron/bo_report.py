@@ -77,16 +77,17 @@ def build(inputs: Dict[str, Any], now: datetime, env: Dict[str, str]) -> Dict[st
     session = "morning" if now.astimezone(rules.HKT).hour < 12 else "evening"
     problems: List[dict] = []
     state_res = inputs.get("hl_state") or {}
-    state = state_res.get("data") if state_res.get("ok") else None
-    if not state_res.get("ok"):
-        problems.append(report.problem("DATA_UNAVAILABLE", f"HL account unreadable: {state_res.get('error') or 'missing'}"))
+    state_ok = bool(state_res.get("ok")) and isinstance(state_res.get("data"), dict)
+    state = state_res.get("data") if state_ok else None
+    if not state_ok:
+        problems.append(report.problem("DATA_UNAVAILABLE", f"HL account unreadable: {state_res.get('error') or 'unreadable'}"))
     spot_res = inputs.get("hl_spot") if "hl_spot" in inputs else {"ok": False}
     nav_info = hlparse.nav_from_envelopes(state_res, spot_res)
     if nav_info.get("warning"):
         report.warn_nav_unverified(nav_info["warning"])
     nav = nav_info["nav"]
     usdc = nav_info["spot"]
-    margin = hlparse.margin_used(state) if state_res.get("ok") else None
+    margin = hlparse.margin_used(state) if state_ok else None
     if nav and margin is not None and nav > 0 and (margin / nav * 100.0) > stops.MARGIN_CAP_PCT:
         problems.append(report.problem(
             "MARGIN_HIGH", f"margin {margin / nav * 100:.1f}% of NAV is above the {stops.MARGIN_CAP_PCT:.0f}% cap"))
@@ -113,8 +114,10 @@ def build(inputs: Dict[str, Any], now: datetime, env: Dict[str, str]) -> Dict[st
 
     pos = hlparse.positions(state)
     mids = hlparse.mids((inputs.get("all_mids") or {}).get("data")) if (inputs.get("all_mids") or {}).get("ok") else {}
-    orders = (inputs.get("hl_orders") or {}).get("data") if (inputs.get("hl_orders") or {}).get("ok") else None
-    if (inputs.get("hl_orders") or {}).get("ok") is False:
+    orders_res = inputs.get("hl_orders") or {}
+    orders_ok = bool(orders_res.get("ok")) and isinstance(orders_res.get("data"), list)
+    orders = orders_res.get("data") if orders_ok else None
+    if "hl_orders" in inputs and not orders_ok:
         problems.append(report.problem("DATA_UNAVAILABLE", "HL open orders unreadable"))
     now_ms = int(now.timestamp() * 1000)
     blocks = []
@@ -138,7 +141,7 @@ def build(inputs: Dict[str, Any], now: datetime, env: Dict[str, str]) -> Dict[st
             f"entry {p.get('entry_px')} mark {mark} unrealized {report.usd(p.get('unrealized_pnl'))}",
             f"soft exit (1H close < 1H Lower): {stops.fmt_level(both['soft'])}",
             f"Hard SL (4H Filter level): {stops.fmt_level(both['hard'])}",
-            hlparse.fmt_hard_sl(resting or {"ok": False}),
+            hlparse.fmt_hard_sl(resting) if isinstance(orders, list) else "Hard SL: 未知",
             *who,
         ]))
 
@@ -155,7 +158,7 @@ def build(inputs: Dict[str, Any], now: datetime, env: Dict[str, str]) -> Dict[st
         "",
         "## Positions",
         "",
-        *(blocks or ["- none"]),
+        *(blocks or (["- 未知"] if not state_ok else ["- none"])),
         "",
         "## Anomalies",
         "",

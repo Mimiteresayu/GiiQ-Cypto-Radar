@@ -13,10 +13,10 @@ JOBS = ("desk-missing", "harbor-pnl", "bo-report", "c48-scoreboard", "desk-veto"
 def make_sources(env: Mapping[str, str], testnet: bool = False) -> sources.Sources:
     timeout = float(env.get("OPS_HTTP_TIMEOUT_S") or 20)
     if testnet:
-        addr = env.get("TESTNET_WALLET_ADDRESS") or ""
+        addr = sources.normalize_hl_address(env.get("TESTNET_WALLET_ADDRESS") or "")
         url = env.get("HL_TESTNET_INFO_URL") or "https://api.hyperliquid-testnet.xyz/info"
     else:
-        addr = env.get("HL_ADDRESS") or ""
+        addr = sources.normalize_hl_address(env.get("HL_ADDRESS") or "")
         url = env.get("HL_INFO_URL") or "https://api.hyperliquid.xyz/info"
     return sources.Sources(
         env.get("COCKPIT_URL") or "", env.get("COCKPIT_AI_KEY") or "", addr, url, timeout,

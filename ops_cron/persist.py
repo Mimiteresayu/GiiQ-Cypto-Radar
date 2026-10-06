@@ -135,12 +135,12 @@ def insert_rows(dsn: str, table: str, columns: Sequence[str], rows: Sequence[Seq
 JOURNAL_FILL_WATERMARK_SQL = (
     "SELECT MAX(trade_time) FROM raw.river_trade_log "
     "WHERE report->>'kind' = 'fill' "
-    "AND COALESCE(report->>'account', %s) = %s"
+    "AND lower(report->>'account') = lower(%s)"
 )
 JOURNAL_FILL_IDS_SQL = (
     "SELECT report->>'fill_id' FROM raw.river_trade_log "
     "WHERE report->>'kind' = 'fill' AND report->>'fill_id' IS NOT NULL "
-    "AND COALESCE(report->>'account', %s) = %s"
+    "AND lower(report->>'account') = lower(%s)"
 )
 
 
@@ -163,7 +163,7 @@ def last_journal_fill_time(dsn: str, account: str) -> Optional[datetime]:
         conn = _connect(dsn)
         try:
             with conn.cursor() as cur:
-                cur.execute(JOURNAL_FILL_WATERMARK_SQL, (account, account))
+                cur.execute(JOURNAL_FILL_WATERMARK_SQL, (account,))
                 row = cur.fetchone()
                 return _as_utc(row[0] if row else None)
         finally:
@@ -180,7 +180,7 @@ def existing_journal_fill_ids(dsn: str, account: str) -> Optional[set]:
         conn = _connect(dsn)
         try:
             with conn.cursor() as cur:
-                cur.execute(JOURNAL_FILL_IDS_SQL, (account, account))
+                cur.execute(JOURNAL_FILL_IDS_SQL, (account,))
                 return {r[0] for r in cur.fetchall() if r and r[0]}
         finally:
             conn.close()

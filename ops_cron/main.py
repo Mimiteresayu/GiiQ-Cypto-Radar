@@ -81,10 +81,11 @@ def build_report(check: str, env: Mapping[str, str], fixture: Optional[str] = No
         now = now or _parse_now(fx.get("now")) or sources.utcnow()
     else:
         now = now or sources.utcnow()
-        if not (env.get("HL_ADDRESS") or "").strip():
+        addr = sources.normalize_hl_address(env.get("HL_ADDRESS") or "")
+        if not addr:
             return _missing_hl_address(check, now)
         src = sources.Sources(env.get("COCKPIT_URL") or "", env.get("COCKPIT_AI_KEY") or "",
-                              env.get("HL_ADDRESS") or "", env.get("HL_INFO_URL") or "https://api.hyperliquid.xyz/info",
+                              addr, env.get("HL_INFO_URL") or "https://api.hyperliquid.xyz/info",
                               cfg["timeout_s"])
         if check == "exit-monitor":
             inputs = sources.exit_monitor_inputs(src, now, cfg["lookback_min"], cfg["bx_enabled"])

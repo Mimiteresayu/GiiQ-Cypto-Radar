@@ -6,6 +6,7 @@ Every call returns {"ok": bool, "data": <json>, "error": str, "http": int|None} 
 from __future__ import annotations
 
 import json
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -18,7 +19,18 @@ HL_READ_TYPES = frozenset({
     "userFillsByTime", "userFunding", "candleSnapshot", "allMids",
 })
 _HL_NO_USER = frozenset({"candleSnapshot", "allMids"})
+_HL_DICT_TYPES = frozenset({"clearinghouseState", "spotClearinghouseState", "allMids"})
+_HL_LIST_TYPES = frozenset({
+    "frontendOpenOrders", "userFills", "userFillsByTime", "userFunding", "candleSnapshot",
+})
+# First try, then up to three retries. Wait 1s, 2s, 4s between them.
+_HL_429_BACKOFF_S = (1, 2, 4)
 HL_FILLS_LOOKBACK_DAYS = 30
+
+
+def normalize_hl_address(raw: Optional[str]) -> str:
+    """HL info returns null for the checksum-case address. One lowercase form for every call and the journal."""
+    return (raw or "").strip().lower()
 
 
 def _res(ok: bool, data: Any = None, error: str = "", http: Optional[int] = None) -> Dict[str, Any]:
@@ -40,12 +52,21 @@ def _call(req: urllib.request.Request, timeout: float) -> Dict[str, Any]:
         return _res(False, error=f"{type(e).__name__}: {str(e)[:160]}")
 
 
+def _hl_body_ok(kind: str, data: Any) -> bool:
+    """null and the wrong JSON shape are a failed read, not an empty book."""
+    if kind in _HL_DICT_TYPES:
+        return isinstance(data, dict)
+    if kind in _HL_LIST_TYPES:
+        return isinstance(data, list)
+    return data is not None
+
+
 class Sources:
     def __init__(self, cockpit_url: str, ai_key: str, hl_address: str, hl_info_url: str, timeout: float = 20.0,
                  bx_base: str = "https://fapi.bitunix.com"):
         self.cockpit_url = (cockpit_url or "").rstrip("/")
         self.ai_key = ai_key or ""
-        self.hl_address = hl_address or ""
+        self.hl_address = normalize_hl_address(hl_address)
         self.hl_info_url = hl_info_url
         self.timeout = timeout
         self.bx_base = bx_base or "https://fapi.bitunix.com"
@@ -60,11 +81,27 @@ class Sources:
     def hl(self, body: Dict[str, Any]) -> Dict[str, Any]:
         if body.get("type") not in HL_READ_TYPES:
             raise ValueError(f"HL info type {body.get('type')!r} is not an allowed read type")
-        if body.get("type") not in _HL_NO_USER and not self.hl_address:
+        kind = str(body.get("type") or "")
+        if kind not in _HL_NO_USER and not self.hl_address:
             return _res(False, error="HL_ADDRESS not set")
-        req = urllib.request.Request(self.hl_info_url, data=json.dumps(body).encode(), method="POST",
-                                     headers={"Content-Type": "application/json"})
-        return _call(req, self.timeout)
+        sent = dict(body)
+        if kind not in _HL_NO_USER:
+            sent["user"] = self.hl_address
+        last = _res(False, error="HL info not called")
+        for attempt in range(len(_HL_429_BACKOFF_S) + 1):
+            req = urllib.request.Request(self.hl_info_url, data=json.dumps(sent).encode(), method="POST",
+                                         headers={"Content-Type": "application/json"})
+            last = _call(req, self.timeout)
+            if last.get("http") != 429 or attempt == len(_HL_429_BACKOFF_S):
+                break
+            time.sleep(_HL_429_BACKOFF_S[attempt])
+        if not last.get("ok") or last.get("http") not in (None, 200):
+            if last.get("ok") and last.get("http") not in (None, 200):
+                return _res(False, error=f"HTTP {last.get('http')}", http=last.get("http"))
+            return last
+        if not _hl_body_ok(kind, last.get("data")):
+            return _res(False, error="HL info unreadable (null or unexpected body)", http=last.get("http"))
+        return last
 
     def cockpit_public(self, path: str) -> Dict[str, Any]:
         """GET a cockpit route that does not take the AI key (for example /api/public/radar)."""

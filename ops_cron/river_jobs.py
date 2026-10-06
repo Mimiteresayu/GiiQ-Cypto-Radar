@@ -39,8 +39,9 @@ def build_scoreboard(inputs: Dict[str, Any], now: datetime, env: Dict[str, str])
         return report.shell("river_c48_ft_score", now, "ok", "C48-3 window closed", [], None, md, closed=True)
     problems: List[dict] = []
     state_res, fill_res = inputs.get("state") or {}, inputs.get("fills") or {}
-    if not state_res.get("ok"):
-        problems.append(report.problem("DATA_UNAVAILABLE", f"testnet account unreadable: {state_res.get('error') or 'missing'}"))
+    state_ok = bool(state_res.get("ok")) and isinstance(state_res.get("data"), dict)
+    if not state_ok:
+        problems.append(report.problem("DATA_UNAVAILABLE", f"testnet account unreadable: {state_res.get('error') or 'unreadable'}"))
     if not fill_res.get("ok"):
         problems.append(report.problem("DATA_UNAVAILABLE", f"testnet fills unreadable: {fill_res.get('error') or 'missing'}"))
     spot_res = inputs.get("spot") if "spot" in inputs else {"ok": False}
@@ -51,7 +52,7 @@ def build_scoreboard(inputs: Dict[str, Any], now: datetime, env: Dict[str, str])
     nav_start = stops.num((inputs.get("nav_start") or env.get("C48_NAV_START") or "").strip() or None)
     if nav_start is None:
         problems.append(report.problem("DATA_UNAVAILABLE", "C48_NAV_START is unset; drawdown is 未知"))
-    pos = hlparse.positions(state_res.get("data") if state_res.get("ok") else None)
+    pos = hlparse.positions(state_res.get("data") if state_ok else None)
     fills = hlparse.fills(fill_res.get("data")) if fill_res.get("ok") else []
     net = hlparse.sum_pnl(fills) if fill_res.get("ok") else None
     margin = hlparse.margin_used(state_res.get("data") if state_res.get("ok") else None)
@@ -98,7 +99,13 @@ def build_scoreboard(inputs: Dict[str, Any], now: datetime, env: Dict[str, str])
                 hard_hit = True
     if hard_hit:
         problems.append(report.problem("HARD_SL_HIT", "a testnet close went through the ~3% price stop"))
-    orders = (inputs.get("orders") or {}).get("data") if (inputs.get("orders") or {}).get("ok") else None
+    orders_res = inputs.get("orders")
+    orders = None
+    if isinstance(orders_res, dict):
+        if orders_res.get("ok") and isinstance(orders_res.get("data"), list):
+            orders = orders_res.get("data")
+        else:
+            problems.append(report.problem("DATA_UNAVAILABLE", "testnet open orders unreadable"))
     for p in pos:
         mark = abs(p["position_value"] / p["szi"]) if p.get("position_value") and p.get("szi") else None
         if isinstance(orders, list) and not hlparse.hard_sl_status(
@@ -392,7 +399,8 @@ def fetch_journal(src, now: datetime, env: Dict[str, str]) -> Dict[str, Any]:
     from . import persist
     day = now.astimezone(rules.HKT).strftime("%Y-%m-%d")
     yday = (now.astimezone(rules.HKT) - timedelta(days=1)).strftime("%Y-%m-%d")
-    account = (env.get("HL_ADDRESS") or getattr(src, "hl_address", "") or "").strip()
+    from .sources import normalize_hl_address
+    account = normalize_hl_address(env.get("HL_ADDRESS") or getattr(src, "hl_address", "") or "")
     dsn = persist.brain_dsn(env)
     last = persist.last_journal_fill_time(dsn, account) if dsn else None
     known = persist.existing_journal_fill_ids(dsn, account) if dsn else set()
@@ -469,7 +477,8 @@ def build_journal(inputs: Dict[str, Any], now: datetime, env: Dict[str, str]) ->
     historical = inputs.get("historical_orders")
     rr = (inputs.get("run_report") or {}).get("data") if (inputs.get("run_report") or {}).get("ok") else None
     exit_actions = (rr.get("exit_actions") if isinstance(rr, dict) else None) or []
-    account = (env.get("HL_ADDRESS") or inputs.get("account") or "").strip()
+    from .sources import normalize_hl_address
+    account = normalize_hl_address(env.get("HL_ADDRESS") or inputs.get("account") or "")
     rows = []
     seen = set()
     seen_ids = set(known_ids or [])
