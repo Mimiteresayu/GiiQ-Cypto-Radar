@@ -86,11 +86,12 @@ from exec_common import (  # noqa: E402
     order_qty,
     round_price,
     coin_notional_ok,
-    daily_entry_cap_ok,
+    count_entries_today_for_reporting,
     total_margin_nav_ok,
     FALLBACK_MARGIN_PCT,
     MAX_COIN_NOTIONAL_NAV_PCT,
     MAX_TOTAL_MARGIN_NAV_PCT,
+    hkt_date,
 )
 
 from pending_entries import band as pending_band  # noqa: E402
@@ -108,16 +109,6 @@ except ImportError as e:  # pragma: no cover
     sys.exit(1)
 
 HL_ADDRESS = os.environ.get("HL_ADDRESS", "0xcFCda0F8576a268BaA17935368081F4e687dB122").strip()
-
-# LEGACY (GIIQ-SoT-1) size bands, no longer used for sizing: GIIQ-SoT-2 = exec_common.size_by_margin
-SIZE_BANDS = {
-    "P": (4.0, 8.0),              # Primary only
-    "P+N": (8.0, 12.0),           # Primary + Narrative
-    "P+CR": (8.0, 12.0),          # Primary + Cemetery Revival
-    "P+N+CR": (10.0, 15.0),       # Primary + Narrative + Cemetery Revival
-    "Continuation": (2.0, 4.0),   # Continuation (no daily cap)
-}
-BTC_BEARISH_FIXED_SIZE_PCT = 4.0
 
 
 def _entry_slippage_pct() -> float:
@@ -194,19 +185,6 @@ def _user_abstraction(hl: Any) -> Optional[str]:
         return None
 
 
-def _clamp_size_leverage(candidate: dict, decision: dict, btc_bearish: bool,
-                         coin_max_leverage: Optional[float] = None) -> Tuple[float, int]:
-    """Clamp size to SoT band and leverage to 1-5x and the coin's HL maxLeverage."""
-    try:
-        size_pct = float(decision.get("size_pct") if decision.get("size_pct") is not None else 4.0)
-    except (TypeError, ValueError):
-        size_pct = 4.0
-    if btc_bearish:
-        size_pct = BTC_BEARISH_FIXED_SIZE_PCT
-    band = SIZE_BANDS["Continuation"] if candidate.get("type") == "Continuation" else SIZE_BANDS["P"]
-    size_pct = max(band[0], min(band[1], size_pct))
-    leverage = clamp_leverage(decision.get("leverage", 2.0), coin_max_leverage)
-    return size_pct, leverage
 
 
 def _check_liq_beyond_sl(entry_price: float, hard_sl: float, estimated_liq_price: Optional[float]) -> bool:
@@ -357,11 +335,6 @@ def _execute(
         result.update(status="error", message="Equity is 0 / unavailable")
         return result
 
-    btc_bearish = False
-    btc_4h = next((r for r in radar_4h.get("rows", []) if r.get("symbol") == "BTC"), None)
-    if btc_4h and btc_4h.get("close") and btc_4h.get("filter") and btc_4h["close"] < btc_4h["filter"]:
-        btc_bearish = True
-
     liq_safe, unsafe = _check_all_positions_liq_safe(account["positions"], radar_1h, radar_4h)
     if not liq_safe:
         result.update(status="fail_closed", message=f"Unsafe liquidation prices for: {', '.join(unsafe)}")
@@ -382,15 +355,22 @@ def _execute(
             return result
 
     slip = _entry_slippage_pct()
-    try:  # GIIQ-SoT-3 daily cap counts real fills already made today (08:55 + pending fills)
+    try:  # GIIQ-SoT-5: daily cap removed, count kept for reporting only
         entries_today = count_entries_today(now, dry_run=False)
     except Exception:  # noqa: BLE001
         entries_today = 0
     entries_run = 0
     result["entries_today_before"] = entries_today
-    for cand in candidates:
-        symbol = cand.get("symbol", "")
-        if symbol not in approved:
+    
+    # GIIQ-SoT-5: process approvals in desk priority order (Chase first), then candidate order
+    approved_list = sorted(approved, key=lambda s: (
+        0 if (next((c for c in candidates if c.get("symbol") == s), {}) or {}).get("type") == "Chase" else 1,
+        s
+    ))
+    
+    for symbol in approved_list:
+        cand = next((c for c in candidates if c.get("symbol") == symbol), None)
+        if not cand:
             continue
         decision = decisions.get(symbol, {})
         entry_type = cand.get("type", "Base")
@@ -402,9 +382,8 @@ def _execute(
 
         is_base = bool(cand.get("is_base")) or entry_type == "Base"
         fallback = str(decision.get("source") or "") == "fallback"
-        if fallback and not is_base:
-            skip("fallback decision: Base only (no Chase / pending add-on)")
-            continue
+        # GIIQ-SoT-5: fallback approves every executable candidate at floor size (not just Base)
+        # Chase will still become pending, not an immediate entry
         if not is_base and entry_type == "Chase":
             if disabled:
                 why = (f"Chase acknowledged, no entry: CONTINUATION/ADD_ON pending disabled ({DISABLED_REASON}; "
@@ -474,14 +453,11 @@ def _execute(
             continue
         sl_dist_pct = (mid - hard_sl) / mid * 100.0
         if sl_dist_pct < MIN_SL_DIST_PCT:
-            skip(f"SL distance {sl_dist_pct:.2f}% from live mid < {MIN_SL_DIST_PCT}%", size_pct=size_pct, leverage=leverage)
+            skip(f"SL distance {sl_dist_pct:.2f}% from live mid < {MIN_SL_DIST_PCT:g}%", size_pct=size_pct, leverage=leverage)
             continue
 
         limit_px = round_price(mid * (1 + slip / 100.0), sz_dec)
-        ok_day, why_day = daily_entry_cap_ok(entries_today, entries_run)
-        if not ok_day:
-            skip(why_day)
-            continue
+        # GIIQ-SoT-5: daily entry cap removed
         ai_size = FALLBACK_MARGIN_PCT if fallback else decision.get("size_pct")
         sz = size_by_margin(equity, limit_px, hard_sl, coin_max, ai_size, decision.get("leverage"), tier=tier)
         if not sz["ok"]:
@@ -529,7 +505,7 @@ def _execute(
             "margin_usd": round(margin_usd, 2), "leverage": leverage, "margin_mode": "isolated",
             "notional_usd": round(notional, 2), "hard_sl": hard_sl, "hard_sl_label": sl_label,
             "sl_dist_pct": round(sl_dist_pct, 3), "estimated_liq": est_liq, "coin_max_leverage": coin_max,
-            "margin_util_after_pct": round(util, 2), "btc_bearish": btc_bearish,
+            "margin_util_after_pct": round(util, 2),
             "entry_upper_ref": upper_ref, "entry_upper_label": upper_label,
             "risk_margin_pct": round(margin_usd / equity * 100.0, 3), "sizing_notes": sz.get("notes"),
             "ai_size_pct": decision.get("size_pct"), "ai_leverage": decision.get("leverage"),
@@ -554,11 +530,16 @@ def _execute(
         # ---------------- LIVE
         from hl_exec import enter_long_with_sl
         _log(f"LIVE placing: BUY {symbol} qty={qty} IOC limit={limit_px} {leverage}x isolated, Hard SL {hard_sl}")
-        r = enter_long_with_sl(hl, symbol, qty, limit_px, leverage, hard_sl, sz_dec)
+        r = enter_long_with_sl(hl, symbol, qty, limit_px, leverage, hard_sl, sz_dec, coin_max_leverage=coin_max, now=now)
         intent["live_result"] = r
         st = r.get("status")
         if st == "executed":
-            cum_margin += (r.get("filled_sz") or qty) * (r.get("avg_px") or limit_px) / leverage
+            # GIIQ-SoT-5: use actual_margin_used from reconciliation if available
+            actual_margin = r.get("actual_margin_used")
+            if actual_margin is not None:
+                cum_margin += actual_margin
+            else:
+                cum_margin += (r.get("filled_sz") or qty) * (r.get("avg_px") or limit_px) / leverage
             entries_run += 1
             result["executed"].append(intent)
             log_entry(trade_id=trade_id, symbol=symbol, entry_type=entry_type, tier=tier,

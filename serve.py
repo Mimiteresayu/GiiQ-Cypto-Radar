@@ -1873,7 +1873,8 @@ def _scheduled_dims(manual: bool = False, mode: str = "snapshot") -> dict:
 
 
 def build_fallback_decisions(cd: dict, now: datetime | None = None) -> tuple[list, str]:
-    """Fallback decisions from today's candidates: Base -> approve at 2% margin, Chase -> veto.
+    """GIIQ-SoT-5: Fallback decisions approve every executable candidate at floor size (2% margin).
+    Chase will still become pending, not an immediate entry.
     Returns (decisions, why_not) — decisions empty with a reason when candidates are unusable."""
     now = now or datetime.now(timezone.utc)
     gen = parse_ts((cd or {}).get("generated_at"))
@@ -1886,11 +1887,11 @@ def build_fallback_decisions(cd: dict, now: datetime | None = None) -> tuple[lis
         sym = str(c.get("symbol") or "").upper()
         if not sym:
             continue
-        base = bool(c.get("is_base")) or c.get("type") == "Base"
-        out.append({"symbol": sym, "decision": "approve" if base else "veto", "type": "BASE" if base else "CHASE",
-                    "size_pct": 2.0 if base else 0, "leverage": None if base else 0,
-                    "reason": ("RAILWAY_FALLBACK: no Claude POST by 08:50 - Base only, 2% margin" if base
-                               else "RAILWAY_FALLBACK: no Claude POST - Chase not allowed in fallback")})
+        entry_type = c.get("type", "Base")
+        # Approve all candidates at floor size
+        out.append({"symbol": sym, "decision": "approve", "type": entry_type,
+                    "size_pct": 2.0, "leverage": 2,  # floor size: 2% margin, 2x leverage
+                    "reason": f"RAILWAY_FALLBACK: no Claude POST by 08:50 - all candidates at floor size (2%, 2x)"})
     return out, ""
 
 
