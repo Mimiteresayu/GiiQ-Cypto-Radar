@@ -1,0 +1,38 @@
+# C48-3 locked copy of upstream bots/btc_conservative.yaml
+# (chainstacklabs/hyperliquid-trading-bot @ 7e930aa6b0d296f029943834c2133beff6174d80).
+# HARD LOCKS (Cove gate) are enforced by assert_locks.py at build time and at startup;
+# edits that break them fail the Docker build. Leverage is not a YAML field upstream:
+# giiq_entrypoint.py sets BTC to 2x isolated and aborts if measured leverage > 3.
+
+name: "c48_3_btc_grid_locked"
+active: true
+
+exchange:
+  type: "hyperliquid"
+  testnet: true                # LOCK: must be true (upstream decides network from this field only)
+
+account:
+  max_allocation_pct: 2.0      # LOCK: <= 2 (% of real testnet equity, see GIIQ_NAV_USD in README)
+
+grid:
+  symbol: "BTC"                # LOCK: BTC only
+  levels: 10                   # upstream value; HL $10.5 min notional shrinks this at small equity
+  price_range:
+    mode: "auto"
+    auto:
+      range_pct: 5.0           # upstream value (+/-5%)
+
+risk_management:
+  stop_loss_enabled: true      # LOCK: must be true
+  stop_loss_pct: 6.0           # LOCK: 4-8. Upstream SL is margin-relative (ROE); at 2x this is ~3%
+                               # adverse price move from entry, inside the +/-5% grid range.
+  take_profit_enabled: false
+  take_profit_pct: 25.0
+  tpsl_mode: "polling"         # LOCK: polling is the mode where upstream StopLossRule is active
+  max_drawdown_pct: 4.0        # LOCK: <= 4
+  max_position_size_pct: 8.0   # LOCK: <= 8
+  rebalance:
+    price_move_threshold_pct: 12.0  # upstream value
+
+monitoring:
+  log_level: "INFO"
