@@ -13,6 +13,9 @@ FAIL CLOSED — a live ORDER is sent only when every one of these holds (live_ga
 Per trade (check_entry):
   * pilot tier only: BX-only crypto, 24h vol >= $2M, spread < 10 bp (re-measured live), gc_tf 1d or 4h
     (no 1H signals, no watch tier, no stock / commodity / index contracts)
+  * trial tier (BX_TRIAL_TIER_ENABLED=1, default off; needs MMT): watch-tier BX-only crypto with 24h vol
+    BX_TRIAL_MIN_VOL_USD..$2M and spread < BX_TRIAL_MAX_SPREAD_BP; margin x BX_TRIAL_SIZE_MULT (<= 1), at most
+    BX_TRIAL_MAX_PER_DAY trial fills per HKT day, liquidity exit at the trial volume floor; every other rule holds
   * isolated margin 1% NAV, 3x; notional <= 0.5% of 24h volume (downsized, skipped below the minimum qty)
   * max 2 open BX positions, max 1 new BX entry per HKT day (pending Chase fills count)
   * Hard SL (tier rule, 4H radar) >= 1.5% below the price; estimated isolated liquidation price below the
@@ -271,25 +274,39 @@ def decisions_path(day: str) -> Path:
     return OUT_DIR / "bx_decisions" / f"bx_decisions_{day.replace('-', '')}.json"
 
 
-def pilot_eligible(meta: dict) -> Tuple[bool, str]:
+def pilot_tier(meta: dict, trial: Optional[dict] = None) -> Tuple[Optional[str], str]:
+    """-> ('tradeable' | 'trial', '') or (None, first failing reason). trial = U.trial_config() (None -> env)."""
+    trial = trial if trial is not None else U.trial_config()
     if meta.get("ex") != "BX":
-        return False, "listed on HL (HL path only)"
+        return None, "listed on HL (HL path only)"
     if meta.get("asset_class") != "crypto":
-        return False, f"asset class {meta.get('asset_class')} (no stocks / commodities / indices)"
+        return None, f"asset class {meta.get('asset_class')} (no stocks / commodities / indices)"
+    tier = "tradeable"
     if meta.get("liq_tier") != "tradeable":
-        return False, f"tier {meta.get('liq_tier')} (entry tier only)"
-    if (meta.get("vol24h_usd") or 0) < VOL_MIN:
-        return False, "24h volume < $2M"
-    sp = _f(meta.get("spread_bp"))
-    if sp is None or sp >= SPREAD_MAX_BP:
-        return False, f"spread {sp} bp not < {SPREAD_MAX_BP:g}"
+        why_not = U.trial_fail(meta, trial)
+        if why_not is not None:
+            if trial.get("enabled") and meta.get("liq_tier") == "watch":
+                return None, f"tier watch (entry tier only; trial: {why_not})"
+            return None, f"tier {meta.get('liq_tier')} (entry tier only)"
+        tier = "trial"
+    else:
+        if (meta.get("vol24h_usd") or 0) < VOL_MIN:
+            return None, "24h volume < $2M"
+        sp = _f(meta.get("spread_bp"))
+        if sp is None or sp >= SPREAD_MAX_BP:
+            return None, f"spread {sp} bp not < {SPREAD_MAX_BP:g}"
     if meta.get("gc_tf") not in LIVE_GC_TFS:
-        return False, f"GC timeframe {meta.get('gc_tf')} (no 1H signals)"
+        return None, f"GC timeframe {meta.get('gc_tf')} (no 1H signals)"
     if meta.get("api_supported") is False:
-        return False, "API trading not supported on this contract"
+        return None, "API trading not supported on this contract"
     if meta.get("max_leverage") is not None and (_f(meta.get("max_leverage")) or 0) < LEVERAGE:
-        return False, "max leverage < 3x"
-    return True, ""
+        return None, "max leverage < 3x"
+    return tier, ""
+
+
+def pilot_eligible(meta: dict, trial: Optional[dict] = None) -> Tuple[bool, str]:
+    tier, why = pilot_tier(meta, trial)
+    return tier is not None, why
 
 
 def build_candidates(now: Optional[datetime] = None) -> dict:
@@ -299,13 +316,14 @@ def build_candidates(now: Optional[datetime] = None) -> dict:
     now = now or _now()
     meta_all = {m["bx_symbol"]: m for m in (bx_radar.load_meta().get("scanned") or [])}
     r1d, r4h = (S._rows_by_symbol(bx_radar.load_radar(tf)) for tf in ("1d", "4h"))
+    trial = U.trial_config()
     out, skipped = [], []
     for sym, m in meta_all.items():
         s = S.classify_signal(m, r1d.get(sym), r4h.get(sym), None)
         if not s or s["gc_tf"] not in LIVE_GC_TFS:
             continue
-        ok, why = pilot_eligible(m)
-        if not ok:
+        ptier, why = pilot_tier(m, trial)
+        if ptier is None:
             skipped.append({"symbol": sym, "type": s["type"], "reason": why})
             continue
         row1, row4 = r1d.get(sym) or {}, r4h.get(sym) or {}
@@ -330,10 +348,20 @@ def build_candidates(now: Optional[datetime] = None) -> dict:
             "asset_age": m.get("asset_age"),
             "size_rule": f"{MARGIN_PCT_NAV:g}% NAV margin, {LEVERAGE}x, <= 0.5% of 24h vol",
         })
+        if trial["enabled"]:
+            mult = trial["size_mult"] if ptier == "trial" else 1.0
+            out[-1].update(liq_tier=ptier, size_mult=mult)
+            if ptier == "trial":
+                out[-1]["size_rule"] = (f"TRIAL: {mult:g} x ({MARGIN_PCT_NAV:g}% NAV margin), {LEVERAGE}x, "
+                                        f"<= 0.5% of 24h vol; max {trial['max_per_day']} trial entry per day")
+                _log(f"[BX_TRIAL] candidate {sym} {s['type']} vol24h={m.get('vol24h_usd')} "
+                     f"spread_bp={m.get('spread_bp')} size_mult={mult:g}")
     doc = {"date": hkt_date(now), "generated_at": now.isoformat(), "ex": "BX", "candidates": out,
            "not_eligible": skipped[:100],
            "rules": {"veto": ["V1", "V2", "V3", "V5"], "approve_max": MAX_NEW_PER_DAY,
                      "no_fallback": "no approval -> no order"}}
+    if trial["enabled"] or trial["invalid"]:
+        doc["trial"] = {**trial, "n": sum(1 for c in out if c.get("liq_tier") == "trial")}
     _write(candidates_path(), doc)
     return doc
 
@@ -406,31 +434,44 @@ def liq_price_long(entry: float, leverage: float, mmr: float) -> float:
 
 def check_entry(cand: dict, meta: dict, live: dict, nav: Optional[float], available: Optional[float],
                 open_live: List[dict], entries_today: int, approval: Optional[dict],
-                tiers: List[dict]) -> Dict[str, Any]:
-    """Pure pilot checks for one entry. live = {price, ask, bid, spread_bp, vol24h}. -> {ok, reason, plan}."""
+                tiers: List[dict], trial_today: int = 0, trial: Optional[dict] = None) -> Dict[str, Any]:
+    """Pure pilot checks for one entry. live = {price, ask, bid, spread_bp, vol24h}. -> {ok, reason, plan}.
+    trial_today = trial-tier fills this HKT day; trial = U.trial_config() (None -> env)."""
     sym = cand["symbol"]
+    trial = trial if trial is not None else U.trial_config()
 
     def no(reason: str) -> Dict[str, Any]:
         return {"ok": False, "symbol": sym, "reason": reason}
     if not approval:
         return no("no ENTRY_DESK approval today (no approval -> no order)")
-    ok, why = pilot_eligible(meta)
-    if not ok:
+    ptier, why = pilot_tier(meta, trial)
+    if ptier is None:
         return no(why)
+    is_trial = ptier == "trial" or cand.get("liq_tier") == "trial"
     if len(open_live) >= MAX_OPEN:
         return no(f"{len(open_live)} BX positions open (max {MAX_OPEN})")
     if any(t.get("bx_symbol") == sym for t in open_live):
         return no("already holding this contract")
     if entries_today >= MAX_NEW_PER_DAY:
         return no(f"{entries_today} new BX entry already today (max {MAX_NEW_PER_DAY})")
+    size_mult = 1.0
+    if is_trial:
+        if trial_today >= trial["max_per_day"]:
+            return no(f"{trial_today} trial-tier BX entry already today (max {trial['max_per_day']})")
+        size_mult = min(trial["size_mult"], _f(cand.get("size_mult")) if _f(cand.get("size_mult")) is not None else 1.0)
+        size_mult = max(0.0, min(1.0, size_mult))
+        if size_mult <= 0:
+            return no("trial size_mult is 0 (BX_TRIAL_SIZE_MULT)")
+    vol_min = trial["min_vol_usd"] if is_trial else VOL_MIN
+    spread_max = trial["max_spread_bp"] if is_trial else SPREAD_MAX_BP
     price, ask = _f(live.get("price")), _f(live.get("ask")) or _f(live.get("price"))
     if not price or not ask:
         return no("no live price")
-    if (live.get("vol24h") or 0) < VOL_MIN:
-        return no(f"live 24h vol {live.get('vol24h')} < $2M")
+    if (live.get("vol24h") or 0) < vol_min:
+        return no(f"live 24h vol {live.get('vol24h')} < ${vol_min / 1e6:g}M")
     sp = _f(live.get("spread_bp"))
-    if sp is None or sp >= SPREAD_MAX_BP:
-        return no(f"live spread {sp} bp not < {SPREAD_MAX_BP:g}")
+    if sp is None or sp >= spread_max:
+        return no(f"live spread {sp} bp not < {spread_max:g}")
     ref = _f(cand.get("close"))
     if ref and abs(price / ref - 1) > PRICE_SANITY:
         return no(f"price {price} vs radar {ref}: > 50% apart")
@@ -442,12 +483,13 @@ def check_entry(cand: dict, meta: dict, live: dict, nav: Optional[float], availa
         return no(f"Hard SL only {dist:.2f}% below price (< {MIN_SL_DIST_PCT}%)")
     if not nav or nav <= 0:
         return no("NAV unavailable (HL NAV + BX equity)")
-    margin = MARGIN_PCT_NAV / 100.0 * nav
+    margin = MARGIN_PCT_NAV / 100.0 * nav * size_mult
     notional = margin * LEVERAGE
-    note = ""
+    note = f"trial tier x{size_mult:g}" if is_trial else ""
     cap = MAX_SIZE_OF_VOL * float(live.get("vol24h") or 0)
     if notional > cap:
-        notional, margin, note = cap, cap / LEVERAGE, f"downsized to 0.5% of 24h vol (${cap:,.0f})"
+        notional, margin = cap, cap / LEVERAGE
+        note = "; ".join(x for x in (note, f"downsized to 0.5% of 24h vol (${cap:,.0f})") if x)
     if available is not None and margin > available:
         return no(f"BX available {available:.2f} USDT < margin {margin:.2f}")
     bp = int(meta.get("base_precision") or 0)
@@ -462,11 +504,13 @@ def check_entry(cand: dict, meta: dict, live: dict, nav: Optional[float], availa
     if liq >= sl:
         return no(f"estimated liq {liq:.6g} not below Hard SL {sl:.6g} at {LEVERAGE}x")
     sl_px = floor_to(sl, qp)
-    return {"ok": True, "symbol": sym, "reason": note or "ok",
-            "plan": {"qty": fmt(qty, bp), "limit_price": fmt(limit_px, qp), "sl_price": fmt(sl_px, qp),
-                     "margin_usd": round(margin, 4), "notional_usd": round(qty * ask, 4), "leverage": LEVERAGE,
-                     "mmr": mmr, "liq_est": round(liq, 10), "sl_dist_pct": round(dist, 3), "nav": round(nav, 2),
-                     "note": note}}
+    plan = {"qty": fmt(qty, bp), "limit_price": fmt(limit_px, qp), "sl_price": fmt(sl_px, qp),
+            "margin_usd": round(margin, 4), "notional_usd": round(qty * ask, 4), "leverage": LEVERAGE,
+            "mmr": mmr, "liq_est": round(liq, 10), "sl_dist_pct": round(dist, 3), "nav": round(nav, 2),
+            "note": note}
+    if is_trial:
+        plan.update(liq_tier="trial", size_mult=size_mult)
+    return {"ok": True, "symbol": sym, "reason": note or "ok", "plan": plan}
 
 
 # ---------------------------------------------------------------------------------------------
@@ -487,7 +531,9 @@ def exit_reason(trade: dict, row4h: Optional[dict], meta: Optional[dict], live: 
     sp = _f((live or {}).get("spread_bp"))
     if sp is None:
         sp = _f((meta or {}).get("spread_bp"))
-    if (vol is not None and vol < LIQ_EXIT_VOL) or (sp is not None and sp > LIQ_EXIT_SPREAD_BP):
+    # trial-tier trades enter below $1M, so their volume exit is the trial entry floor
+    exit_vol = min(LIQ_EXIT_VOL, U.trial_config()["min_vol_usd"]) if trade.get("liq_tier") == "trial" else LIQ_EXIT_VOL
+    if (vol is not None and vol < exit_vol) or (sp is not None and sp > LIQ_EXIT_SPREAD_BP):
         return "liquidity_exit"
     return None
 
@@ -532,6 +578,12 @@ def open_live_trades(conn) -> List[dict]:
 def live_entries_today(conn, now: datetime) -> int:
     day = hkt_date(now)
     return sum(1 for r in conn.execute("SELECT entry_time FROM shadow_trades WHERE mode='live'")
+               if r[0] and hkt_date(datetime.fromisoformat(r[0])) == day)
+
+
+def live_trial_entries_today(conn, now: datetime) -> int:
+    day = hkt_date(now)
+    return sum(1 for r in conn.execute("SELECT entry_time FROM shadow_trades WHERE mode='live' AND liq_tier='trial'")
                if r[0] and hkt_date(datetime.fromisoformat(r[0])) == day)
 
 
@@ -594,16 +646,20 @@ def execute_entry(trade_api, cand: dict, meta: dict, plan: dict, now: datetime, 
     conn.execute(
         """INSERT INTO shadow_trades(signal_id, symbol, bx_symbol, kind, gc_tf, tier, counted, entry_time, entry_px,
            size_pct_nav, leverage, hard_sl, exit_rule, fees_bp, slip_bp, status, note, mode, order_id, client_id,
-           position_id, qty, sl_order_id)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'open', ?, 'live', ?,?,?,?,?)""",
+           position_id, qty, sl_order_id, liq_tier)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'open', ?, 'live', ?,?,?,?,?,?)""",
         (cand.get("signal_id"), cand.get("coin") or sym, sym, kind or cand.get("type"), cand.get("gc_tf"),
          cand.get("tier"), int(counted), now.isoformat(), entry_px,
          round(plan["margin_usd"] / plan["nav"] * 100, 4), LEVERAGE, sl, "4h_close_below_filter", 6.0, None,
          f"hkt={hkt_date(now)}; live pilot; {plan.get('note') or ''}".strip("; "), res["order_id"], cid, pid,
-         filled, sl_id))
+         filled, sl_id, plan.get("liq_tier")))
     conn.commit()
     res.update(status="filled", position_id=pid, filled_qty=filled, entry_px=entry_px, sl_order_id=sl_id)
     _log(f"[BX_LIVE] ENTRY {sym} qty={filled} px={entry_px} SL={sl} pos={pid}")
+    if plan.get("liq_tier") == "trial":
+        res["liq_tier"] = "trial"
+        _log(f"[BX_TRIAL] ENTRY {sym} size_mult={plan.get('size_mult')} margin_usd={plan['margin_usd']} "
+             f"notional_usd={plan['notional_usd']} qty={filled} px={entry_px} SL={sl} pos={pid}")
     return res
 
 
@@ -733,7 +789,8 @@ def _try_enter(api, conn, c, meta_all, acct, nav, now, market, tiers_fn, rep, ki
         rep["skipped"].append({"symbol": c["symbol"], "reason": f"market data failed: {str(e)[:120]}"})
         return False
     chk = check_entry(c, meta, live, nav, _f(acct.get("available")), open_live_trades(conn),
-                      live_entries_today(conn, now), approval_for(c["symbol"], now), tiers)
+                      live_entries_today(conn, now), approval_for(c["symbol"], now), tiers,
+                      trial_today=live_trial_entries_today(conn, now))
     if not chk["ok"]:
         rep["skipped"].append({"symbol": c["symbol"], "reason": chk["reason"]})
         return False
@@ -866,7 +923,8 @@ def _try_enter_pending(api, conn, c, meta_all, acct, nav, now, market, tiers_fn,
         return False
     approval = {"decision": "approve", "source": "claude", "ts": rec.get("approved_at")} if rec.get("approved_at") else None
     chk = check_entry(c, meta, live, nav, _f(acct.get("available")), open_live_trades(conn),
-                      live_entries_today(conn, now), approval, tiers)
+                      live_entries_today(conn, now), approval, tiers,
+                      trial_today=live_trial_entries_today(conn, now))
     if not chk["ok"]:
         rep["skipped"].append({"symbol": c["symbol"], "reason": chk["reason"]})
         return False
@@ -891,12 +949,14 @@ def status(conn=None) -> Dict[str, Any]:
         if own:
             conn.close()
     st = _read(OUT_DIR / "bx_live_state.json") or {}
+    trial = U.trial_config()
+    rules_extra = {"trial": trial} if trial["enabled"] else {}
     return {"bx_enabled": env_on("BX_ENABLED", "1"), "bx_live": env_on("BX_LIVE", "0"),
             "keys_present": bx_trade.keys_present(), "breaker": breaker_state(), "baseline_nav": st.get("baseline_nav"),
             "realized_pnl_usd": round(realized, 4), "open": opens, "closed_recent": closed,
             "pending": [e for e in load_live_pending() if e.get("status") == "pending"],
             "rules": {"margin_pct_nav": MARGIN_PCT_NAV, "leverage": LEVERAGE, "max_open": MAX_OPEN,
-                      "max_new_per_day": MAX_NEW_PER_DAY, "breaker_pct_nav": BREAKER_PCT_NAV}}
+                      "max_new_per_day": MAX_NEW_PER_DAY, "breaker_pct_nav": BREAKER_PCT_NAV, **rules_extra}}
 
 
 # ---------------------------------------------------------------------------------------------
