@@ -33,7 +33,6 @@ Remove unnecessary ENTRY gates, add real safety protections from Signum platform
 4. **Process approvals in desk priority order** (Chase first, then alphabetical), not pure alphabetical. Executor iterates `approved_list` sorted by candidate type and symbol.
 5. **Fallback approves every executable candidate at floor size** (2% margin, 2x leverage), not just Base. Chase still becomes pending, not an immediate entry. `build_fallback_decisions` approves all with `size_pct=2.0, leverage=2`.
 6. **BX size/leverage from desk decision** (within 2x–5x bounds), not fixed 1%/3x. `check_entry` reads `approval.get("size_pct")` and `approval.get("leverage")`, clamps to 2–5x and coin max leverage. Pending Chase fills also use desk size/leverage from the stored approval.
-7. **Min SL distance 0.6%** (was 1.5%). Cove number: IOC slippage 0.5% + fees 0.09% = 0.59%. Below that the trade is "impossible" → safety/data. `MIN_SL_DIST_PCT = 0.6` for both HL and BX.
 
 ### ADDED protections (Signum parity)
 
@@ -67,7 +66,7 @@ Remove unnecessary ENTRY gates, add real safety protections from Signum platform
 
 - **Exit logic**: `exit_worker`, 1H/4H channel exits, tier exit timeframes, Hard SL placement and levels, CONT Hard SL level. No item moves a stop.
 - **Hard floors**: exchange Hard SL on every entry, total margin cap, kill switch, liquidation price must be beyond Hard SL, data-integrity checks (stale/missing data, stop above entry, coin max leverage, exchange minimums), price sanity check.
-- **Left as-is (owner hasn't decided)**: Chase/CONT pending freeze, Chase immediate entry, Base 1D-Green requirement, live-mid > 1D Upper check, size clamp >4%, Tiny tier 3x/2%, 20% per-coin notional cap, BTC regime rule, API key handling.
+- **Left as-is (owner hasn't decided)**: Chase/CONT pending freeze, Chase immediate entry, Base 1D-Green requirement, live-mid > 1D Upper check, size clamp >4%, Tiny tier 3x/2%, 20% per-coin notional cap, BTC regime rule, API key handling, **minimum SL distance 1.5%** (Cove suggested 0.6% based on IOC slippage + fees, not approved by MMT).
 - **Never touched**: `secrets/.env`, no live orders, no Railway changes, no deploys.
 
 ---

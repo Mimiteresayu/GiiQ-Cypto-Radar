@@ -55,7 +55,7 @@ HKT = timezone(timedelta(hours=8))
 BREAKER_PCT_NAV = 3.0
 SPREAD_MAX_BP = 10.0            # strictly below
 MAX_SIZE_OF_VOL = 0.005
-MIN_SL_DIST_PCT = 0.6           # GIIQ-SoT-5: lowered to match HL (IOC 0.5% + fees 0.09%)
+MIN_SL_DIST_PCT = 1.5           # kept at 1.5% (0.6% was suggestion, not approved)
 IOC_SLIP = 0.005                # IOC limit = ask x 1.005
 PRICE_SANITY = 0.5              # live price within 50% of the radar close
 BX_TOTAL_MARGIN_CAP_PCT = 80.0  # GIIQ-SoT-5 ADD-2: BX total margin cap (HL+BX combined if visible)

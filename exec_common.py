@@ -28,7 +28,7 @@ SOT_ID = "GIIQ-SoT-5"
 MIN_NOTIONAL_USD = 10.0  # Hyperliquid minimum order value (USD)
 MIN_LEVERAGE = 1.0
 MAX_LEVERAGE = 5.0
-MIN_SL_DIST_PCT = 0.6  # IOC slippage 0.5% + fees 0.09%
+MIN_SL_DIST_PCT = 1.5
 MAX_MARGIN_UTILIZATION_PCT = 80.0
 DEFAULT_MAX_CANDIDATE_AGE_H = 3.0  # 08:05 build -> 08:55 execute (+ slack)
 HKT = timezone(timedelta(hours=8))
