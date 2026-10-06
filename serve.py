@@ -41,6 +41,8 @@ COOKIE_NAME = "otr_session"
 SESSION_SECRET = (os.environ.get("SESSION_SECRET") or PASSWORD or "dev-local").encode()
 ENTRY_READ_KEY = (os.environ.get("ENTRY_READ_KEY") or "").strip()
 AI_DECISION_KEY = (os.environ.get("AI_DECISION_KEY") or ENTRY_READ_KEY or "").strip()
+# GET-only monitors (ops_cron, exit desks): accepted by _read_key_ok() only, never on write routes. Unset -> grants nothing.
+OPS_READ_KEY = (os.environ.get("OPS_READ_KEY") or "").strip()
 _SECRET_QS_RE = re.compile(r"(?i)([?&;][a-z0-9_\-]*(?:key|token|password|secret)=)[^&;\s\"']*")
 # Top-level radar fields kept off /api/public/radar: strategy parameters and the watchlist / universe lists.
 _PUBLIC_RADAR_DROP = ("gc_params", "universe_requested", "universe_source", "universe_floors", "narrative_map",
@@ -2402,11 +2404,11 @@ class Handler(SimpleHTTPRequestHandler):
             self._exec_preflight()
             return
         if path == "/api/exit/health":
-            if self._ai_key_ok():
+            if self._read_key_ok():
                 self._send_json(200, _exit_health())
             return
         if path == "/api/ai/dimensions":
-            if self._ai_key_ok():
+            if self._read_key_ok():
                 d = _read_out_json("dimensions_latest.json")
                 self._send_json(200 if d else 404, d or {"ok": False, "error": "dimensions not computed yet"})
             return
@@ -2424,7 +2426,7 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if path in ("/api/bx/radar", "/api/bx/shadow", "/api/bx/review", "/api/bx/status", "/api/bx/day"):
             # keyed, read-only BX shadow data (Claude weekly review of unknown-class contracts, reports)
-            if self._ai_key_ok():
+            if self._read_key_ok():
                 if BX_SERVICE_URL:
                     qs = {k: v for k, v in parse_qs(parsed.query).items() if k in ("tf", "date")}   # never forward ?key=
                     code, d = _bx_service(path + (("?" + urlencode(qs, doseq=True)) if qs else ""))
@@ -2450,7 +2452,7 @@ class Handler(SimpleHTTPRequestHandler):
                     self._send_json(500, {"ok": False, "error": f"{type(e).__name__}: {e}"})
             return
         if path == "/api/exec/pending":
-            if self._ai_key_ok():
+            if self._read_key_ok():
                 try:
                     from pending_entries import DISABLED_REASON, load_pending, pending_disabled
                     allrec = load_pending()
@@ -2886,6 +2888,15 @@ class Handler(SimpleHTTPRequestHandler):
             return False
         return True
 
+    def _ops_key_ok(self) -> bool:
+        provided = self._provided_key()
+        return bool(self.command == "GET" and provided and OPS_READ_KEY
+                    and hmac.compare_digest(provided, OPS_READ_KEY))
+
+    def _read_key_ok(self) -> bool:
+        """Read-only GET routes: OPS_READ_KEY, else the AI key (sends 404/403 like _ai_key_ok)."""
+        return self._ops_key_ok() or self._ai_key_ok()
+
     def _exec_preflight(self) -> None:
         """GET /api/exec/preflight (keyed): last preflight result. POST: run it now (never trades)."""
         if not self._ai_key_ok():
@@ -2962,6 +2973,9 @@ class Handler(SimpleHTTPRequestHandler):
             code, bx_res = _bx_service("/api/bx/decision", {"decisions": body["bx_decisions"],
                                                             "source": body.get("source") or "claude"})
             bx_res = dict(bx_res, http=code)
+            if not bx_res.get("ok"):
+                sys.stderr.write(f"[AI_DECISION] bx-exec {code}: "
+                                 f"{redact_secrets(json.dumps(bx_res, default=str))[:800]}\n")
             if decisions is None:
                 self._send_json(200 if bx_res.get("ok") else 422, {"ok": bool(bx_res.get("ok")), "bx": bx_res})
                 return
@@ -3029,14 +3043,14 @@ class Handler(SimpleHTTPRequestHandler):
     def _scheduler_status(self) -> None:
         """GET /api/scheduler/status: scheduler job status.
 
-        Auth: cockpit login (cookie / Bearer / Basic / X-Cockpit-Password) or the AI key
+        Auth: cockpit login (cookie / Bearer / Basic / X-Cockpit-Password), OPS_READ_KEY, or the AI key
         (AI_DECISION_KEY, or ENTRY_READ_KEY) via X-AI-Key header or ?key=. Otherwise 401.
 
         Returns:
             enabled: bool
             jobs: dict of job_name -> {last_run, status, message, error}
         """
-        if not self._authed():
+        if not self._authed() and not self._ops_key_ok():
             provided = self._provided_key()
             if not provided or not any(k and hmac.compare_digest(provided, k)
                                        for k in (AI_DECISION_KEY, ENTRY_READ_KEY)):

@@ -296,6 +296,7 @@ Trimmed radar feed for public consumption (e.g., giiqquant site):
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `AI_DECISION_KEY` | No | `ENTRY_READ_KEY` | Auth key for AI endpoints (`/api/ai/candidates`, `/api/ai/decision`) |
+| `OPS_READ_KEY` | No | - (grants nothing) | Read-only key for monitors (ops_cron, exit desks), `X-AI-Key` header. GET only: `/api/exit/health`, `/api/scheduler/status`, `/api/exec/pending`, `/api/ai/dimensions`, `/api/bx/{status,day,radar,shadow,review}`. Never accepted on `/api/ai/decision`, `/api/ai/candidates`, `/api/ai/narrative`, `/api/exec/run`, `/api/exec/preflight` |
 | `EXEC_DRY_RUN` | No | `1` | Execution mode: `1` = DRY_RUN (logs only), `0` = LIVE (requires `HL_API_PRIVATE_KEY`) |
 | `HL_API_PRIVATE_KEY` | No | - | Hyperliquid API private key for wallet `0xb74a9E2EA3e12511aDfc34a0a8327FbE4bc4e4D0` (live execution only) |
 | `SCHEDULER_ENABLED` | No | `1` (Railway) | Enable APScheduler in-process cron jobs (Asia/Hong_Kong timezone) |
@@ -379,7 +380,7 @@ Executor / exit workers are always forced to DRY_RUN on manual runs. `POST /api/
 now also rebuilds candidates.
 
 **Scheduler status:**
-- `GET /api/scheduler/status`: cockpit login, or the AI key (`AI_DECISION_KEY` / `ENTRY_READ_KEY`) via `X-AI-Key`
+- `GET /api/scheduler/status`: cockpit login, `OPS_READ_KEY`, or the AI key (`AI_DECISION_KEY` / `ENTRY_READ_KEY`) via `X-AI-Key`
   header or `?key=`; otherwise 401 (persisted to `out/scheduler_status.json`, survives restarts;
   executor `fail_closed` is reported as `fail_closed`, not `error`; exit-worker failures are `error`)
 - Included in `GET /api/desk-data` under `scheduler` key

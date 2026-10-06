@@ -282,6 +282,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(400, {"ok": False, "error": "need {decisions: [...]}"})
                 return
             res = bx_live.store_decisions(decs, str(body.get("source") or "claude"))
+            if not res.get("ok"):
+                bx_live._log("[BX_DECISION] 422 " + json.dumps(res, default=str, separators=(",", ":"))[:800])
             self._send(200 if res.get("ok") else 422, res)
             return
         self._send(404, {"ok": False, "error": "not found"})
