@@ -55,7 +55,8 @@ def _actors(coin: str, dec: dict, day: str, coin_fills: List[dict], executed: Li
                 if str(rec.get("symbol") or "").upper() == coin.upper():
                     ts = rec.get("timestamp")
                     break
-    lines = [f"entry decision: {who}" + (f" at {ts}" if ts else " (no log time)" if who == "unknown" else "")]
+    blank = who in (decider.UNKNOWN, "unknown")
+    lines = [f"entry decision: {who}" + (f" at {ts}" if ts else " (no log time)" if blank else "")]
     opens = [x for x in coin_fills if str(x.get("dir") or "").startswith("Open")]
     closes = [x for x in coin_fills if str(x.get("dir") or "").startswith("Close") or "Liquidat" in str(x.get("dir") or "")]
     if any(hlparse.order_actor(x, executed) == "Railway" for x in opens):
@@ -82,6 +83,9 @@ def build(inputs: Dict[str, Any], now: datetime, env: Dict[str, str]) -> Dict[st
     if not state_ok:
         problems.append(report.problem("DATA_UNAVAILABLE", f"HL account unreadable: {state_res.get('error') or 'unreadable'}"))
     spot_res = inputs.get("hl_spot") if "hl_spot" in inputs else {"ok": False}
+    if "hl_spot" in inputs and not spot_res.get("ok"):
+        report.add_problem(problems, "DATA_UNAVAILABLE",
+                           f"hl_spot unavailable: {spot_res.get('error') or 'not fetched'}", "hl_spot")
     nav_info = hlparse.nav_from_envelopes(state_res, spot_res)
     if nav_info.get("warning"):
         report.warn_nav_unverified(nav_info["warning"])

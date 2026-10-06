@@ -45,6 +45,9 @@ def build_scoreboard(inputs: Dict[str, Any], now: datetime, env: Dict[str, str])
     if not fill_res.get("ok"):
         problems.append(report.problem("DATA_UNAVAILABLE", f"testnet fills unreadable: {fill_res.get('error') or 'missing'}"))
     spot_res = inputs.get("spot") if "spot" in inputs else {"ok": False}
+    if "spot" in inputs and not spot_res.get("ok"):
+        report.add_problem(problems, "DATA_UNAVAILABLE",
+                           f"hl_spot unavailable: {spot_res.get('error') or 'not fetched'}", "hl_spot")
     nav_info = hlparse.nav_from_envelopes(state_res, spot_res)
     if nav_info.get("warning"):
         report.warn_nav_unverified(nav_info["warning"])
@@ -285,7 +288,7 @@ def build_veto(inputs: Dict[str, Any], now: datetime, env: Dict[str, str]) -> Di
         else:
             strategy = "unknown"
         decision = (rec or {}).get("decision") or "none"
-        who = decider.decider_of(rec) if rec else "unknown"
+        who = decider.decider_of(rec) if rec else decider.UNKNOWN
         sig_ts = decider._ts((rec or {}).get("timestamp")) if rec else None
         if sig_ts is not None and sig_ts.astimezone(rules.HKT).strftime("%Y-%m-%d") != sig_day:
             sig_ts = None

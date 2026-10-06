@@ -14,9 +14,11 @@ from . import rules
 RAILWAY_FALLBACK = "Railway 08:50 fallback"
 CLAUDE = "Claude.ai"
 FORGE = "Forge"
-UNKNOWN = "unknown"
+# Printed label. Actor columns (order_actor / close_actor) keep their own stored tokens.
+UNKNOWN = "未知"
+_LEGACY_UNKNOWN = "unknown"
 
-_EXPLICIT = {CLAUDE, FORGE, RAILWAY_FALLBACK, UNKNOWN}
+_EXPLICIT = {CLAUDE, FORGE, RAILWAY_FALLBACK, UNKNOWN, _LEGACY_UNKNOWN}
 
 
 def _ts(v: Any) -> Optional[datetime]:
@@ -27,6 +29,8 @@ def decider_of(rec: Optional[dict]) -> str:
     if not isinstance(rec, dict):
         return UNKNOWN
     explicit = str(rec.get("decider") or rec.get("actor") or "").strip()
+    if explicit in (UNKNOWN, _LEGACY_UNKNOWN):
+        return UNKNOWN
     if explicit in _EXPLICIT:
         return explicit
     if str(rec.get("source") or "").strip().lower() == "fallback":
@@ -55,7 +59,7 @@ def last_before(records: Iterable[dict], day: str, cutoff: tuple = (8, 55)) -> O
 
 
 def decider_for_coin(symbol: str, decisions: Optional[dict], day: str) -> str:
-    """Decider = whoever's POST was last before 08:55 HKT. No evidence → unknown."""
+    """Decider = whoever's POST was last before 08:55 HKT. No evidence → 未知."""
     if not isinstance(decisions, dict):
         return UNKNOWN
     hist = [r for r in (decisions.get("history") or []) if isinstance(r, dict)

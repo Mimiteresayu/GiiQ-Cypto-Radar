@@ -88,6 +88,9 @@ def build(inputs: Dict[str, Any], now: datetime, env: Dict[str, str]) -> Dict[st
     if not state_ok:
         problems.append(report.problem("DATA_UNAVAILABLE", f"HL account unreadable: {state_res.get('error') or 'unreadable'}"))
     spot_res = inputs.get("hl_spot") if "hl_spot" in inputs else {"ok": False}
+    if "hl_spot" in inputs and not spot_res.get("ok"):
+        report.add_problem(problems, "DATA_UNAVAILABLE",
+                           f"hl_spot unavailable: {spot_res.get('error') or 'not fetched'}", "hl_spot")
     nav_info = hlparse.nav_from_envelopes(state_res, spot_res)
     if nav_info.get("warning"):
         report.warn_nav_unverified(nav_info["warning"])
@@ -227,8 +230,10 @@ def build(inputs: Dict[str, Any], now: datetime, env: Dict[str, str]) -> Dict[st
         "",
         "## Realized by strategy and coin",
         "",
-        f"- yesterday by strategy: " + (", ".join(f"{k} {report.usd(v)}" for k, v in sorted(by_strat.items())) or "none"),
-        f"- yesterday by coin: " + (", ".join(f"{k} {report.usd(v)}" for k, v in sorted(by_coin.items())) or "none"),
+        f"- yesterday by strategy: " + (", ".join(f"{k} {report.usd(v)}" for k, v in sorted(by_strat.items()))
+                                        or ("未知" if y_fills is None else "none")),
+        f"- yesterday by coin: " + (", ".join(f"{k} {report.usd(v)}" for k, v in sorted(by_coin.items()))
+                                    or ("未知" if y_fills is None else "none")),
         f"- 7d by coin: " + (", ".join(f"{k} {report.usd(v)}" for k, v in sorted(w_by.items())) or ("未知" if w_fills is None else "none")),
         f"- since open by coin: " + (UNKNOWN if all_truncated or fills_all is None else
                                      (", ".join(f"{k} {report.usd(v)}" for k, v in sorted(a_by.items())) or "none")),

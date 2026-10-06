@@ -98,6 +98,16 @@ def _unavailable(rep: _Report, inp: Dict[str, Any], names: Iterable[str]) -> Non
             rep.problem("DATA_UNAVAILABLE", n, f"{n} unavailable: {r.get('error') or 'not fetched'}", "ops_cron")
 
 
+def _spot_unavailable(rep: _Report, inp: Dict[str, Any], key: str = "hl_spot") -> None:
+    """A failed spot read is one DATA_UNAVAILABLE, deduped on (code, coin) like the other reads."""
+    if key not in inp:
+        return
+    spot = inp.get(key) or {}
+    if spot.get("ok"):
+        return
+    rep.problem("DATA_UNAVAILABLE", key, f"{key} unavailable: {spot.get('error') or 'not fetched'}", "ops_cron")
+
+
 # ---------------------------------------------------------------------------------------------
 # Hyperliquid (public info API payloads)
 # ---------------------------------------------------------------------------------------------
@@ -357,6 +367,7 @@ def exit_monitor(inp: Dict[str, Any], now: datetime, cfg: Dict[str, Any]) -> Dic
     bx_on = bool(cfg.get("bx_enabled", True))
     names = [n for n in EXIT_SOURCES if bx_on or n != "bx_status"]
     _unavailable(rep, inp, names)
+    _spot_unavailable(rep, inp)
 
     eh = _data(inp.get("exit_health"))
     if isinstance(eh, dict):
@@ -504,6 +515,7 @@ def daily_audit(inp: Dict[str, Any], now: datetime, cfg: Dict[str, Any]) -> Dict
         names.remove("bx_day")
         rep.note("BX_DAY_MISSING", None, "no BX day report for today (08:56 run not recorded)", "bx_day")
     _unavailable(rep, inp, names)
+    _spot_unavailable(rep, inp)
     window_h = int(cfg.get("window_h", 24))
     since = now - timedelta(hours=window_h)
     slip_max = float(cfg.get("slippage_max_bp", 60))

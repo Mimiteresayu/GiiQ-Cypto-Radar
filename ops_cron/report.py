@@ -32,6 +32,14 @@ def problem(code: str, msg: str, coin: Optional[str] = None, source: str = "ops_
     return {"code": code, "coin": coin, "msg": msg[:300], "source": source}
 
 
+def add_problem(problems: List[dict], code: str, msg: str, coin: Optional[str] = None,
+                source: str = "ops_cron") -> None:
+    """One row per (code, coin), the same dedupe as rules._Report.problem."""
+    if any(p.get("code") == code and p.get("coin") == coin for p in problems):
+        return
+    problems.append(problem(code, msg, coin, source))
+
+
 def known_usd(v, readable: bool) -> str:
     """A failed or missing balance is 未知. Never a zero standing in for a missed read."""
     if not readable or v is None:

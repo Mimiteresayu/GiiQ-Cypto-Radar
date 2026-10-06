@@ -29,7 +29,7 @@ HL_FILLS_LOOKBACK_DAYS = 30
 
 
 def normalize_hl_address(raw: Optional[str]) -> str:
-    """HL info returns null for the checksum-case address. One lowercase form for every call and the journal."""
+    """Lowercase is normalisation only. HL returned null with HTTP 429 (rate limit), not because of address case."""
     return (raw or "").strip().lower()
 
 

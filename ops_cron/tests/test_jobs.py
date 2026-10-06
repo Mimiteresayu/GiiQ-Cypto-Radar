@@ -154,14 +154,14 @@ class TestDecider(unittest.TestCase):
     def test_claude_source_alone_is_unknown(self):
         dec = {"records": [{"symbol": "SOL", "source": "claude", "timestamp": "2026-10-06T00:10:00+00:00"}],
                "history": [{"symbol": "SOL", "source": "claude", "timestamp": "2026-10-06T00:10:00+00:00"}]}
-        self.assertEqual(decider.decider_for_coin("SOL", dec, "2026-10-06"), "unknown")
+        self.assertEqual(decider.decider_for_coin("SOL", dec, "2026-10-06"), "未知")
 
     def test_fallback_source_is_the_0850_job(self):
         dec = {"history": [{"symbol": "SOL", "source": "fallback", "timestamp": "2026-10-06T00:40:00+00:00"}],
                "records": [{"symbol": "SOL", "source": "forge", "timestamp": "2026-10-06T00:40:00+00:00"}]}
         self.assertEqual(decider.decider_for_coin("SOL", dec, "2026-10-06"), "Railway 08:50 fallback")
-        self.assertEqual(decider.decider_of({"source": "claude"}), "unknown")
-        self.assertEqual(decider.decider_of({"source": "forge"}), "unknown")
+        self.assertEqual(decider.decider_of({"source": "claude"}), "未知")
+        self.assertEqual(decider.decider_of({"source": "forge"}), "未知")
         self.assertEqual(decider.decider_of({"source": "fallback", "actor": "Forge"}), "Forge")
 
     def test_explicit_actor_is_kept(self):
@@ -210,7 +210,7 @@ class TestRiver(unittest.TestCase):
         for key in ("coin", "strategy", "desk_decision", "decider", "ret_48h", "ret_48h_sl_aware",
                     "excess_vs_btc", "hard_sl_hit", "outcome"):
             self.assertIn(key, row)
-        self.assertEqual(row["decider"], "unknown")
+        self.assertEqual(row["decider"], "未知")
         self.assertEqual(row["desk_decision"], "veto")
         self.assertEqual(veto["brain_rows"][0]["table"], "raw.river_desk_veto")
 
@@ -235,7 +235,7 @@ class TestRiver(unittest.TestCase):
         self.assertEqual(rep["brain_rows"][0]["table"], "raw.river_trade_log")
         deciders = [r["decider"] for r in rep["rows"]]
         self.assertTrue(deciders)
-        self.assertTrue(all(d == "unknown" for d in deciders))
+        self.assertTrue(all(d == "未知" for d in deciders))
         self.assertEqual(rep["notify"], "problem")
         self.assertTrue(any(p["code"] == "HARD_SL_HIT" for p in rep["problems"]))
 
@@ -382,6 +382,30 @@ class TestSpotUsdc(unittest.TestCase):
         self.assertIn("spot USDC 4.00", good["markdown"])
         self.assertIn("perp accountValue 1,000.00", good["markdown"])
 
+    def test_spot_read_failure_alerts_once(self):
+        data = _exit_with([_sl_order(sz="2.5", triggerPx="140")], {"SOL": "155"})
+        data["hl_spot"] = {"ok": False, "error": "down"}
+        rep = rules.exit_monitor(data, NOW, {"bx_enabled": False, "lookback_min": 65})
+        spot = [p for p in rep["problems"] if p["code"] == "DATA_UNAVAILABLE" and p.get("coin") == "hl_spot"]
+        self.assertEqual(len(spot), 1)
+        self.assertIsNone(rep["nav"])
+        self.assertEqual(rep["nav_label"], "NAV: 未核實")
+        self.assertEqual(rep["notify"], "problem")
+        self.assertFalse(any(p["code"] == "DATA_UNAVAILABLE" and p.get("coin") == "hl_state" for p in rep["problems"]))
+
+        state, orders, mids = _hl_book(order=_sl_order())
+        h = harbor.build({"day": "2026-10-06", "hl_state": state, "hl_spot": {"ok": False, "error": "down"},
+                          "hl_orders": orders, "all_mids": mids, "fills_7d": {"ok": False, "error": "down"},
+                          "fills_all": {"ok": False, "error": "down"}, "funding_7d": {"ok": True, "data": []},
+                          "run_report": {"ok": True, "data": {}}, "bx_status": {"ok": False}}, NOW, {})
+        harbor_spot = [p for p in h["problems"] if p["code"] == "DATA_UNAVAILABLE" and p.get("coin") == "hl_spot"]
+        self.assertEqual(len(harbor_spot), 1)
+        self.assertIn("NAV: 未核實", h["markdown"])
+        self.assertIn("yesterday by strategy: 未知", h["markdown"])
+        self.assertIn("yesterday by coin: 未知", h["markdown"])
+        self.assertNotIn("yesterday by strategy: none", h["markdown"])
+        self.assertNotIn("yesterday by coin: none", h["markdown"])
+
 
 class TestHlAddress(unittest.TestCase):
     def test_every_job_alerts_when_the_address_is_missing(self):
@@ -438,7 +462,7 @@ class TestRiverFixes(unittest.TestCase):
         self.assertNotIn("ETH", coins)
         self.assertAlmostEqual(veto["rows"][0]["ret_48h"], after)
         self.assertNotAlmostEqual(veto["rows"][0]["ret_48h"], before)
-        self.assertEqual(veto["rows"][0]["decider"], "unknown")
+        self.assertEqual(veto["rows"][0]["decider"], "未知")
 
     def test_journal_window_and_size_signs(self):
         self.assertEqual(river_jobs.journal_window_start(NOW, None), NOW - timedelta(hours=26))
@@ -464,7 +488,7 @@ class TestRiverFixes(unittest.TestCase):
         sizes = {r["coin"]: r["size"] for r in rep["rows"]}
         self.assertEqual(sizes["SOL"], 2)
         self.assertEqual(sizes["ETH"], -3)
-        self.assertTrue(all(r["decider"] == "unknown" for r in rep["rows"]))
+        self.assertTrue(all(r["decider"] == "未知" for r in rep["rows"]))
 
     def test_scoreboard_includes_the_2040_hkt_run(self):
         t = datetime(2026, 10, 7, 12, 40, tzinfo=timezone.utc)
