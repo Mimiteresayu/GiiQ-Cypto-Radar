@@ -138,7 +138,9 @@ class TestFallbackAndStreak(unittest.TestCase):
 
 
 class TestExecutorFallback(unittest.TestCase):
-    def test_fallback_chase_skipped_and_base_at_2pct(self):
+    def test_fallback_all_candidates_at_floor_2pct_2x(self):
+        """GIIQ-SoT-5: fallback approves every executable candidate at floor size (2% / 2x); a Chase still
+        becomes a pending (never an 08:55 order) -- or 'no entry' while the CONTINUATION freeze is on."""
         import test_live_execution as T
         t = T.TestExecutorDryRun("test_cumulative_margin_cap")
         t.setUp()
@@ -146,14 +148,14 @@ class TestExecutorFallback(unittest.TestCase):
             hl = T.FakeHL(equity=1000, meta=t.META, mids={"AAA": 1.0, "BBB": 1.0})
             chase = dict(T._cand("BBB", filt=0.97, lower=0.95), type="Chase", is_base=False, is_chase=True)
             res = t.run_exec(hl, T._cands(T._cand("AAA", filt=0.97, lower=0.95), chase),
-                             {"AAA": {"decision": "approve", "size_pct": 4, "source": "fallback"},
+                             {"AAA": {"decision": "approve", "size_pct": 4, "leverage": 5, "source": "fallback"},
                               "BBB": {"decision": "approve", "size_pct": 4, "source": "fallback"}})
         finally:
             t.tearDown()
         self.assertEqual([a["symbol"] for a in res["actions"]], ["AAA"])
-        self.assertEqual(res["actions"][0]["size_pct"], 2.0)
+        self.assertEqual((res["actions"][0]["size_pct"], res["actions"][0]["leverage"]), (2.0, 2))  # floor
         self.assertEqual(res["actions"][0]["decision_source"], "fallback")
-        self.assertTrue(any("fallback decision: Base only" in s["reason"] for s in res["skipped"]))
+        self.assertEqual([p["symbol"] for p in res["pending"]], ["BBB"])   # Chase -> pending (freeze off in tests)
 
 
 class TestEntryCounter(unittest.TestCase):
@@ -192,8 +194,9 @@ class TestRailwayFallback(unittest.TestCase):
         import serve
         fb, why = serve.build_fallback_decisions(self._cd())
         self.assertEqual(why, "")
-        self.assertEqual({d["symbol"]: (d["decision"], d["size_pct"]) for d in fb},
-                         {"MON": ("approve", 2.0), "TIA": ("veto", 0)})
+        # GIIQ-SoT-5: every candidate approved at floor size 2% / 2x (Chase too: it becomes a pending)
+        self.assertEqual({d["symbol"]: (d["decision"], d["size_pct"], d["leverage"]) for d in fb},
+                         {"MON": ("approve", 2.0, 2), "TIA": ("approve", 2.0, 2)})
         self.assertEqual(serve.build_fallback_decisions(self._cd(stale=True))[1], "candidates stale")
         old = self._cd(generated_at=(datetime.now(timezone.utc) - timedelta(days=1)).isoformat())
         self.assertEqual(serve.build_fallback_decisions(old)[1], "candidates not generated today")
@@ -208,7 +211,8 @@ class TestRailwayFallback(unittest.TestCase):
             res = serve._scheduled_fallback()
             self.assertEqual(res["status"], "success", res)
             d = get_decisions_for_today()
-            self.assertEqual((d["MON"]["source"], d["MON"]["decision"], d["TIA"]["decision"]), ("fallback", "approve", "veto"))
+            self.assertEqual((d["MON"]["source"], d["MON"]["decision"], d["TIA"]["decision"]),
+                             ("fallback", "approve", "approve"))       # SoT-5: all candidates
             self.assertEqual(serve._scheduled_fallback()["status"], "skipped")
         shutil.rmtree(self.tmp)
         os.makedirs(self.tmp)

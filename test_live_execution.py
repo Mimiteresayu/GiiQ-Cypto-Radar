@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 import exec_common as ec  # noqa: E402
+from hl_sim import SimExchangeMixin  # noqa: E402
 import executor  # noqa: E402
 import exit_worker  # noqa: E402
 import hl_exec  # noqa: E402
@@ -22,8 +23,9 @@ import hl_exec  # noqa: E402
 NOW = datetime(2026, 9, 28, 0, 55, tzinfo=timezone.utc)  # 08:55 HKT
 
 
-class FakeHL:
-    """Mimics hl_exec.HLClient."""
+class FakeHL(SimExchangeMixin):
+    """Mimics hl_exec.HLClient. Writes go through hl_sim (positions / SL orders appear like on the
+    exchange, so the GIIQ-SoT-5 post-fill reconciliation sees a real state)."""
 
     def __init__(self, equity=1000.0, margin_used=0.0, positions=None, meta=None, mids=None, orders=None,
                  lev_ok=True, fill=True, sl_ok=True, close_ok=True):
@@ -51,33 +53,6 @@ class FakeHL:
 
     def open_orders(self):
         return self.orders
-
-    # write
-    def set_leverage(self, coin, lev):
-        self.calls.append(("set_leverage", coin, lev))
-        return {"ok": self.lev_ok}
-
-    def open_long_ioc(self, coin, qty, px):
-        self.calls.append(("open_long_ioc", coin, qty, px))
-        if not self.fill:
-            return {"status": "error", "error": "Order could not immediately match", "filled_sz": 0.0}
-        return {"status": "filled", "filled_sz": qty, "avg_px": px, "oid": 1}
-
-    def place_stop_loss(self, coin, qty, trig, szd):
-        self.calls.append(("place_stop_loss", coin, qty, trig))
-        if not self.sl_ok:
-            return {"status": "error", "error": "Invalid TP/SL price"}
-        return {"status": "resting", "oid": 99, "trigger_px": trig}
-
-    def market_close(self, coin, qty):
-        self.calls.append(("market_close", coin, qty))
-        if not self.close_ok:
-            return {"status": "error", "error": "boom", "filled_sz": 0.0}
-        return {"status": "filled", "filled_sz": qty, "avg_px": 1.0}
-
-    def cancel(self, coin, oid):
-        self.calls.append(("cancel", coin, oid))
-        return {"ok": True}
 
     def names(self):
         return [c[0] for c in self.calls]
@@ -165,8 +140,10 @@ class TestSizingRules(unittest.TestCase):
         self.assertEqual(ec.clamp_leverage(10, 50), 5)
         self.assertEqual(ec.clamp_leverage(2.5, None), 2)
         self.assertEqual(ec.clamp_leverage(0.2, 3), 1)
-        cand = {"type": "Base"}
-        self.assertEqual(executor._clamp_size_leverage(cand, {"size_pct": 6, "leverage": 5}, False, 3), (6.0, 3))
+        # GIIQ-SoT-5 removed the dead executor._clamp_size_leverage; the live sizing is size_by_margin:
+        # leverage never above the coin max, 2x floor, AI size clamped to the 2-4% band
+        sz = ec.size_by_margin(1000.0, 1.0, 0.9, 3, ai_size_pct=6, ai_leverage=5)
+        self.assertEqual((sz["leverage"], sz["margin_pct"]), (3, 4.0))
 
     def test_margin_cap(self):
         self.assertTrue(ec.margin_cap_ok(700, 100, 1000)[0])
@@ -336,13 +313,13 @@ class TestExecutorDryRun(EnvMixin, unittest.TestCase):
         self.assertEqual(self.log_entry.call_args.kwargs["entry_size"], 119.0)
 
     def test_cumulative_margin_cap(self):
-        # GIIQ-SoT-4: total margin <= 70% NAV (cumulative across the run; was 30%)
-        hl = FakeHL(equity=1000, margin_used=640, meta=self.META, mids={"AAA": 1.0, "BBB": 1.0})
+        # GIIQ-SoT-5: one total margin cap, 80% NAV (cumulative across the run; was 70% + 80% utilisation)
+        hl = FakeHL(equity=1000, margin_used=740, meta=self.META, mids={"AAA": 1.0, "BBB": 1.0})
         res = self.run_exec(hl, _cands(_cand("AAA", tier="small", filt=0.97, lower=0.95), _cand("BBB", tier="small", filt=0.97, lower=0.95)),
                             {"AAA": {"decision": "approve", "size_pct": 6, "leverage": 2},
                              "BBB": {"decision": "approve", "size_pct": 6, "leverage": 2}})
-        self.assertEqual([a["symbol"] for a in res["actions"]], ["AAA"])  # 64%+~4% ok
-        self.assertEqual(res["skipped"][0]["symbol"], "BBB")               # ~68%+~4% > 70% (still < 80% utilisation)
+        self.assertEqual([a["symbol"] for a in res["actions"]], ["AAA"])  # 74%+~4% ok
+        self.assertEqual(res["skipped"][0]["symbol"], "BBB")               # ~78%+~4% > 80%
         self.assertIn("cumulative", res["skipped"][0]["reason"])
 
     def test_stale_candidates_fail_closed(self):
@@ -396,8 +373,10 @@ class TestExecutorLive(EnvMixin, unittest.TestCase):
         self.assertEqual(res["mode"], "LIVE")
         self.assertEqual(len(res["executed"]), 1)
         self.assertEqual(hl.names(), ["set_leverage", "open_long_ioc", "place_stop_loss"])
-        self.assertEqual(hl.calls[0], ("set_leverage", "AAA", 3))  # SoT-2: AI 2x lifted to the 3x floor
-        self.assertEqual(hl.calls[2], ("place_stop_loss", "AAA", 119.0, 0.97))  # SL for the filled qty at Hard SL
+        self.assertEqual(hl.calls[0], ("set_leverage", "AAA", 2))  # SoT-5: AI 2x is allowed (floor 2x)
+        self.assertEqual(hl.calls[1][4], hl_exec._make_cloid("AAA", "2026-09-28"))   # deterministic cloid
+        self.assertEqual(hl.calls[2], ("place_stop_loss", "AAA", 79.0, 0.97))  # SL for the filled qty at Hard SL
+        self.assertTrue(res["executed"][0]["live_result"]["reconcile"]["ok"])  # SoT-5 post-fill reconciliation
         self.assertFalse(self.log_entry.call_args.kwargs["dry_run"])
 
     def test_live_guard_skip_places_nothing(self):
@@ -449,9 +428,12 @@ class TestExecutorLive(EnvMixin, unittest.TestCase):
         res = executor.execute_approved_candidates(hl=hl, candidates_data=_cands(_cand("AAA", filt=0.97, lower=0.95)),
                                                    decisions={"AAA": {"decision": "approve"}},
                                                    radar_1h={}, radar_4h={"rows": []}, now=NOW)
-        self.assertEqual(hl.names(), ["set_leverage", "open_long_ioc", "place_stop_loss", "market_close"])
+        # SoT-5: the reconciliation retries the SL once before the fail-safe close
+        self.assertEqual(hl.names(), ["set_leverage", "open_long_ioc", "place_stop_loss", "place_stop_loss",
+                                      "market_close"])
         self.assertEqual(res["executed"], [])
-        self.assertEqual(res["alerts"], ["AAA: sl_failed_closed"])
+        self.assertEqual(len(res["alerts"]), 1)
+        self.assertTrue(res["alerts"][0].startswith("AAA: sl_failed_closed"), res["alerts"])
         self.assertEqual(res["status"], "success")
         self.log_entry.assert_not_called()
 

@@ -89,6 +89,7 @@ from exec_common import (  # noqa: E402
     count_entries_today_for_reporting,
     total_margin_nav_ok,
     FALLBACK_MARGIN_PCT,
+    FALLBACK_LEVERAGE,
     MAX_COIN_NOTIONAL_NAV_PCT,
     MAX_TOTAL_MARGIN_NAV_PCT,
     hkt_date,
@@ -266,10 +267,11 @@ def _execute(
             result["claude_post"] = {"missing_days": miss}
             if miss >= 2:
                 result["alerts"].append(f"RED: no Claude ENTRY_DESK POST for {miss} days in a row "
-                                        f"(POST_BLOCKED?) - fallback only (Base, {FALLBACK_MARGIN_PCT:g}%)")
+                                        f"(POST_BLOCKED?) - fallback only (all candidates, "
+                                        f"{FALLBACK_MARGIN_PCT:g}% / {FALLBACK_LEVERAGE}x)")
             elif miss == 1:
                 result["alerts"].append(f"Claude ENTRY_DESK POST missing today - fallback only "
-                                        f"(Base, {FALLBACK_MARGIN_PCT:g}%)")
+                                        f"(all candidates, {FALLBACK_MARGIN_PCT:g}% / {FALLBACK_LEVERAGE}x)")
         except Exception as e:  # noqa: BLE001
             result["alerts"].append(f"claude POST check failed: {e}")
     approved = [s for s, rec in decisions.items() if rec.get("decision") == "approve"]
@@ -458,8 +460,10 @@ def _execute(
 
         limit_px = round_price(mid * (1 + slip / 100.0), sz_dec)
         # GIIQ-SoT-5: daily entry cap removed
+        # GIIQ-SoT-5: a fallback decision is always floor size, 2% margin at 2x (whatever the record says)
         ai_size = FALLBACK_MARGIN_PCT if fallback else decision.get("size_pct")
-        sz = size_by_margin(equity, limit_px, hard_sl, coin_max, ai_size, decision.get("leverage"), tier=tier)
+        ai_lev = FALLBACK_LEVERAGE if fallback else decision.get("leverage")
+        sz = size_by_margin(equity, limit_px, hard_sl, coin_max, ai_size, ai_lev, tier=tier)
         if not sz["ok"]:
             skip(sz["reason"], mid=mid)
             continue
@@ -470,7 +474,7 @@ def _execute(
         notional = qty * mid
         min_usd = min_order_usd(equity)
         if notional < min_usd:
-            skip(f"Notional ${notional:.2f} < minimum ${min_usd:.2f} (max of HL ${MIN_NOTIONAL_USD:g}, 1% NAV)",
+            skip(f"Notional ${notional:.2f} < minimum ${min_usd:.2f} (HL minimum order)",
                  size_pct=size_pct, leverage=leverage)
             continue
         margin_usd = notional / leverage  # actual margin after lot rounding
@@ -556,11 +560,13 @@ def _execute(
                     result["message"] = f"LIVE entry failures: {', '.join(result['alerts'])}"
                 else:
                     result["message"] = f"LIVE entry failures: {', '.join(result['alerts'])}"
-            if st and st.startswith("sl_failed"):
-                result["alerts"].append(f"{symbol}: {st}")
-                if st == "sl_failed_CLOSE_FAILED":
+            if st and (st.startswith("sl_failed") or st.startswith("reconcile_failed")):
+                probs = "; ".join((r.get("reconcile") or {}).get("problems") or [])
+                result["alerts"].append(f"{symbol}: {st}" + (f" ({probs})" if probs else ""))
+                if st.endswith("CLOSE_FAILED"):
                     result["status"] = "error"
-                    result["message"] = f"{symbol}: SL failed AND fail-safe close failed - MANUAL ACTION"
+                    result["message"] = (f"{symbol}: {'SL' if st.startswith('sl_') else 'post-fill reconciliation'} "
+                                         f"failed AND fail-safe close failed - MANUAL ACTION")
     if pend_dirty:
         try:
             save_pending(pend_entries)

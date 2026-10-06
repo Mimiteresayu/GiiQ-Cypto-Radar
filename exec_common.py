@@ -68,6 +68,7 @@ MAX_COIN_NOTIONAL_NAV_PCT = 20.0  # one coin's notional (existing + add) <= 20% 
 ADDON_MIN_PRICE_GAIN_PCT = 10.0
 # Fallback decisions (Harbor 08:40, only when Claude's POST never arrived): approve every executable candidate at floor size.
 FALLBACK_MARGIN_PCT = 2.0
+FALLBACK_LEVERAGE = 2           # GIIQ-SoT-5: fallback = floor size, 2% margin at 2x
 # Tiny tier limits (MMT 2026-10-03 13:35-13:45 HKT, AIQ-0022): leverage <= 3x, margin <= 2% NAV per
 # trade. Tiny = mcap < $200M or unknown (mcap_tiers.tier_for), so any tier other than
 # mega/large/small (incl. "unknown" / empty) is treated as Tiny (fail-safe).
@@ -340,10 +341,17 @@ def nav_snapshot(spot: dict, perp: dict, abstraction: Optional[str] = None,
         equity_nav = max(spot_total, perp_av)
         source = "abstraction unknown: max(spot USDC total, perp accountValue)"
     
-    # GIIQ-SoT-5: Conservative NAV = min(equity, free USDC + isolated margin)
-    # spot_total = free USDC + hold; hold includes isolated margin in unified mode
-    # For split accounts: free + margin_used
-    free_usdc = spot_total - spot_hold if ab == "unifiedAccount" else (spot_total if ab else spot_total)
+    # GIIQ-SoT-5: Conservative NAV = min(equity incl. uPnL, free USDC + isolated margin collateral)
+    # - unified: free USDC = spot total - hold (hold carries the perp collateral in unified mode)
+    # - split / unknown: free USDC = free spot USDC + free perp collateral (perp `withdrawable`, else
+    #   accountValue - totalMarginUsed). Leaving the perp side out made a split account's NAV = spot only
+    #   (e.g. 100 instead of 1000) and an all-perp account's NAV = 0.
+    if ab == "unifiedAccount":
+        free_usdc = spot_total - spot_hold
+    else:
+        wd = _f((perp or {}).get("withdrawable"))
+        perp_free = wd if wd is not None else max(0.0, perp_av - margin_used)
+        free_usdc = (spot_total - spot_hold) + perp_free
     conservative_nav = free_usdc + margin_used
     nav = min(equity_nav, conservative_nav)
     

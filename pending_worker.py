@@ -366,11 +366,12 @@ def _run_pending(hl: Any = None, radar_1d: Optional[dict] = None, radar_4h: Opti
         else:
             note(f"live entry {st}; stays pending")
             res["alerts"].append(f"{sym} {kind}: {st}")
-            if st and st.startswith("sl_failed"):
+            if st and (st.startswith("sl_failed") or st.startswith("reconcile_failed")):
+                # the fill was closed (or the close failed): never re-arm automatically
                 mark("cancelled", f"{st} (fill closed) - manual review")
-            if st == "sl_failed_CLOSE_FAILED":
+            if st and st.endswith("CLOSE_FAILED"):
                 res["status"] = "error"
-                res["message"] = f"{sym}: SL failed AND fail-safe close failed - MANUAL ACTION"
+                res["message"] = f"{sym}: {st}: fail-safe close failed - MANUAL ACTION"
             elif res["status"] == "success":
                 res["status"] = "error"
                 res["message"] = "; ".join(res["alerts"])

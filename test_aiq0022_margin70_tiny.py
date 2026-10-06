@@ -22,15 +22,15 @@ META5 = {"AAA": {"szDecimals": 0, "maxLeverage": 5.0}, "BBB": {"szDecimals": 0, 
 
 class TestCaps(unittest.TestCase):
     def test_constants(self):
-        self.assertEqual(ec.MAX_TOTAL_MARGIN_NAV_PCT, 70.0)
+        self.assertEqual(ec.MAX_TOTAL_MARGIN_NAV_PCT, 80.0)   # GIIQ-SoT-5: one 80% NAV cap (was 70%)
         self.assertEqual(ec.MAX_MARGIN_UTILIZATION_PCT, 80.0)   # outer hard cap unchanged
         self.assertEqual(ec.MAX_COIN_NOTIONAL_NAV_PCT, 20.0)    # per-coin cap unchanged
         self.assertEqual(ec.TINY_MAX_LEV, 3)
         self.assertEqual(ec.TINY_MAX_MARGIN_PCT, 2.0)
 
-    def test_total_margin_70_boundary(self):
-        self.assertTrue(ec.total_margin_nav_ok(660, 40, 1000)[0])    # exactly 70%
-        self.assertFalse(ec.total_margin_nav_ok(661, 40, 1000)[0])   # 70.1%
+    def test_total_margin_80_boundary(self):
+        self.assertTrue(ec.total_margin_nav_ok(760, 40, 1000)[0])    # exactly 80% (GIIQ-SoT-5)
+        self.assertFalse(ec.total_margin_nav_ok(761, 40, 1000)[0])   # 80.1%
 
     def test_outer_80_cap(self):
         self.assertTrue(ec.margin_cap_ok(760, 40, 1000)[0])          # exactly 80%
@@ -75,13 +75,13 @@ class TestExecutorCaps(EnvMixin, unittest.TestCase):
                                                     radar_1h={}, radar_4h={"rows": []}, radar_1d={"rows": []},
                                                     now=NOW)
 
-    def test_70pct_cap_blocks_entry(self):
-        # 68% used + 4% small-tier margin = 72% NAV > 70% (utilisation 72% < 80%, so the 70% cap binds)
-        hl = FakeHL(equity=1000, margin_used=680, meta=META5, mids={"AAA": 1.0})
+    def test_80pct_cap_blocks_entry(self):
+        # GIIQ-SoT-5: 78% used + ~4% small-tier margin > 80% NAV
+        hl = FakeHL(equity=1000, margin_used=780, meta=META5, mids={"AAA": 1.0})
         res = self.run_exec(hl, _cands(_cand("AAA", tier="small", filt=0.97, lower=0.95)),
                             {"AAA": {"decision": "approve", "size_pct": 4, "leverage": 3}})
         self.assertEqual(res["actions"], [])
-        self.assertIn("> 70% cap", res["skipped"][0]["reason"])
+        self.assertIn("> 80", res["skipped"][0]["reason"])
 
     def test_entry_under_70pct_allowed(self):
         # 40% used would have been blocked by the old 30% cap; now allowed
