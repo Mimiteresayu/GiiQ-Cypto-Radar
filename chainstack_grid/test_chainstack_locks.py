@@ -216,6 +216,19 @@ class TestDockerfile(unittest.TestCase):
         self.assertEqual(cfg["build"]["builder"], "DOCKERFILE")
         self.assertEqual(cfg["deploy"]["restartPolicyType"], "NEVER")
 
+    def test_railway_draining_covers_stop_path(self):
+        cfg = json.loads((HERE / "railway.json").read_text(encoding="utf-8"))
+        self.assertEqual(cfg["deploy"]["drainingSeconds"], 120)
+        self.assertEqual(cfg["deploy"]["restartPolicyType"], "NEVER")
+        self.assertEqual(ge.RAILWAY_DRAINING_SEC, cfg["deploy"]["drainingSeconds"])
+        # bot SIGTERM wait + flatten budget + one in-flight request (connect + read timeouts)
+        worst = ge.BOT_STOP_WAIT_SEC + ge.FLATTEN_BUDGET_SEC + 2 * ge.HL_HTTP_TIMEOUT_SEC
+        self.assertLess(worst, 110)
+        src = (HERE / "giiq_entrypoint.py").read_text(encoding="utf-8")
+        self.assertIn("proc.wait(timeout=BOT_STOP_WAIT_SEC)", src)
+        self.assertIn("Info(TESTNET_API_URL, skip_ws=True, timeout=HL_HTTP_TIMEOUT_SEC)", src)
+        self.assertIn("account_address=master, timeout=HL_HTTP_TIMEOUT_SEC)", src)
+
 
 class TestTestnetOnly(unittest.TestCase):
     def test_good_env_passes(self):
@@ -579,6 +592,14 @@ class TestFlatten(unittest.TestCase):
         self.assertTrue(problems)
         self.assertIn("CRITICAL", out)
         self.assertFalse((self.data / ge.HALT_MARKER_NAME).exists())
+
+    def test_flatten_budget_stops_new_close_attempts(self):
+        c = FakeClient(positions=[btc_pos()])
+        c.orders = [{"coin": "BTC", "oid": 1}]
+        problems = ge.flatten(c, budget=0)
+        self.assertEqual(c.cancelled_coins, ["BTC"])
+        self.assertEqual(c.closes, [])
+        self.assertTrue(any("budget" in p for p in problems))
 
     def test_sdk_close_is_reduce_only_ioc(self):
         calls = {}

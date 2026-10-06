@@ -45,6 +45,12 @@ MIN_GRID_LEVELS = 2  # upstream geometric spacing divides by (levels - 1)
 RECONCILE_MAX_FAILURES = 3
 CLOSE_ATTEMPTS = 3
 CLOSE_SLIPPAGE = 0.05
+# Must finish inside railway.json deploy.drainingSeconds (120): bot wait + flatten budget +
+# one in-flight request (connect + read timeout) stays under ~110s.
+RAILWAY_DRAINING_SEC = 120
+BOT_STOP_WAIT_SEC = 30
+FLATTEN_BUDGET_SEC = 60
+HL_HTTP_TIMEOUT_SEC = 5
 
 REQUIRED_ENV = ("HYPERLIQUID_TESTNET_PRIVATE_KEY", "TESTNET_WALLET_ADDRESS")
 SECRET_ENV = ("HYPERLIQUID_TESTNET_PRIVATE_KEY",)
@@ -144,8 +150,8 @@ class HLTestnetClient:
         wallet = Account.from_key(private_key)
         self.signer_address = wallet.address
         self.master = master
-        self.info = Info(TESTNET_API_URL, skip_ws=True)
-        self.exchange = Exchange(wallet, TESTNET_API_URL, account_address=master)
+        self.info = Info(TESTNET_API_URL, skip_ws=True, timeout=HL_HTTP_TIMEOUT_SEC)
+        self.exchange = Exchange(wallet, TESTNET_API_URL, account_address=master, timeout=HL_HTTP_TIMEOUT_SEC)
 
     def update_leverage(self, leverage: int, coin: str, is_cross: bool):
         return self.exchange.update_leverage(leverage, coin, is_cross=is_cross)
@@ -322,9 +328,11 @@ def _fill_summary(resp) -> str:
     return f"not filled: {st}"
 
 
-def flatten(client) -> list[str]:
+def flatten(client, budget: float = FLATTEN_BUDGET_SEC) -> list[str]:
     """Cancel every open order, then reduce-only IOC close every open position and confirm
-    size 0 via a fresh clearinghouseState read. Returns problems (empty = flat)."""
+    size 0 via a fresh clearinghouseState read. Returns problems (empty = flat).
+    No close attempt starts after `budget` seconds."""
+    deadline = time.monotonic() + budget
     problems: list[str] = []
     try:
         coins = {COIN} | {o.get("coin") for o in client.open_orders()}
@@ -339,6 +347,9 @@ def flatten(client) -> list[str]:
     for coin, szi in sorted(positions.items()):
         size = szi
         for attempt in range(1, CLOSE_ATTEMPTS + 1):
+            if time.monotonic() >= deadline:
+                problems.append(f"flatten budget {budget:g}s exhausted before {coin} close attempt {attempt}")
+                break
             try:
                 resp = client.close_position(coin, size)
                 summary = _fill_summary(resp)
@@ -363,7 +374,7 @@ def stop_bot(proc, client, data_dir: Path, reason: str, halt: bool = True) -> li
     if proc.poll() is None:
         proc.send_signal(signal.SIGTERM)
         try:
-            proc.wait(timeout=60)
+            proc.wait(timeout=BOT_STOP_WAIT_SEC)
         except subprocess.TimeoutExpired:
             proc.kill()
     problems = flatten(client)
