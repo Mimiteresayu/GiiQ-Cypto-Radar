@@ -6,6 +6,7 @@ round-trip PF over the FULL fill history (Prism unified method, prism/jump69_rec
   vault route (ref)   : net_rt = closedPnl - actual fee + funding; PF_V = (W - 0.1*max(W-L,0)) / L  (10% PS on net profit, HWM)
   last --days PF (round trips closed in window) = recency reference only.
 MDD (from HL portfolio pnl/accountValue), verdict for gate 1.
+--json includes gate1_pass (true only when no hard FAIL; NOTE lines do not fail the gate).
 Data: public HL info API only. No keys. Offline replay: --raw DIR (fills.json + funding.json)."""
 import json,sys,time,math,urllib.request,argparse,collections,os
 API='https://api.hyperliquid.xyz/info'
@@ -197,7 +198,8 @@ def main():
     if hist0 and fu0 and fu0<hist0-2*DAY: reasons.append(f'NOTE fill history truncated by HL API: funding since {D(fu0)} but fills only since {D(hist0)} ({len(F)} fills); PF covers the served fills only')
     elif len(F)>=10000: reasons.append(f'NOTE {len(F)} fills (HL may cap history near 10k); PF covers fills since {D(hist0)}')
     if open_tr: reasons.append(f'NOTE {len(open_tr)} open position(s) not in PF (no flat yet): '+','.join(sorted(open_tr)))
-    verdict='PASS gate1 -> hand to Cove (IS/OOS + permutation)' if not [r for r in reasons if not r.startswith('NOTE')] else 'FAIL gate1'
+    gate1_pass=not [r for r in reasons if not r.startswith('NOTE')]
+    verdict='PASS gate1 -> hand to Cove (IS/OOS + permutation)' if gate1_pass else 'FAIL gate1'
     res=dict(address=a.addr,name=name,is_vault=is_vault,window_days=a.days,equity_points=len(eq),
         beta_btc=bb,r2_btc=r2b,beta_top20=bkb,r2_top20=r2k,beta_share_of_pnl=beta_share,net_long_time=net_long,
         fills=len(F),funding_records=len(FU),fill_history_start=D(hist0),pf_fill_coverage=cover,
@@ -206,7 +208,7 @@ def main():
         pf_copy_full=pfc,pf_vault_full=full['pf_vault'],pf_copy_recent=rec_pfc,pf_vault_recent=rec['pf_vault'],
         pf_full=dict(full,pf_copy=pfc,first_close=D(full['first_close']),last_close=D(full['last_close'])),
         pf_recent=dict(rec,pf_copy=rec_pfc,first_close=D(rec['first_close']),last_close=D(rec['last_close'])),open_positions=sorted(open_tr),
-        mdd_alltime=mdd_all,ret_alltime=tot_all,mdd_window=mdd_win,ret_window=tot_win,verdict=verdict,reasons=reasons,
+        mdd_alltime=mdd_all,ret_alltime=tot_all,mdd_window=mdd_win,ret_window=tot_win,gate1_pass=gate1_pass,verdict=verdict,reasons=reasons,
         repro_check='MANUAL: Cove criterion 9 (reproducible on Railway, no 3rd-party keys) — answer Y/N before handing over')
     if a.json: print(json.dumps(res,indent=1,default=str));return
     f=lambda x,p='.2f': 'n/a' if x is None else format(x,p)

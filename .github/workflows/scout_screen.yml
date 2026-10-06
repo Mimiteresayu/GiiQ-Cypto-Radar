@@ -4,14 +4,21 @@ on:
   schedule:
     # 09:30 HKT weekdays = 01:30 UTC (HKT = UTC+8)
     - cron: '30 1 * * 1-5'
-  
+
   workflow_dispatch:
-  
+    inputs:
+      dry_run:
+        description: 'Print the issue payload and do not open or comment on an issue'
+        type: boolean
+        default: false
+
   pull_request:
     paths:
       - 'scout/**'
       - '.github/workflows/scout_screen.yml'
 
+# Screen pushes to scout-out. Issue writes use the built-in GITHUB_TOKEN only.
+# The cancel job narrows this to contents: read (checkout the notifier) + issues: write.
 permissions:
   contents: write
   issues: write
@@ -20,74 +27,158 @@ jobs:
   scout-screen:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0  # need full history for branch operations
-      
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      
+
       - name: Install dependencies
         run: |
           pip install requests
-      
+
+      - name: Test notify decision
+        run: |
+          python3 scout/test_notify.py
+          node scout/test_open_issue.js
+
       - name: Run discovery
+        id: discover
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           cd scout
           python3 discover.py --top-n 20 --timeout-per-screen 900
-      
+
+      - name: Build notify payload
+        if: always()
+        run: |
+          STATUS="${{ steps.discover.outcome }}"
+          if [ -z "$STATUS" ]; then STATUS=skipped; fi
+          python3 scout/notify.py \
+            --out-dir scout/out \
+            --screen-status "$STATUS" \
+            --repo "${{ github.repository }}" \
+            --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --server-url "${{ github.server_url }}" \
+            --write /tmp/notify.json
+
       - name: Upload artifacts (PR only)
-        if: github.event_name == 'pull_request'
+        if: ${{ success() && github.event_name == 'pull_request' }}
         uses: actions/upload-artifact@v4
         with:
           name: scout-outputs-${{ github.sha }}
           path: scout/out/
-      
+
       - name: Commit and push to scout-out branch (schedule/dispatch only)
-        if: github.event_name != 'pull_request'
+        if: ${{ success() && github.event_name != 'pull_request' }}
         run: |
           # Configure git
           git config user.name "Scout Bot"
           git config user.email "scout@giiq.bot"
-          
+
+          # Hold this run's report. The branch switch and the main checkout
+          # below replace scout/, which would otherwise drop today's files.
+          mkdir -p /tmp/scout-run-out
+          cp -a scout/out/. /tmp/scout-run-out/
+          git checkout -- scout
+          git clean -fd -- scout/out
+
           # Create or switch to scout-out branch
           git fetch origin scout-out || true
           git checkout scout-out 2>/dev/null || git checkout -b scout-out
-          
+
           # Merge latest changes from main (scout directory only)
           git checkout origin/main -- scout/ || true
-          
-          # Stage outputs
+
+          # Put this run's report back and stage it
+          mkdir -p scout/out
+          cp -a /tmp/scout-run-out/. scout/out/
           git add scout/out/
-          
+
           # Check if there are changes to commit
           if git diff --staged --quiet; then
             echo "No changes to commit"
           else
             # Commit with [skip ci] to prevent triggering this workflow again
             git commit -m "Scout daily screen $(date -u +%Y-%m-%d) [skip ci]"
-            
+
             # Push to scout-out branch
             git push origin scout-out
           fi
-      
-      - name: Create issue on failure (schedule/dispatch only)
-        if: failure() && github.event_name != 'pull_request'
+
+      - name: Show notify decision
+        if: always()
+        run: |
+          if [ -f /tmp/notify.json ]; then
+            python3 -m json.tool /tmp/notify.json
+          else
+            echo '{"action":"missing-payload"}'
+          fi
+
+      - name: Open scout issue (schedule/dispatch, not dry-run)
+        if: ${{ always() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run != 'true')) }}
         uses: actions/github-script@v7
         with:
           script: |
-            const date = new Date().toISOString().split('T')[0];
-            await github.rest.issues.create({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              title: `Scout screen failed ${date}`,
-              body: `The scheduled Scout discovery and screening job failed on ${date}.\n\nWorkflow run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
-              labels: ['scout', 'automated-failure']
-            });
+            const fs = require('fs');
+            const path = require('path');
+            const { openIssue } = require(path.join(process.env.GITHUB_WORKSPACE, 'scout/open_issue.js'));
+            let payload;
+            try {
+              payload = JSON.parse(fs.readFileSync('/tmp/notify.json', 'utf8'));
+            } catch (err) {
+              const date = new Date().toISOString().slice(0, 10);
+              const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+              payload = {
+                action: 'stale',
+                label: 'scout-stale',
+                label_color: 'D93F0B',
+                label_description: 'Scout screen failed or produced no output',
+                date,
+                title: `Scout stale ${date}: no output`,
+                title_prefix: `Scout stale ${date}:`,
+                body: `The Scout screen produced no usable output.\n\nActions run: ${runUrl}\n`,
+              };
+            }
+            await openIssue({ github, context, core, payload });
+
+  # Job timeout cancels the screen job before its issue step can run.
+  scout-stale-on-cancel:
+    needs: scout-screen
+    if: ${{ always() && needs.scout-screen.result == 'cancelled' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run != 'true')) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Checkout notifier
+        uses: actions/checkout@v4
+
+      - name: Build stale payload
+        run: |
+          mkdir -p /tmp/empty-scout-out
+          python3 scout/notify.py \
+            --out-dir /tmp/empty-scout-out \
+            --screen-status cancelled \
+            --repo "${{ github.repository }}" \
+            --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --server-url "${{ github.server_url }}" \
+            --write /tmp/notify.json
+
+      - name: Open scout-stale issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const { openIssue } = require(path.join(process.env.GITHUB_WORKSPACE, 'scout/open_issue.js'));
+            const payload = JSON.parse(fs.readFileSync('/tmp/notify.json', 'utf8'));
+            await openIssue({ github, context, core, payload });
