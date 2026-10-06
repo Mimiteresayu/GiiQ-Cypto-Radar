@@ -222,11 +222,18 @@ class HLClient:
         return {"ok": _ok(resp), "raw": resp}
 
     def open_long_ioc(self, coin: str, qty: float, limit_px: float, cloid: Optional[str] = None) -> Dict[str, Any]:
-        """Open a LONG IOC order with optional deterministic client order ID (GIIQ-SoT-5)."""
-        builder = {"limit": {"tif": "Ioc"}}
+        """Open a LONG IOC order with optional deterministic client order ID (GIIQ-SoT-5).
+
+        The cloid goes to the SDK as its own `cloid=` argument (a `Cloid`, 0x + 32 hex), which the SDK
+        signs as the order's "c" field. It must NOT be put inside the order type: the SDK copies the
+        `limit` dict to the wire verbatim, so an extra key there changes the signed action and the
+        exchange rejects the order."""
+        order_type = {"limit": {"tif": "Ioc"}}
+        kw: Dict[str, Any] = {"reduce_only": False}
         if cloid:
-            builder["limit"]["cloid"] = cloid  # type: ignore
-        resp = self.exchange().order(coin, True, qty, limit_px, builder, reduce_only=False)
+            from hyperliquid.utils.types import Cloid
+            kw["cloid"] = Cloid.from_str(cloid)
+        resp = self.exchange().order(coin, True, qty, limit_px, order_type, **kw)
         return parse_order_response(resp)
 
     def place_stop_loss(self, coin: str, qty: float, trigger_px: float, sz_decimals: int) -> Dict[str, Any]:
@@ -264,8 +271,21 @@ def _make_cloid(coin: str, hkt_date_str: str, kind: str = "entry") -> str:
     A rerun or retry will produce the same cloid, preventing double-sends of identical orders.
     """
     s = f"{coin}|{hkt_date_str}|{kind}"
-    h = hashlib.sha256(s.encode()).hexdigest()[:16]
-    return f"giiq{h}"
+    # HL cloid format: "0x" + 32 hex chars (16 bytes) -- anything else is refused by the SDK / exchange
+    return "0x" + hashlib.sha256(s.encode()).hexdigest()[:32]
+
+
+def _long_size(hl: Any, coin: str) -> float:
+    """Current LONG size of `coin` from clearinghouseState (0.0 if none or unreadable)."""
+    try:
+        for grp in (hl.perp_state() or {}).get("assetPositions", []) or []:
+            p = grp.get("position") or {}
+            if p.get("coin") == coin:
+                szi = float(p.get("szi") or 0)
+                return szi if szi > 0 else 0.0
+    except Exception:  # noqa: BLE001
+        pass
+    return 0.0
 
 
 def _reconcile_position(hl: Any, coin: str, expected_filled: float, leverage: int, hard_sl: float,
@@ -364,6 +384,9 @@ def enter_long_with_sl(hl: Any, coin: str, qty: float, limit_px: float, leverage
     
     res: Dict[str, Any] = {"coin": coin, "qty": qty, "limit_px": limit_px, "leverage": leverage, 
                            "hard_sl": hard_sl, "cloid": cloid}
+    # size already held (ADD_ON adds to an open LONG): reconciliation expects prior + filled
+    prior_size = _long_size(hl, coin)
+    res["prior_size"] = prior_size
     try:
         lev = hl.set_leverage(coin, leverage)
     except Exception as e:  # noqa: BLE001
@@ -406,10 +429,14 @@ def enter_long_with_sl(hl: Any, coin: str, qty: float, limit_px: float, leverage
     # GIIQ-SoT-5: post-fill reconciliation
     _log(f"{coin}: running post-fill reconciliation...")
     reconcile_ok, problems, actual_margin = _reconcile_position(
-        hl, coin, filled, leverage, hard_sl, coin_max_leverage, sz_decimals
+        hl, coin, filled + (prior_size or 0.0), leverage, hard_sl, coin_max_leverage, sz_decimals
     )
     res["reconcile"] = {"ok": reconcile_ok, "problems": problems, "actual_margin_used": actual_margin}
     
+    if not sl_ok and reconcile_ok:
+        # the first SL attempt failed but reconciliation found / placed a resting SL: protected
+        res["sl_note"] = "Hard SL placed on the reconciliation retry"
+        sl_ok = True
     if sl_ok and reconcile_ok:
         res["status"] = "executed"
         res["actual_margin_used"] = actual_margin
@@ -430,10 +457,11 @@ def enter_long_with_sl(hl: Any, coin: str, qty: float, limit_px: float, leverage
         close = {"status": "error", "error": str(e)}
     res["close_result"] = {k: v for k, v in close.items() if k != "raw"}
     
+    prefix = "sl_failed" if not sl_ok else "reconcile_failed"   # no Hard SL is the primary cause
     if close.get("status") == "filled":
-        res["status"] = "reconcile_failed_closed" if not reconcile_ok else "sl_failed_closed"
+        res["status"] = f"{prefix}_closed"
     else:
-        res["status"] = "reconcile_failed_CLOSE_FAILED" if not reconcile_ok else "sl_failed_CLOSE_FAILED"
+        res["status"] = f"{prefix}_CLOSE_FAILED"
         _log(f"{coin}: CRITICAL fail-safe close FAILED: {close.get('error')} -- MANUAL ACTION REQUIRED")
     return res
 

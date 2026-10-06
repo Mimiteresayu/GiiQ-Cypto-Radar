@@ -311,26 +311,21 @@ class TestExitWorker(unittest.TestCase):
 class TestSizeAndLeverageBands(unittest.TestCase):
     """Test SoT size and leverage enforcement."""
 
-    def test_btc_bearish_fixed_size(self):
-        """Test BTC bearish regime: fixed 4% per coin."""
-        from executor import _clamp_size_leverage, BTC_BEARISH_FIXED_SIZE_PCT
-
-        candidate = {"type": "Base", "tier": "large"}
-        decision = {"size_pct": 8.0, "leverage": 3.0}
-
-        size_pct, leverage = _clamp_size_leverage(candidate, decision, btc_bearish=True)
-        self.assertEqual(size_pct, BTC_BEARISH_FIXED_SIZE_PCT)
+    def test_dead_btc_bearish_sizing_removed(self):
+        """GIIQ-SoT-5 removed the dead BTC-bearish 4% sizing (never called by the live path)."""
+        import executor
+        for name in ("_clamp_size_leverage", "BTC_BEARISH_FIXED_SIZE_PCT", "SIZE_BANDS"):
+            self.assertFalse(hasattr(executor, name), name)
 
     def test_leverage_bounds(self):
-        """Test leverage clamped to 1-5x."""
-        from executor import _clamp_size_leverage
-
-        candidate = {"type": "Base", "tier": "mega"}
-        decision = {"size_pct": 6.0, "leverage": 10.0}  # Above max
-
-        size_pct, leverage = _clamp_size_leverage(candidate, decision, btc_bearish=False)
-        self.assertLessEqual(leverage, 5.0)
-        self.assertGreaterEqual(leverage, 1.0)
+        """Live sizing (exec_common.size_by_margin): leverage 2-5x, never above the coin max, size 2-4%."""
+        import exec_common as ec
+        r = ec.size_by_margin(1000.0, 100.0, 95.0, 10, ai_size_pct=6.0, ai_leverage=10.0)
+        self.assertEqual((r["leverage"], r["margin_pct"]), (5, 4.0))
+        r = ec.size_by_margin(1000.0, 100.0, 95.0, 3, ai_size_pct=6.0, ai_leverage=10.0)
+        self.assertEqual(r["leverage"], 3)
+        r = ec.size_by_margin(1000.0, 100.0, 95.0, 10, ai_size_pct=1.0, ai_leverage=1.0)
+        self.assertEqual((r["leverage"], r["margin_pct"]), (2, 2.0))
 
 
 class TestLiquidationChecks(unittest.TestCase):

@@ -34,7 +34,7 @@ def _radar(n, requested=None):
 
 class TestSotId(unittest.TestCase):
     def test_sot_id(self):
-        self.assertEqual(ec.SOT_ID, "GIIQ-SoT-4")
+        self.assertEqual(ec.SOT_ID, "GIIQ-SoT-5")
         doc = (ROOT / "docs" / "SOT_CHANGELOG.md").read_text(encoding="utf-8")
         self.assertIn("GIIQ-SoT-1", doc)
         self.assertIn("GIIQ-SoT-2", doc)
@@ -88,7 +88,7 @@ class TestPriceAndMinOrder(unittest.TestCase):
 
     def test_min_order(self):
         self.assertEqual(ec.min_order_usd(500), 10.0)       # HL minimum dominates
-        self.assertAlmostEqual(ec.min_order_usd(1691.8), 16.918)  # 1% NAV
+        self.assertEqual(ec.min_order_usd(1691.8), 10.0)    # GIIQ-SoT-5: $10 only (1% NAV minimum removed)
         self.assertEqual(ec.min_order_usd(0), 10.0)
 
 
@@ -130,8 +130,8 @@ class TestRunReport(unittest.TestCase):
 
 class TestSot2Sizing(unittest.TestCase):
     """GIIQ-SoT-2 (MMT 2026-09-28, corrected): risk = isolated margin 2-4% NAV (not SL-distance
-    based), 3-5x isolated, liq strictly below the Hard SL (step down toward 3x, else skip),
-    AI size/lev = maximums."""
+    based), isolated, liq strictly below the Hard SL, AI size/lev = maximums.
+    GIIQ-SoT-5: leverage band 2-5x (was 3-5x): step down toward 2x, else skip."""
 
     def test_default_max_margin_and_5x(self):
         r = ec.size_by_margin(1000, 100.0, 95.0, 10)
@@ -152,24 +152,32 @@ class TestSot2Sizing(unittest.TestCase):
         self.assertTrue(any("5x liq" in n for n in r["notes"]))
         self.assertLess(r["liq"], 80.0)
 
-    def test_impossible_at_3x_skips(self):
+    def test_impossible_at_2x_skips(self):
         r = ec.size_by_margin(1000, 100.0, 72.0, 10)  # 3x liq 70.2 < 72 ok
         self.assertEqual(r["leverage"], 3)
-        r = ec.size_by_margin(1000, 100.0, 70.0, 10)  # 3x liq 70.18 >= 70 -> skip
+        r = ec.size_by_margin(1000, 100.0, 70.0, 10)  # 3x liq 70.18 >= 70 -> SoT-5 steps on to 2x
+        self.assertEqual(r["leverage"], 2)
+        liq2 = ec.isolated_liq_price_long(100.0, 2, 10)
+        r = ec.size_by_margin(1000, 100.0, liq2 * 1.01, 10)   # Hard SL just above the 2x liq -> 2x
+        self.assertEqual((r["ok"], r["leverage"]), (True, 2))
+        r = ec.size_by_margin(1000, 100.0, liq2, 10)          # Hard SL at the 2x liq -> skip
         self.assertFalse(r["ok"])
-        self.assertIn("SoT-2 leverage impossible", r["reason"])
+        self.assertIn("leverage impossible", r["reason"])
 
     def test_ai_values_are_maximums_inside_band(self):
         r = ec.size_by_margin(1000, 100.0, 98.0, 10, ai_size_pct=3, ai_leverage=4)
         self.assertEqual((r["leverage"], r["margin_pct"]), (4, 3.0))
         r = ec.size_by_margin(1000, 100.0, 98.0, 10, ai_size_pct=6, ai_leverage=9)
         self.assertEqual((r["leverage"], r["margin_pct"]), (5, 4.0))  # hard caps
-        r = ec.size_by_margin(1000, 100.0, 98.0, 10, ai_size_pct=1, ai_leverage=2)  # floors 2% / 3x
-        self.assertEqual((r["leverage"], r["margin_pct"]), (3, 2.0))
+        r = ec.size_by_margin(1000, 100.0, 98.0, 10, ai_size_pct=1, ai_leverage=1)  # floors 2% / 2x (SoT-5)
+        self.assertEqual((r["leverage"], r["margin_pct"]), (2, 2.0))
         self.assertEqual(len(r["notes"]), 2)
+        r = ec.size_by_margin(1000, 100.0, 98.0, 10, ai_size_pct=2, ai_leverage=2)  # 2x is a valid AI choice
+        self.assertEqual((r["leverage"], r["margin_pct"]), (2, 2.0))
 
-    def test_coin_max_below_3x_skips(self):
-        self.assertFalse(ec.size_by_margin(1000, 100.0, 98.0, 2)["ok"])
+    def test_coin_max_below_2x_skips(self):
+        self.assertFalse(ec.size_by_margin(1000, 100.0, 98.0, 1)["ok"])             # SoT-5 floor 2x
+        self.assertEqual(ec.size_by_margin(1000, 100.0, 98.0, 2)["leverage"], 2)   # never above coin max
         self.assertEqual(ec.size_by_margin(1000, 100.0, 98.0, 3)["leverage"], 3)
 
     def test_fixed_leverage_and_room_for_add_on(self):
@@ -194,13 +202,12 @@ class TestSot2Sizing(unittest.TestCase):
         self.assertFalse(ec.addon_gates(pos, 1000, None)[0])
 
     def test_sot3_portfolio_caps(self):
-        self.assertTrue(ec.total_margin_nav_ok(650, 50, 1000)[0])   # 70% NAV (GIIQ-SoT-4, was 30%)
-        self.assertFalse(ec.total_margin_nav_ok(660, 50, 1000)[0])
+        self.assertTrue(ec.total_margin_nav_ok(750, 50, 1000)[0])   # 80% NAV (GIIQ-SoT-5, was 70%)
+        self.assertFalse(ec.total_margin_nav_ok(760, 50, 1000)[0])
         self.assertTrue(ec.coin_notional_ok(100, 100, 1000)[0])
         self.assertFalse(ec.coin_notional_ok(150, 60, 1000)[0])
-        self.assertTrue(ec.daily_entry_cap_ok(1, 1)[0])
-        self.assertFalse(ec.daily_entry_cap_ok(2, 1)[0])
-        self.assertEqual(ec.SOT_ID, "GIIQ-SoT-4")
+        self.assertFalse(hasattr(ec, "daily_entry_cap_ok"))           # SoT-5: daily entry cap removed
+        self.assertEqual(ec.SOT_ID, "GIIQ-SoT-5")
 
 
 class TestExecutorGuardrails(EnvMixin, unittest.TestCase):

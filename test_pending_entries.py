@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pending_entries as pe  # noqa: E402
+from hl_sim import SimExchangeMixin  # noqa: E402
 import pending_worker as pw  # noqa: E402
 
 NOW = datetime(2026, 9, 28, 4, 10, tzinfo=timezone.utc)  # 12:10 HKT
@@ -22,12 +23,13 @@ def _row(lower, filt, close, trend="Green", upper=None):
     return {"lower": lower, "filter": filt, "close": close, "trend": trend, "upper": upper or filt * 1.1}
 
 
-class FakeHL:
+class FakeHL(SimExchangeMixin):
     def __init__(self, equity=1000.0, margin_used=0.0, positions=None, mids=None, meta=None, fill=True, lev=None):
         self.equity, self.margin_used, self.positions = equity, margin_used, positions or []
         self.mids = mids or {}
         self._meta = meta or {"AAA": {"szDecimals": 0, "maxLeverage": 5.0}}
         self.fill, self.lev, self.calls = fill, lev, []
+        self.orders = []
 
     def spot_state(self):
         return {"balances": [{"coin": "USDC", "total": str(self.equity)}]}
@@ -47,23 +49,9 @@ class FakeHL:
     def all_mids(self):
         return self.mids
 
-    def set_leverage(self, coin, lev):
-        self.calls.append(("set_leverage", coin, lev))
-        return {"ok": True}
+    def open_orders(self):
+        return self.orders
 
-    def open_long_ioc(self, coin, qty, px):
-        self.calls.append(("open_long_ioc", coin, qty, px))
-        if not self.fill:
-            return {"status": "error", "error": "no match", "filled_sz": 0.0}
-        return {"status": "filled", "filled_sz": qty, "avg_px": px, "oid": 1}
-
-    def place_stop_loss(self, coin, qty, trig, szd):
-        self.calls.append(("place_stop_loss", coin, qty, trig))
-        return {"status": "resting", "oid": 9, "trigger_px": trig}
-
-    def market_close(self, coin, qty):
-        self.calls.append(("market_close", coin, qty))
-        return {"status": "filled", "filled_sz": qty}
 
 
 H4 = 4 * 3600 * 1000
@@ -205,7 +193,7 @@ class TestWorker(unittest.TestCase):
         self.assertEqual([c[0] for c in hl.calls], ["set_leverage", "open_long_ioc", "place_stop_loss"])
         f = res["filled"][0]
         self.assertEqual(f["size_pct"], 4.0)                  # SoT-2 hard cap 4%
-        self.assertEqual(f["leverage"], 3)                    # AI 2x lifted to the SoT-2 3x floor
+        self.assertEqual(f["leverage"], 2)                    # SoT-5: AI 2x allowed (floor 2x, was 3x)
         self.assertEqual(f["hard_sl"], 0.88)                  # small -> 4H Filter
         self.assertLessEqual(f["risk_margin_pct"], 4.0)
         self.assertEqual(ents[0]["status"], "filled")
