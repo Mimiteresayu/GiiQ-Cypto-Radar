@@ -45,8 +45,8 @@ class TestExitMonitor(unittest.TestCase):
         self.assertEqual([c["bx_symbol"] for c in r["bx"]["closes_since_last_run"]], ["BARUSDT"])
         self.assertTrue(r["summary"].startswith("OK · HL 1 倉 · BX 1 倉 · BX_LIVE=1"))
 
-    def test_daily_ok_summary_only_in_the_summary_hour(self):
-        self.assertEqual(self.run_(daily_summary_hour_hkt=12)["notify"], "daily_ok")
+    def test_ok_is_silent_in_every_hour(self):
+        self.assertIsNone(self.run_(daily_summary_hour_hkt=12)["notify"])
         self.assertIsNone(self.run_(daily_summary_hour_hkt=20)["notify"])
 
     def test_problem_notifies_even_in_summary_hour(self):
@@ -190,7 +190,7 @@ class TestDailyAudit(unittest.TestCase):
     def test_ok_fixture(self):
         r = self.run_()
         self.assertEqual(r["status"], "ok", r["problems"])
-        self.assertIsNone(r["notify"])
+        self.assertEqual(r["notify"], "report")
         self.assertTrue(r["bx"]["singapore_egress_ok"])
         self.assertEqual((r["hl"]["n_open_orders"], r["hl"]["n_close_orders"]), (2, 1))
         self.assertAlmostEqual(r["hl"]["realized_pnl_24h_usd"], 14.58)

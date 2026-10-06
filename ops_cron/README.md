@@ -1,206 +1,244 @@
-# ops_cron — deterministic exit monitor + daily live audit (Railway cron)
+# ops_cron — read-only Railway cron checks
 
-These two scripts replace the hourly EXIT_DESK bot check and the 09:22 BX/HL daily audit bot check
-(`automation_inventory_v0` items 1 and 3). They read the same data the bot read, apply fixed rules, and alert
-only when something is wrong. No LLM is involved unless an alert asks a human (or the bot) to look.
+Pure Python. No LLM calls, no order placement, no cancels, no changes to exec / entry / exit / sizing.
+One package, one entrypoint, one Railway cron service per schedule.
 
-**READ-ONLY.** The scripts never place, modify or cancel orders, and never change env vars or feature flags.
-They do not import any repo trading, signing or exchange-key code; the image contains only `ops_cron/`, and a
-test checks that every import is standard library (plus the Postgres driver). They make these calls only:
+```bash
+python -m ops_cron.main <job> [--dry-run] [--fixture FILE] [--now ISO]
+```
 
-| Source | Calls | Auth |
-|---|---|---|
-| cockpit | `GET /api/exit/health`, `/api/scheduler/status`, `/api/bx/status`, `/api/bx/day?date=`, `/api/exec/pending`, `/api/exec/run-report?date=` | `X-AI-Key` header = `COCKPIT_AI_KEY` (never in the URL) |
-| Hyperliquid public info API | `clearinghouseState`, `frontendOpenOrders`, `userFillsByTime`, `candleSnapshot` (any other type raises) | none (public, `HL_ADDRESS` only) |
-| bx-exec | through the cockpit proxy `/api/bx/*` only | the cockpit's own `BX_SERVICE_KEY` |
+`python -m ops_cron <job>` is the same entrypoint.
 
-## Schedule
+## Jobs
 
-Railway cron schedules are in UTC (HKT = UTC+8). The minimum interval is 5 minutes. Each run must exit when it is
-done, and Railway skips a run if the previous one is still running.
+Railway cron is UTC. HKT = UTC+8. The four-hour exit monitor uses the same clock hours in both zones
+(`17 0,4,8,12,16,20 * * *` is 00:17 / 04:17 / 08:17 / 12:17 / 16:17 / 20:17 HKT).
 
-| Check | HKT | UTC cron | Railway config |
-|---|---|---|---|
-| Exit monitor | hourly at :12 | `12 * * * *` | `ops_cron/railway.exit-monitor.json` |
-| Exit monitor daily OK summary | the 20:12 run | (same service) | `OPS_DAILY_SUMMARY_HOUR_HKT=20` |
-| Daily live audit | 09:22 | `22 1 * * *` | `ops_cron/railway.daily-audit.json` |
+| Job | Service | HKT | UTC cron | Always sends | Railway config |
+|---|---|---|---|---|---|
+| `exit-monitor` | `ops-exit-monitor` | every 4h at :17 | `17 0,4,8,12,16,20 * * *` | no — alert only on problems | `railway.exit-monitor.json` |
+| `desk-missing` | `ops-desk-missing` | 08:30 | `30 0 * * *` | no | `railway.desk-missing.json` |
+| `c48-scoreboard` | `ops-c48-scoreboard` | every 3h UTC | `0 */3 * * *` | no; silent after 2026-10-07 21:00 HKT | `railway.c48-scoreboard.json` |
+| `desk-veto` | `ops-desk-veto` | 09:05 | `5 1 * * *` | no | `railway.desk-veto.json` |
+| `harbor-pnl` | `ops-harbor-pnl` | 09:15 | `15 1 * * *` | yes, one message | `railway.harbor-pnl.json` |
+| `trade-journal` | `ops-trade-journal` | 09:15 | `15 1 * * *` | no — alert on failure or a Hard SL hit | `railway.trade-journal.json` |
+| `daily-audit` | `ops-daily-audit` | 09:22 | `22 1 * * *` | yes, one message | `railway.daily-audit.json` |
+| `bo-report` | `ops-bo-report` | weekdays 09:32 and 20:32 | `32 1,12 * * 1-5` | yes, one message | `railway.bo-report.json` |
 
-Why :12 and 09:22: the cockpit 1H exit job runs at :07 and the 4H job at :10 (HKT). bx-exec runs hourly at :09,
-every 4h at :05, and entries at 08:56. So both checks run after the jobs they check have finished.
+Harbor and the trade journal share a clock time and stay two services (different start commands).
 
-## Alert rules
+Exit monitor reads cockpit `GET /api/exit/health`, `/api/scheduler/status`, `/api/bx/status`, `/api/exec/pending`,
+plus the public Hyperliquid info API. It alerts on a missing Hard SL on an open HL position, a stale scheduler
+job, a tripped BX breaker, and source errors. A healthy run sends nothing.
 
-A run is **`problem`** if any rule below fires, otherwise **`ok`**. `info` items are kept in the report and never
-alert. Duplicate `(code, coin)` pairs from different sources are reported once.
+Daily audit (09:22, after the 08:55 executor) always sends one summary: today's run report, stored decisions,
+fills, open positions with both stops, and BX status. Problems are inside that message.
 
-### Exit monitor (hourly)
+Desk-missing (08:30) alerts only when today's cockpit decisions have no non-fallback POST. The alert text is
+exactly: `no Claude desk POST yet; Railway 08:50 fallback will apply (HL Base 2% + Hard SL, Chase veto)`.
+`source=fallback` alone is not a desk POST. A missing or unreadable `decisions` field is `DATA_UNAVAILABLE`,
+not that sentence. This job does not change the 08:50 fallback.
 
-| Code | Fires when | Source |
-|---|---|---|
-| `DATA_UNAVAILABLE` | any source errors, times out (`OPS_HTTP_TIMEOUT_S`), returns non-2xx, or `/api/bx/status` has an unexpected shape (no `breaker` / `open`) | all |
-| *(passthrough)* `NO_SL`, `EXIT_NOT_DONE`, `JOB_FAILED`, `MARGIN_HIGH`, `ORPHAN_SL`, `PENDING_STALE`, `LEVERAGE_OFF`, `RADAR_STALE`, `HL_FETCH`, `BX_*` | the cockpit `/api/exit/health` reports it (rules in `exit_health.py`). `JOB_MISSED` is dropped because `JOB_STALE` below replaces it with the same 1H/4H limits. | cockpit |
-| `NO_SL` | an open HL position (public `clearinghouseState`) has no trigger / reduce-only / TP-SL order on that coin (`frontendOpenOrders`). This checks HL directly, so it still works if the cockpit health check is wrong. | HL |
-| `HL_ENTRY_CAP` | more than 3 HL opening orders (distinct order ids) today HKT (`MAX_NEW_ENTRIES_PER_DAY`) | HL |
-| `JOB_STALE` | a cockpit job's `last_run` is older than its interval + grace: `1h_scan_exits` 75 min, `4h_scan_exits` 265 min, `pending_entries` 265 min, `1d_scan_candidates` 1470 min, `executor` 1470 min; or the job has never run | cockpit scheduler |
-| `SCHEDULER_DISABLED` | cockpit `SCHEDULER_ENABLED=0` | cockpit scheduler |
-| `BX_BREAKER` | the BX circuit breaker is tripped | bx status |
-| `BX_BREAKER_NOT_TRIPPED` | realised BX P&L ≤ −`breaker_pct_nav`% (3%) of the baseline NAV, but the breaker is not tripped | bx status |
-| `BX_MAX_OPEN` | more than `max_open` (2) live BX positions | bx status |
-| `BX_ENTRY_CAP` | more than `max_new_per_day` (1) open live BX positions entered today HKT | bx status |
-| `BX_NO_SL` | an open live BX position has no Hard SL in the ledger. Also passed through from bx-exec when SL repair fails. | bx status |
-| `BX_EGRESS` | `BX_LIVE=1` and egress is not verified as non-US | bx status |
-| `BX_LIVE_BLOCKED` | `BX_LIVE=1` but `live_ready=false` (blockers are listed) | bx status |
-| `BX_JOB_ERROR` / `BX_JOB_STALE` | a bx-exec job (`1h` 75 min, `4h` 265 min, `daily` 1470 min, `entries` 1470 min) last ended in `error`, or is older than its limit | bx status |
-| *(passthrough)* bx-exec `problems` (`BX_MANAGE_ERROR`, `BX_ACCOUNT`, …) | reported by the last bx-exec 1h / 4h run | bx status |
+Harbor (09:15) is the daily P&L and portfolio note. Monday (HKT weekday 0) adds the latest infra-fee line
+against trading P&L. It also flags a missing Hard SL or a liquidation price closer than the Hard SL.
+Cove BO (weekdays 09:32 and 20:32) is the live book: NAV, day and week P&L, weekly cost, positions, actors,
+anomalies. Session is morning when the HKT hour is before 12, otherwise evening.
 
-The BX limits come from `rules` in `/api/bx/status`. If that is missing, the pilot defaults apply: 2 open,
-1 entry per day, −3% NAV.
+Harbor and Cove share `ops_cron.stops.sl_distance`: the soft exit is the 1H Lower and the Hard SL is the
+4H Filter (Small/Tiny pair). Distance is from mark; `pnl_if_hit` is the loss if that level trades.
+Margin cap is 70% of NAV. Weekly cost shown on the BO report is $91. Neither number is read from sizing code.
 
-Info only: `HL_CLOSE` / `BX_CLOSE` (closes in the last `OPS_LOOKBACK_MIN` = 65 min, i.e. since the last run),
-`BX_JOB_UNKNOWN` (bx-exec keeps job status in memory, so after a restart a job shows as unknown until it runs
-again), and `BX_DISABLED`.
+River's three jobs write insert-only rows to giiq-brain:
 
-**Notifications.** On `problem`, every run alerts, so a problem that lasts is repeated each hour until it is fixed.
-On `ok`, nothing is sent, except the run in hour `OPS_DAILY_SUMMARY_HOUR_HKT` (20 → 20:12 HKT), which sends one
-line, for example `OK · HL 1 倉 · BX 1 倉 · BX_LIVE=1 · closes 2 · 20:12 HKT 04-Oct`.
+- **C48-3 FT scoreboard** reads the HL **testnet** public info API (`TESTNET_WALLET_ADDRESS` only).
+  Checks: margin ≤ 2% NAV, notional ≤ 8% NAV, leverage ≤ 3x, drawdown ≤ 4% from `C48_NAV_START`.
+  BTC only. After 2026-10-07 21:00 HKT the job exits ok, sends nothing, and inserts no score row.
+- **Desk veto** (09:05) uses public `GET /api/public/radar` (no key): 1D `dual_cross_up` = Base,
+  4H `dual_cross_up` = Chase, plus decision symbols, cap 25, BTC always included.
+  `ret_48h` is from 1h candles (HL, else Bitunix public `{COIN}USDT`). If a later 1h low trades through
+  the 4H Filter as of 48h ago, `ret_48h_sl_aware` uses that stop instead of the raw return.
+- **Trade journal** (09:15) is one row per today's fill, plus decision symbols with no fill.
+  The `decider` column is the last cockpit decision for that coin posted **before 08:55 HKT** that day.
 
-### Daily live audit (09:22 HKT, window = last `OPS_AUDIT_WINDOW_H` = 24 h)
+### Decider
 
-| Code | Fires when |
+| Evidence | Column |
 |---|---|
-| `DATA_UNAVAILABLE` | any source fails (as above). A 404 from `/api/bx/day` means there is no 08:56 report today; that is `BX_DAY_MISSING` (info), not a problem. |
-| `BX_EGRESS` | egress is not `ok`, or the geo countries are not all `OPS_BX_EXPECTED_COUNTRY` (SG), or the region does not start with `OPS_BX_EXPECTED_REGION_PREFIX` (`asia-southeast1`) |
-| `BX_LIVE_OFF` | `OPS_EXPECT_BX_LIVE=1` and `BX_LIVE=0` (unset = the flag is reported but not judged) |
-| `BX_BREAKER`, `BX_BREAKER_NOT_TRIPPED`, `BX_MAX_OPEN`, `BX_ENTRY_CAP`, `BX_NO_SL`, `BX_LIVE_BLOCKED` | same rules as the exit monitor |
-| `RULE_VIOLATION` | a live fill in the window breaks a rule. **HL** (from the executor / pending run report): Hard SL missing or < 1.5% below the fill; leverage outside 1–5x; Base fill not above the 1D Upper; pending (ADD_ON / CONTINUATION) fill at or below the pending zone Lower. **BX** (from the 08:56 day report and open positions): Hard SL order not confirmed; Hard SL < 1.5% below the fill. |
-| `SLIPPAGE_HIGH` | an HL fill is more than `OPS_SLIPPAGE_MAX_BP` (60 bp) above the mid at signal (the executor's IOC limit is mid + 50 bp by default) |
+| explicit actor in {Claude.ai, Forge, Railway 08:50 fallback, unknown} | that label |
+| `source=fallback` | `Railway 08:50 fallback` |
+| `source=forge` | `Forge` |
+| `source=claude` | `unknown` (Forge and Claude both write `claude` today) |
+| no decision before 08:55 HKT | `unknown` |
 
-The trade review is always included in the report (it does not alert):
+Missing numbers are written `未知` or `未核實`. A previous run's number is never reused.
+BX NAV is `未知` (owner Harbor): there is no read-only Bitunix key and no BX NAV table.
+`available_usdt` is not NAV. Prop is owner Helm. Stocks and cash are owner MMT.
+Percents use known sleeves only. All-time realised P&L is `未核實` when `userFills` returns 2000 rows.
+Infra fee comes from the latest `river/admin/ai_infra_usage_review_*.md` (`RIVER_ADMIN_DIR`); if that
+file is missing the fee is `未知` (owner River). Months are not summed.
 
-- **Orders (24 h):** HL fills grouped by order id (public `userFillsByTime`), plus failed HL orders from the run
-  report; BX orders from today's `/api/bx/day` and open positions entered in the window.
-- **Realised P&L (24 h):** HL = sum of `closedPnl − fee` over fills in the window; BX = sum of `pnl_usd` over
-  `closed_recent` exits in the window, plus the cumulative `realized_pnl_usd`.
-- **Rule compliance and slippage per fill:** fill vs mid at signal (bp), SL distance, and where the fill sits
-  against the pending zone (`in_zone` / `above_filter +x%` / `below_lower`).
-- **Missed entries:** pendings that expired or were cancelled in the window (with reason), and executor /
-  pending / BX skips caused by the 1.5% minimum SL distance check.
-- **Exit efficiency (HL):** for each round trip closed in the window (flat → open → flat), MFE = highest 1h
-  high between entry and exit, and `efficiency = (exit − entry) / (MFE high − entry)`. 1.0 = sold at the top,
-  0 = gave back the whole move, < 0 = exited below entry.
+GC periods match the live scanner with Lag/Fast off: 1H 48, 4H 72, 1D 144 (`ops_cron/gc_levels.py`).
+The last closed bar is the one whose close time is ≤ now. Allowed HL info types:
+`clearinghouseState`, `frontendOpenOrders`, `userFills`, `userFillsByTime`, `userFunding`,
+`candleSnapshot`, `allMids`. Any other type raises.
 
-By default the audit alerts only on `problem`. Set `OPS_AUDIT_SEND_OK=1` to also send the summary every day.
+## Alert sink
 
-## Output and persistence
+1. Telegram when both `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` are set.
+2. Email only when the Telegram vars are **absent** and `SMTP_HOST` + `ALERT_EMAIL_TO` are set.
+   A failed Telegram send does not fall through to email.
+3. If neither is set, the message is a log line only (`[OPS_ALERT]` on stderr).
 
-- **stdout:** exactly one JSON line per run (the full report: `check`, `run_id`, `run_at`, `status`, `summary`,
-  `problems`, `info`, check-specific sections, `sources`, `alert`, `persisted`).
-- **stderr:** the markdown summary, plus one `[OPS_ALERT] {"subject": …, "text": …}` line whenever an alert is
-  due, even when no sink is configured.
-- **Postgres (optional):** when `BRAIN_DSN` is set, one `INSERT` into `raw.ops_check_run` per run. The script never
-  runs DDL, UPDATE or DELETE. Create the table once with [`schema.sql`](schema.sql):
+The Telegram URL contains the bot token and is never logged. Secrets are scrubbed from error text.
+Exit code is 0 for `ok` and `problem`. Exit code 1 only when the script crashes (it still tries to alert).
 
-| Column | Type | Meaning |
-|---|---|---|
-| `id` | `bigserial` PK | |
-| `run_id` | `text` unique | uuid4 of the run |
-| `check_name` | `text` | `exit_monitor` / `daily_audit` |
-| `run_at` | `timestamptz` | check time (UTC) |
-| `status` | `text` | `ok` / `problem` |
-| `n_problems` | `int` | |
-| `summary` | `text` | one line (also used in the alert subject) |
-| `alerted` | `bool` | a webhook / email was sent this run |
-| `report` | `jsonb` | full report (same as the stdout line) |
-| `inserted_at` | `timestamptz` | default `now()` |
+## Brain tables
 
-If the insert fails, the error goes into `persisted` and stderr; the DSN is never printed. The run still exits 0.
+Postgres via `BRAIN_DATABASE_URL` (older name `BRAIN_DSN` still works). Insert-only: no UPDATE, no DELETE.
+`CREATE TABLE IF NOT EXISTS` runs from [`schema.sql`](schema.sql) before the run row is inserted.
+Proposed names (schema `raw`):
+
+| Table | Written by |
+|---|---|
+| `raw.ops_check_run` | every job, one row per run |
+| `raw.harbor_pnl_daily` | `harbor-pnl` (markdown matches the file below) |
+| `raw.bo_live_report` | `bo-report` |
+| `raw.river_c48_ft_score` | `c48-scoreboard` (none after the cutoff) |
+| `raw.river_desk_veto` | `desk-veto`, one row per signal |
+| `raw.river_trade_log` | `trade-journal`, one row per fill or decision (`decider` text column) |
+
+Harbor also writes `harbor/out/pnl_YYYY-MM-DD.md` (`HARBOR_OUT_DIR`, default `harbor/out`).
+That directory is gitignored. `--dry-run` writes neither the file nor the database.
 
 ## Environment variables
 
-All configuration comes from env vars; nothing secret is in the code. Set them on the two Railway cron services
-only.
+Nothing secret is in the repo. Cockpit auth is the `X-AI-Key` header from `COCKPIT_AI_KEY`.
+The key is never placed in a URL. `AI_DECISION_KEY` is not set on the cockpit service; the live
+read key is `ENTRY_READ_KEY`. Reference it, do not paste a value:
 
-| Variable | Required | Default | Meaning |
-|---|---|---|---|
-| `COCKPIT_URL` | yes | — | cockpit base URL, e.g. `https://<cockpit domain>` |
-| `COCKPIT_AI_KEY` | yes | — | the cockpit `AI_DECISION_KEY` (sent as the `X-AI-Key` header) |
-| `HL_ADDRESS` | yes | — | HL main wallet address (public; used for the public info API) |
-| `HL_INFO_URL` | no | `https://api.hyperliquid.xyz/info` | HL public info endpoint |
-| `OPS_HTTP_TIMEOUT_S` | no | `20` | per-request timeout; a timeout is `DATA_UNAVAILABLE` |
-| `OPS_BX_ENABLED` | no | `1` | `0` skips every BX source and rule |
-| `OPS_LOOKBACK_MIN` | no | `65` | exit monitor "new closes since last run" window |
-| `OPS_DAILY_SUMMARY_HOUR_HKT` | no | `20` | hour (HKT) whose exit-monitor run sends the daily OK line |
-| `OPS_AUDIT_WINDOW_H` | no | `24` | audit look-back window |
-| `OPS_SLIPPAGE_MAX_BP` | no | `60` | `SLIPPAGE_HIGH` threshold |
-| `OPS_EXPECT_BX_LIVE` | no | unset | `1`: `BX_LIVE=0` is a problem in the audit; `0`/unset: not judged |
-| `OPS_BX_EXPECTED_COUNTRY` | no | `SG` | egress country the audit expects |
-| `OPS_BX_EXPECTED_REGION_PREFIX` | no | `asia-southeast1` | bx-exec Railway region prefix the audit expects |
-| `OPS_AUDIT_SEND_OK` | no | `0` | `1`: send the audit summary even when OK |
-| `ALERT_WEBHOOK_URL` | no | — | POST `{"text": "..."}` (same payload as `failsafe_exit_worker` / `BX_ALERT_WEBHOOK`; Slack-compatible) |
-| `SMTP_HOST` | no | — | email sink (with `ALERT_EMAIL_TO`) |
-| `SMTP_PORT` | no | `587` (`465` if `SMTP_SSL=1`) | |
-| `SMTP_USER` / `SMTP_PASSWORD` | no | — | SMTP login (skipped if `SMTP_USER` is empty) |
-| `SMTP_SSL` | no | `0` | `1` = implicit TLS (port 465); otherwise STARTTLS |
-| `SMTP_STARTTLS` | no | `1` | `0` disables STARTTLS (plain SMTP; not recommended) |
-| `ALERT_EMAIL_FROM` | no | `SMTP_USER` | sender address |
-| `ALERT_EMAIL_TO` | no | — | comma-separated recipients |
-| `BRAIN_DSN` | no | — | Postgres DSN; when set, one insert-only row per run into `raw.ops_check_run` |
+```
+COCKPIT_AI_KEY=${{cockpit.ENTRY_READ_KEY}}
+```
 
-**Alert sinks.** The repo's only existing alert mechanism is a JSON webhook (`ALERT_WEBHOOK_URL` in
-`failsafe_exit_worker.py`, `BX_ALERT_WEBHOOK` in bx-exec, payload `{"text": ...}`). Email was sent by the AI
-routine itself. So ops_cron reuses the webhook payload and adds SMTP for email. With neither set, alerts are only
-`[OPS_ALERT]` log lines in Railway. Railway allows outbound SMTP only on Pro plans; on other plans, use the webhook
-(for example a Slack incoming webhook or an email-relay webhook).
+HL calls use wallet **address** env vars only (no private keys).
+
+### Every service
+
+| Variable | Required | Meaning |
+|---|---|---|
+| `TELEGRAM_BOT_TOKEN` | one sink | Telegram bot token |
+| `TELEGRAM_CHAT_ID` | with the token | chat that receives alerts and reports |
+| `SMTP_HOST`, `ALERT_EMAIL_TO` | email fallback | used only when both Telegram vars are unset |
+| `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_SSL`, `SMTP_STARTTLS`, `ALERT_EMAIL_FROM` | no | email details (port 587, STARTTLS on, unless `SMTP_SSL=1`) |
+| `BRAIN_DATABASE_URL` | no | giiq-brain DSN. Tables are created if missing |
+| `OPS_HTTP_TIMEOUT_S` | no | per-request timeout, default 20s. A timeout is `DATA_UNAVAILABLE` |
+
+### `ops-exit-monitor`, `ops-daily-audit`, `ops-desk-missing`, `ops-harbor-pnl`, `ops-bo-report`, `ops-desk-veto`, `ops-trade-journal`
+
+| Variable | Required | Meaning |
+|---|---|---|
+| `COCKPIT_URL` | yes | cockpit base URL |
+| `COCKPIT_AI_KEY` | yes | `${{cockpit.ENTRY_READ_KEY}}` |
+| `HL_ADDRESS` | yes except desk-missing | main HL wallet address (public info API) |
+| `HL_INFO_URL` | no | default `https://api.hyperliquid.xyz/info` |
+
+Desk-missing needs only `COCKPIT_URL`, `COCKPIT_AI_KEY`, and a sink. It does not call Hyperliquid.
+
+### Extra
+
+| Service | Variable | Meaning |
+|---|---|---|
+| exit-monitor, daily-audit | `OPS_BX_ENABLED` | `0` skips BX reads and rules (default on) |
+| exit-monitor | `OPS_LOOKBACK_MIN` | close look-back, default 65 |
+| daily-audit | `OPS_AUDIT_WINDOW_H` | default 24 |
+| daily-audit | `OPS_SLIPPAGE_MAX_BP` | default 60 |
+| daily-audit | `OPS_EXPECT_BX_LIVE` | `1` makes `BX_LIVE=0` a problem |
+| daily-audit | `OPS_BX_EXPECTED_COUNTRY` | default `SG` |
+| daily-audit | `OPS_BX_EXPECTED_REGION_PREFIX` | default `asia-southeast1` |
+| harbor-pnl | `HARBOR_OUT_DIR` | default `harbor/out` |
+| harbor-pnl | `RIVER_ADMIN_DIR` | default `river/admin` (latest infra review file) |
+| desk-veto | `BX_PUBLIC_URL` | Bitunix public kline host, default `https://fapi.bitunix.com` (GET, no key) |
+| c48-scoreboard | `TESTNET_WALLET_ADDRESS` | HL testnet address. Not a private key |
+| c48-scoreboard | `HL_TESTNET_INFO_URL` | default `https://api.hyperliquid-testnet.xyz/info` |
+| c48-scoreboard | `C48_NAV_START` | NAV baseline for the 4% drawdown check. Unset → drawdown `未知` and a problem |
+
+C48 does not need `COCKPIT_URL`. It does not call mainnet.
+
+## What each job reads
+
+| Source | Calls | Auth |
+|---|---|---|
+| cockpit | `GET /api/exit/health`, `/api/scheduler/status`, `/api/bx/status`, `/api/bx/day?date=`, `/api/exec/pending`, `/api/exec/run-report?date=` | `X-AI-Key: COCKPIT_AI_KEY` |
+| cockpit | `GET /api/public/radar` | none |
+| Hyperliquid public info | the seven types listed above | none (`HL_ADDRESS` or `TESTNET_WALLET_ADDRESS`) |
+| Bitunix public | `GET /api/v1/futures/market/kline` | none |
+
+`/api/exec/run-report` includes a `decisions` object for that HKT date (posted, count, records, history).
+No file path and no key in the body.
+
+## Exit-monitor and daily-audit rules
+
+A run is `problem` when `problems` is non-empty. Duplicate `(code, coin)` pairs are reported once.
+
+### Exit monitor
+
+| Code | Fires when |
+|---|---|
+| `DATA_UNAVAILABLE` | a source errors, times out, returns non-2xx, `/api/bx/status` has no `breaker` / `open`, or `/api/exec/pending` fails |
+| `NO_SL` and other exit-health codes | cockpit `/api/exit/health` reports them (`JOB_MISSED` is replaced by `JOB_STALE`) |
+| `NO_SL` | an open HL position has no trigger / reduce-only / TP-SL order (`frontendOpenOrders`) |
+| `HL_ENTRY_CAP` | more than 3 distinct HL opening order ids today HKT |
+| `JOB_STALE` | `1h_scan_exits` > 75 min, `4h_scan_exits` or `pending_entries` > 265 min, `1d_scan_candidates` or `executor` > 1470 min, or never run |
+| `SCHEDULER_DISABLED` | `SCHEDULER_ENABLED=0` |
+| `BX_BREAKER` | BX circuit breaker tripped |
+| `BX_BREAKER_NOT_TRIPPED` | realised BX P&L ≤ −3% of baseline NAV and the breaker is not tripped |
+| `BX_MAX_OPEN` / `BX_ENTRY_CAP` / `BX_NO_SL` | more than `max_open` (2), more than `max_new_per_day` (1), or an open live BX position with no Hard SL |
+| `BX_EGRESS` / `BX_LIVE_BLOCKED` | `BX_LIVE=1` and egress or `live_ready` is not ok |
+| `BX_JOB_ERROR` / `BX_JOB_STALE` | bx-exec job last ended in error, or is older than 1h 75 / 4h 265 / daily 1470 / entries 1470 min |
+
+Pending continuation being disabled is recorded, not a problem. Info only: recent closes, `BX_JOB_UNKNOWN`, `BX_DISABLED`.
+
+### Daily audit
+
+Same BX rules, plus `RULE_VIOLATION` (Hard SL missing or < 1.5% below the fill, leverage outside 1–5x,
+Base fill not above the 1D Upper, pending fill at or below the zone Lower, BX Hard SL not confirmed)
+and `SLIPPAGE_HIGH` (HL fill more than 60 bp above the mid at signal). A 404 from `/api/bx/day` is
+`BX_DAY_MISSING` (info). The summary is sent every day.
 
 ## Run locally
 
 ```bash
-# offline, from fixtures (no network, nothing sent)
-python -m ops_cron exit-monitor --dry-run --fixture ops_cron/tests/fixtures/exit_ok.json
-python -m ops_cron daily-audit  --dry-run --fixture ops_cron/tests/fixtures/audit_ok.json
-
-# live reads, nothing sent / written (needs COCKPIT_URL, COCKPIT_AI_KEY, HL_ADDRESS)
-python -m ops_cron exit-monitor --dry-run
-python -m ops_cron daily-audit  --dry-run --now 2026-10-04T01:22:00Z
-
-# tests
-python -m pytest -q ops_cron            # or: python -m unittest discover -s ops_cron/tests -t .
+python -m ops_cron.main exit-monitor --dry-run --fixture ops_cron/tests/fixtures/exit_ok.json
+python -m ops_cron.main daily-audit  --dry-run --fixture ops_cron/tests/fixtures/audit_ok.json
+python -m pytest -q ops_cron
 ```
 
-`--dry-run` prints the markdown report and the pretty JSON report. It sends no alert and writes no row.
-Exit code: `0` for `ok` and `problem`. `1` only if the script itself crashed; it then tries to send an
-`OPS_CRASH` alert.
+## Deploy
 
-## Deploy as a Railway cron service
+Create **eight** Railway cron services in the same project as cockpit. Do not change cockpit, bx-exec,
+or chainstack-grid config except the cockpit deploy that already carries `GET /api/exec/run-report`.
 
-Do this twice, once per check, in the same project as the cockpit:
+For each service:
 
-1. **New service → GitHub repo** (this repo, branch `main`). Name it `ops-exit-monitor` (or `ops-daily-audit`).
-   Any region works: it only calls the cockpit and the public HL API, never Bitunix.
-2. **Settings → Config-as-code → Railway config file path:** `/ops_cron/railway.exit-monitor.json`
-   (or `/ops_cron/railway.daily-audit.json`). This sets the Dockerfile builder (`ops_cron/Dockerfile`), the start
-   command, the cron schedule (`12 * * * *` / `22 1 * * *`), `restartPolicyType: NEVER` and
-   `watchPatterns: ["ops_cron/**"]`. Do not attach a volume, public domain or healthcheck.
-3. **Variables:** `COCKPIT_URL`, `COCKPIT_AI_KEY`, `HL_ADDRESS`, plus at least one sink (`ALERT_WEBHOOK_URL`, or
-   `SMTP_HOST` + `SMTP_USER` + `SMTP_PASSWORD` + `ALERT_EMAIL_TO`) and optionally `BRAIN_DSN`.
-   To reference the cockpit key without copying it: `COCKPIT_AI_KEY=${{cockpit.AI_DECISION_KEY}}`.
-4. If `BRAIN_DSN` is set: run `ops_cron/schema.sql` once against that database (it can also create an
-   insert-only role).
-5. Deploy. Check the first run in the service's logs: one JSON line with `"status":"ok"` (or the problems).
-   Use **Run now** in Railway (or `python -m ops_cron exit-monitor --dry-run` locally with the same vars) to
-   test right away.
-6. When both services have run cleanly for a day, turn off the two bot routines (EXIT_DESK hourly, 09:22 audit).
+1. New service from this repo, branch `main`, after this PR is merged. Any region: these jobs never call Bitunix with a key.
+2. Config-as-code path: `/ops_cron/railway.<job>.json`. That sets `ops_cron/Dockerfile`, the start command
+   `python -m ops_cron.main <job>`, the UTC cron string, `restartPolicyType: NEVER`, and `watchPatterns: ["ops_cron/**"]`.
+   No volume, public domain, or healthcheck.
+3. Variables from the tables above. Cockpit key reference:
+
+   `COCKPIT_AI_KEY=${{cockpit.ENTRY_READ_KEY}}`
+
+4. Redeploy cockpit so the `decisions` field on run-report is live before the first 08:30 / 09:22 run.
+5. Optional: set `BRAIN_DATABASE_URL`. The cron creates the tables. Running `ops_cron/schema.sql` once is enough
+   if you want them before the first insert.
 
 ## Known gaps
 
-- **BX slippage and BX exit efficiency are not computed.** bx-exec does not expose the mid at signal, the entry
-  for closed trades, or BX candles through a read endpoint. ops_cron does not call Bitunix directly, so these
-  fields stay empty. HL has both.
-- **The BX daily entry cap counts open positions only.** A BX position opened and closed on the same day is not
-  counted, because `closed_recent` has no entry time.
-- **BX job freshness resets when bx-exec restarts** (job status is in memory). Until each job runs again it is
-  `BX_JOB_UNKNOWN` (info), not a problem.
-- **Repeat alerts.** Runs keep no state, so a problem that persists is alerted every hour.
-- **Key scope.** `COCKPIT_AI_KEY` is the cockpit `AI_DECISION_KEY`, which also authorises `POST /api/ai/decision`
-  and `POST /api/exec/run`. ops_cron only sends GETs (enforced in code and tested), but a separate read-only key
-  on the cockpit would be safer.
+- `source=claude` cannot tell Claude.ai from Forge. The decider column stays `unknown` unless the record
+  carries an explicit actor or `source=forge` / `source=fallback`.
+- BX NAV is `未知`. Public Bitunix klines are used only as a candle fallback on the veto job.
+- `userFills` is capped at 2000. All-time realised P&L is then `未核實`.
+- BX slippage and BX exit efficiency are not computed. The daily BX entry cap counts open positions only.
+- BX job freshness resets when bx-exec restarts (`BX_JOB_UNKNOWN` until the job runs again).
+- A problem that persists is alerted on every exit-monitor run. Runs keep no alert state.
+- There is no separate `OPS_READ_KEY`. `COCKPIT_AI_KEY` is the cockpit read key, sent only as a header on GETs.

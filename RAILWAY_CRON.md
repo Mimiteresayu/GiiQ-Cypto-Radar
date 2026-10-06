@@ -123,9 +123,9 @@ and must not be changed. Never add entry logic to this worker.
 
 ## Ops checks (separate cron services)
 
-The hourly exit monitor and the 09:22 HKT daily live audit run as two separate Railway **cron** services from
-`ops_cron/` (read-only, no LLM, alert only on problems). Schedules, rules, env vars and deploy steps:
-[ops_cron/README.md](ops_cron/README.md).
+Read-only ops checks run as separate Railway **cron** services from `ops_cron/` (no LLM). One service per
+schedule: exit monitor every 4h, 09:22 HKT daily audit, 08:30 HKT desk-missing, Harbor P&L, Cove BO report,
+and River's three jobs. Schedules (HKT and UTC), env vars and deploy steps: [ops_cron/README.md](ops_cron/README.md).
 
 ## Narrative
 

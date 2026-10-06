@@ -158,6 +158,25 @@ class TestHeaderAuthOnKeyedEndpoints(_Server):
         for k in ("runs", "executed", "skipped", "failed"):
             self.assertIn(k, d)
         self.assertEqual(self.get("/api/exec/run-report?date=../x", {"X-AI-Key": AI_KEY})[0], 400)
+        self.assertFalse(d["decisions"]["posted"])
+        self.assertEqual(d["decisions"]["count"], 0)
+
+    def test_run_report_includes_that_days_decisions(self):
+        ddir = os.path.join(self.tmp, "decisions")
+        os.makedirs(ddir)
+        with open(os.path.join(ddir, "decisions_20261003.json"), "w") as f:
+            json.dump({"decisions": {"SOL": {"symbol": "SOL", "decision": "approve", "source": "claude",
+                                             "timestamp": "2026-10-02T16:12:00+00:00", "type": "BASE",
+                                             "reason": "desk"}},
+                       "history": []}, f)
+        with patch.dict(os.environ, {"DECISIONS_DIR": ddir}):
+            code, body = self.get("/api/exec/run-report?date=2026-10-03", {"X-AI-Key": AI_KEY})
+        self.assertEqual(code, 200)
+        d = json.loads(body)
+        self.assertTrue(d["decisions"]["posted"])
+        self.assertEqual(d["decisions"]["records"][0]["symbol"], "SOL")
+        self.assertEqual(d["decisions"]["records"][0]["source"], "claude")
+        self.assertNotIn(ddir.encode(), body)
 
     def test_entry_candidates_header(self):
         self.assertEqual(self.get("/api/entry-candidates")[0], 403)

@@ -6,8 +6,8 @@
     "watchPatterns": ["ops_cron/**"]
   },
   "deploy": {
-    "startCommand": "python -m ops_cron exit-monitor",
-    "cronSchedule": "12 * * * *",
+    "startCommand": "python -m ops_cron.main exit-monitor",
+    "cronSchedule": "17 0,4,8,12,16,20 * * *",
     "restartPolicyType": "NEVER"
   }
 }

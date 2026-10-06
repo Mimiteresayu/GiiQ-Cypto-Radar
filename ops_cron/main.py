@@ -1,13 +1,12 @@
-"""ops_cron entrypoint (Railway cron service). READ-ONLY: GETs cockpit endpoints with the X-AI-Key read key and
-reads the public Hyperliquid info API; never places / modifies / cancels orders or changes env / feature flags.
+"""ops_cron entrypoint (one Railway cron service per job). READ-ONLY: GETs cockpit with the X-AI-Key header
+and reads the public Hyperliquid info API; never places, modifies or cancels orders.
 
-  python -m ops_cron exit-monitor [--dry-run] [--fixture FILE] [--now ISO]
-  python -m ops_cron daily-audit  [--dry-run] [--fixture FILE] [--now ISO]
+  python -m ops_cron.main <job> [--dry-run] [--fixture FILE] [--now ISO]
 
-Normal run: stdout = exactly one JSON line (the report); alerts only on `problem` (plus the 20:xx HKT daily OK
-summary for the exit monitor); INSERT into raw.ops_check_run when BRAIN_DSN is set.
---dry-run: same data reads, prints the markdown + pretty JSON report, sends nothing and writes nothing.
---fixture: read inputs from a JSON file {"now": ISO, "inputs": {...}} instead of the network (offline).
+Jobs: exit-monitor, daily-audit, desk-missing, harbor-pnl, bo-report, c48-scoreboard, desk-veto, trade-journal.
+Scheduled reports (daily-audit, harbor-pnl, bo-report) always send one message. The others alert only on problems.
+Brain writes use BRAIN_DATABASE_URL (BRAIN_DSN still accepted): CREATE TABLE IF NOT EXISTS, then insert-only.
+--dry-run prints the markdown and pretty JSON, sends nothing and writes nothing.
 Exit code 0 for ok and problem; 1 only if the script itself crashed (an alert is attempted).
 """
 from __future__ import annotations
@@ -21,9 +20,9 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Mapping, Optional
 
-from . import alerts, persist, rules, sources
+from . import alerts, audit_brief, catalog, persist, rules, sources
 
-CHECKS = ("exit-monitor", "daily-audit")
+CHECKS = ("exit-monitor", "daily-audit") + catalog.JOBS
 
 
 def _env_bool(env: Mapping[str, str], name: str, default: Optional[bool]) -> Optional[bool]:
@@ -70,25 +69,52 @@ def build_report(check: str, env: Mapping[str, str], fixture: Optional[str] = No
                               cfg["timeout_s"])
         if check == "exit-monitor":
             inputs = sources.exit_monitor_inputs(src, now, cfg["lookback_min"], cfg["bx_enabled"])
-        else:
+        elif check == "daily-audit":
             inputs = sources.daily_audit_inputs(src, now, cfg["bx_enabled"], cfg["window_h"])
-    rep = rules.exit_monitor(inputs, now, cfg) if check == "exit-monitor" else rules.daily_audit(inputs, now, cfg)
-    if check == "daily-audit" and rep["notify"] is None and cfg["audit_send_ok"]:
-        rep["notify"] = "daily_ok"
+        else:
+            inputs = catalog.fetch(check, env, now)
+    if check == "exit-monitor":
+        rep = rules.exit_monitor(inputs, now, cfg)
+    elif check == "daily-audit":
+        rep = rules.daily_audit(inputs, now, cfg)
+        rep["brief_md"] = audit_brief.build(inputs, now)
+    else:
+        rep = catalog.build(check, inputs, now, env)
     rep["run_id"] = str(uuid.uuid4())
     return rep
 
 
 def _subject(rep: Dict[str, Any]) -> str:
-    name = "exit monitor" if rep["check"] == "exit_monitor" else "daily audit"
+    names = {"exit_monitor": "exit monitor", "daily_audit": "daily audit", "desk_missing": "desk missing",
+             "harbor_pnl": "harbor pnl", "bo_live_report": "bo report", "river_c48_ft_score": "c48 scoreboard",
+             "river_desk_veto": "desk veto", "river_trade_log": "trade journal"}
     tag = "PROBLEM" if rep["status"] == "problem" else "OK"
-    return f"[ops] {tag} {name} {rep['run_at_hkt']} HKT: {rep['summary']}"[:200]
+    return f"[ops] {tag} {names.get(rep['check'], rep['check'])} {rep['run_at_hkt']} HKT: {rep['summary']}"[:200]
+
+
+def _markdown(rep: Dict[str, Any]) -> str:
+    if rep.get("markdown"):
+        return rep["markdown"]
+    md = rules.to_markdown(rep)
+    if rep.get("brief_md"):
+        md = md + "\n" + rep["brief_md"]
+    return md
+
+
+def _write_out(rep: Dict[str, Any], env: Mapping[str, str]) -> None:
+    spec = rep.get("out_file")
+    if not spec:
+        return
+    from pathlib import Path
+    root = Path(env.get("HARBOR_OUT_DIR") or "harbor/out")
+    root.mkdir(parents=True, exist_ok=True)
+    (root / spec["name"]).write_text(spec["text"], encoding="utf-8")
 
 
 def run(check: str, env: Mapping[str, str], dry_run: bool = False, fixture: Optional[str] = None,
         now: Optional[datetime] = None) -> Dict[str, Any]:
     rep = build_report(check, env, fixture, now)
-    md = rules.to_markdown(rep)
+    md = _markdown(rep)
     rep["dry_run"] = dry_run
     if dry_run:
         rep["alerted"] = False
@@ -99,10 +125,27 @@ def run(check: str, env: Mapping[str, str], dry_run: bool = False, fixture: Opti
         rep["alert"] = alerts.send(_subject(rep), md, env, timeout=config(env)["timeout_s"])
         rep["alerted"] = any(v == "sent" for k, v in rep["alert"].items() if k != "log")
     sys.stderr.write(md)
-    dsn = (env.get("BRAIN_DSN") or "").strip()
-    rep["persisted"] = persist.insert(rep, dsn) if dsn else "skipped (BRAIN_DSN not set)"
+    dsn = persist.brain_dsn(env)
+    if dsn:
+        made = persist.ensure_tables(dsn)
+        if made != "ok":
+            sys.stderr.write(f"[OPS] Brain schema failed: {made}\n")
+        rep["persisted"] = persist.insert(rep, dsn)
+    else:
+        rep["persisted"] = "skipped (BRAIN_DATABASE_URL not set)"
     if dsn and rep["persisted"] != "ok":
         sys.stderr.write(f"[OPS] Brain insert failed: {rep['persisted']}\n")
+    if dsn and rep.get("brain_rows"):
+        extra = []
+        for spec in rep["brain_rows"]:
+            extra.append(persist.insert_rows(dsn, spec["table"], spec["columns"], spec["values"]))
+        rep["brain_tables"] = extra
+        if any(x != "ok" for x in extra):
+            sys.stderr.write(f"[OPS] Brain report insert failed: {extra}\n")
+    try:
+        _write_out(rep, env)
+    except Exception as e:  # noqa: BLE001
+        sys.stderr.write(f"[OPS] report file failed: {type(e).__name__}\n")
     persist.emit(rep)
     return rep
 

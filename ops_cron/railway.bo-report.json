@@ -6,8 +6,8 @@
     "watchPatterns": ["ops_cron/**"]
   },
   "deploy": {
-    "startCommand": "python -m ops_cron.main daily-audit",
-    "cronSchedule": "22 1 * * *",
+    "startCommand": "python -m ops_cron.main bo-report",
+    "cronSchedule": "32 1,12 * * 1-5",
     "restartPolicyType": "NEVER"
   }
 }

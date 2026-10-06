@@ -1822,6 +1822,61 @@ def _today_run_report(now: datetime | None = None, day: str | None = None) -> di
     return out
 
 
+def _decision_public(sym: object, rec: dict) -> dict:
+    """Desk-POST fields the ops cron is allowed to read. No file path, no key."""
+    try:
+        from decisions import _rec_source
+        source = _rec_source(rec)
+    except Exception:
+        source = str(rec.get("source") or "")
+    return {
+        "symbol": str(sym or rec.get("symbol") or rec.get("coin") or ""),
+        "decision": rec.get("decision"),
+        "type": rec.get("type"),
+        "source": source,
+        "timestamp": rec.get("timestamp"),
+        "reason": str(rec.get("reason") or "")[:240],
+        "size_pct": rec.get("size_pct"),
+        "leverage": rec.get("leverage"),
+        "actor": rec.get("actor") or rec.get("decider"),
+    }
+
+
+def _decisions_on_day(day: str) -> dict:
+    """Read-only view of the HKT decision file for `day` (YYYY-MM-DD).
+
+    Same route as GET /api/exec/run-report. Does not store, fall back, or trade.
+    """
+    empty: dict = {"ok": True, "date": day, "posted": False, "count": 0, "records": [], "history": []}
+    ymd = day.replace("-", "")
+    if not re.fullmatch(r"\d{8}", ymd):
+        return {**empty, "ok": False, "error": "bad date"}
+    try:
+        from decisions import _decisions_dir
+        path = _decisions_dir() / f"decisions_{ymd}.json"
+    except Exception as e:
+        return {**empty, "ok": False, "error": type(e).__name__}
+    if not path.is_file():
+        return empty
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        return {**empty, "ok": False, "error": type(e).__name__}
+    if not isinstance(data, dict):
+        return {**empty, "ok": False, "error": "bad file"}
+    records = []
+    by = data.get("decisions") if isinstance(data.get("decisions"), dict) else {}
+    for sym, rec in by.items():
+        if isinstance(rec, dict):
+            records.append(_decision_public(sym, rec))
+    history = []
+    for rec in data.get("history") or []:
+        if isinstance(rec, dict):
+            history.append(_decision_public(rec.get("symbol"), rec))
+    return {"ok": True, "date": day, "posted": bool(records), "count": len(records),
+            "records": records, "history": history[-200:]}
+
+
 def _pending_view() -> list:
     """Active pending pullback entries + live trigger zones (cockpit / API)."""
     try:
@@ -2466,7 +2521,7 @@ class Handler(SimpleHTTPRequestHandler):
                 if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
                     self._send_json(400, {"ok": False, "error": "date must be YYYY-MM-DD"})
                     return
-                self._send_json(200, {"ok": True, **_today_run_report(day=day)})
+                self._send_json(200, {"ok": True, **_today_run_report(day=day), "decisions": _decisions_on_day(day)})
             return
         if self._need_auth():
             return

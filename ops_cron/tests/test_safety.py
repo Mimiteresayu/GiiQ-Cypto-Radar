@@ -48,11 +48,17 @@ class FakeHTTP:
             data = (self.inputs.get(name) or {}).get("data", {})
         else:
             t = body["type"]
-            data = {"clearinghouseState": (self.inputs.get("hl_state") or {}).get("data"),
-                    "frontendOpenOrders": (self.inputs.get("hl_orders") or {}).get("data"),
-                    "userFillsByTime": (self.inputs.get("hl_fills") or {}).get("data"),
-                    "candleSnapshot": ((self.inputs.get("candles") or {}).get((body.get("req") or {}).get("coin"))
-                                       or {}).get("data", [])}[t]
+            coin = (body.get("req") or {}).get("coin")
+            table = {
+                "clearinghouseState": (self.inputs.get("hl_state") or {}).get("data") or {},
+                "frontendOpenOrders": (self.inputs.get("hl_orders") or {}).get("data") or [],
+                "userFillsByTime": (self.inputs.get("hl_fills") or {}).get("data") or [],
+                "userFills": (self.inputs.get("hl_fills") or {}).get("data") or [],
+                "userFunding": (self.inputs.get("hl_funding") or {}).get("data") or [],
+                "allMids": (self.inputs.get("all_mids") or {}).get("data") or {},
+                "candleSnapshot": ((self.inputs.get("candles") or {}).get(coin) or {}).get("data", []),
+            }
+            data = table.get(t, [])
         return _Resp(data)
 
 
@@ -152,25 +158,45 @@ class TestRunModes(unittest.TestCase):
         lines = out.strip().splitlines()
         self.assertEqual(len(lines), 1)
         rep = json.loads(lines[0])
-        self.assertEqual((rep["status"], rep["alerted"], rep["persisted"]), ("ok", False, "skipped (BRAIN_DSN not set)"))
+        self.assertEqual((rep["status"], rep["alerted"], rep["persisted"]),
+                         ("ok", False, "skipped (BRAIN_DATABASE_URL not set)"))
 
-    def test_problem_run_alerts_webhook_and_email_without_leaking_secrets(self):
+    def test_problem_run_alerts_telegram_and_skips_email(self):
         sent = {}
-        env = {**ENV, "ALERT_WEBHOOK_URL": SECRET_HOOK, "SMTP_HOST": "smtp.invalid", "SMTP_USER": "ops",
-               "SMTP_PASSWORD": SECRET_PW, "ALERT_EMAIL_TO": "owner@example.invalid"}
-        with patch("ops_cron.alerts._webhook", side_effect=lambda url, text, t: sent.setdefault("hook", text) and "sent"), \
-                patch("ops_cron.alerts._email", side_effect=lambda e, s, text, t: sent.setdefault("mail", s) and "sent"):
+        env = {**ENV, "TELEGRAM_BOT_TOKEN": "tg-TOKEN-999", "TELEGRAM_CHAT_ID": "4242",
+               "SMTP_HOST": "smtp.invalid", "SMTP_USER": "ops", "SMTP_PASSWORD": SECRET_PW,
+               "ALERT_EMAIL_TO": "owner@example.invalid"}
+        def _tg(token, chat, text, t):
+            sent["tg"] = text
+            return "sent"
+
+        with patch("ops_cron.alerts._telegram", side_effect=_tg), \
+                patch("ops_cron.alerts._email", side_effect=AssertionError("email used while telegram is set")):
             rc, out, err = run_main(["exit-monitor", "--fixture", self.problem_fixture()], env)
         self.assertEqual(rc, 0)
         rep = json.loads(out.strip())
         self.assertEqual(rep["status"], "problem")
         self.assertTrue(rep["alerted"])
-        self.assertEqual(rep["alert"], {"log": "sent", "webhook": "sent", "email": "sent"})
-        self.assertIn("NO_SL", sent["hook"])
-        self.assertTrue(sent["mail"].startswith("[ops] PROBLEM exit monitor"))
-        self.assertIn("[OPS_ALERT]", err)
-        for s in (SECRET_KEY, SECRET_PW, SECRET_HOOK):
+        self.assertEqual(rep["alert"], {"log": "sent", "telegram": "sent"})
+        self.assertIn("NO_SL", sent["tg"])
+        self.assertNotIn("tg-TOKEN-999", out + err)
+        for s in (SECRET_KEY, SECRET_PW):
             self.assertNotIn(s, out + err)
+
+    def test_email_fallback_when_telegram_absent(self):
+        sent = {}
+        env = {**ENV, "SMTP_HOST": "smtp.invalid", "SMTP_USER": "ops", "SMTP_PASSWORD": SECRET_PW,
+               "ALERT_EMAIL_TO": "owner@example.invalid"}
+        def _mail(e, s, text, t):
+            sent["mail"] = s
+            return "sent"
+
+        with patch("ops_cron.alerts._email", side_effect=_mail):
+            rc, out, err = run_main(["exit-monitor", "--fixture", self.problem_fixture()], env)
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(out.strip())["alert"]["email"], "sent")
+        self.assertTrue(sent["mail"].startswith("[ops] PROBLEM exit monitor"))
+        self.assertNotIn(SECRET_PW, out + err)
 
     def test_no_sink_configured_logs_structured_alert(self):
         rc, out, err = run_main(["exit-monitor", "--fixture", self.problem_fixture()], ENV)
@@ -181,17 +207,19 @@ class TestRunModes(unittest.TestCase):
         self.assertIn("NO_SL", json.loads(line[len("[OPS_ALERT] "):])["text"])
 
     def test_failed_sink_is_reported(self):
-        with patch("ops_cron.alerts._webhook", side_effect=OSError("boom")):
-            rc, out, _ = run_main(["exit-monitor", "--fixture", self.problem_fixture()],
-                                  {**ENV, "ALERT_WEBHOOK_URL": SECRET_HOOK})
-        self.assertEqual(json.loads(out.strip())["alert"]["webhook"], "error: OSError")
+        with patch("ops_cron.alerts._telegram", side_effect=OSError("boom")):
+            rc, out, err = run_main(["exit-monitor", "--fixture", self.problem_fixture()],
+                                    {**ENV, "TELEGRAM_BOT_TOKEN": "tg-TOKEN-999", "TELEGRAM_CHAT_ID": "1"})
+        self.assertTrue(json.loads(out.strip())["alert"]["telegram"].startswith("error: OSError"))
+        self.assertNotIn("tg-TOKEN-999", out + err)
 
-    def test_daily_audit_ok_summary_opt_in(self):
-        with patch("ops_cron.alerts.send", return_value={"log": "sent"}) as send:
-            run_main(["daily-audit", "--fixture", str(FIX / "audit_ok.json")], ENV)
-            send.assert_not_called()
-            run_main(["daily-audit", "--fixture", str(FIX / "audit_ok.json")], {**ENV, "OPS_AUDIT_SEND_OK": "1"})
-            send.assert_called_once()
+    def test_daily_audit_always_sends_one_summary(self):
+        with patch("ops_cron.alerts.send", return_value={"log": "sent", "telegram": "sent"}) as send:
+            rc, out, _ = run_main(["daily-audit", "--fixture", str(FIX / "audit_ok.json")], ENV)
+        self.assertEqual(rc, 0)
+        send.assert_called_once()
+        self.assertEqual(json.loads(out.strip())["notify"], "report")
+        self.assertIn("Today's 08:55 run report", send.call_args.args[1])
 
     def test_brain_insert_only(self):
         executed = []
@@ -220,8 +248,14 @@ class TestRunModes(unittest.TestCase):
             rc, out, _ = run_main(["daily-audit", "--fixture", str(FIX / "audit_ok.json")], {**ENV, "BRAIN_DSN": SECRET_DSN})
         rep = json.loads(out.strip())
         self.assertEqual(rep["persisted"], "ok")
-        (sql, params), = executed
+        inserts = [(sql, params) for sql, params in executed if sql.upper().startswith("INSERT")]
+        self.assertEqual(len(inserts), 1)
+        sql, params = inserts[0]
         self.assertTrue(sql.startswith("INSERT INTO raw.ops_check_run "))
+        self.assertTrue(any(s.upper().startswith("CREATE TABLE IF NOT EXISTS RAW.OPS_CHECK_RUN") for s, _ in executed))
+        for sql, _params in executed:
+            upper = sql.upper()
+            self.assertFalse(upper.startswith("UPDATE") or " DELETE " in f" {upper} ")
         self.assertEqual(params[1:4], ("daily_audit", rep["run_at"], "ok"))
         self.assertEqual(json.loads(params[7])["run_id"], rep["run_id"])
         self.assertNotIn(SECRET_DSN, out)

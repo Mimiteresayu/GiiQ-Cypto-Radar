@@ -378,17 +378,28 @@ def exit_monitor(inp: Dict[str, Any], now: datetime, cfg: Dict[str, Any]) -> Dic
             rep.note("BX_CLOSE", c.get("bx_symbol"), f"{c.get('exit_reason')} P&L {c.get('pnl_usd')} USD", "bx_status")
 
     hk = now.astimezone(HKT)
-    daily = hk.hour == int(cfg.get("daily_summary_hour_hkt", 20))
+    pend_body: Dict[str, Any] = {"checked": False}
+    if "pending" in inp:
+        names = list(names) + ["pending"]
+        if not (inp.get("pending") or {}).get("ok"):
+            rep.problem("DATA_UNAVAILABLE", "pending",
+                        f"pending unavailable: {(inp.get('pending') or {}).get('error') or 'not fetched'}", "ops_cron")
+        else:
+            pdata = _data(inp.get("pending"))
+            active = (pdata.get("active") or []) if isinstance(pdata, dict) else []
+            pend_body = {"checked": True, "disabled": pdata.get("disabled") if isinstance(pdata, dict) else None,
+                         "n_active": len(active) if isinstance(active, list) else None}
     ok_line = (f"OK · HL {len(pos)} 倉 · BX {bx_body.get('n_open', '-')} 倉 · BX_LIVE="
                f"{'-' if not bx_body.get('checked') else int(bool(bx_body.get('bx_live')))} · "
                f"closes {len(hl_closes) + len(bx_body.get('closes_since_last_run') or [])} · {hk.strftime('%H:%M HKT %d-%b')}")
     res = _result("exit_monitor", now, rep, ok_line, {
         "hl": {"n_positions": len(pos), "positions": pos, "entries_today": len(hl_today),
                "closes_since_last_run": hl_closes},
-        "bx": bx_body, "cockpit_jobs": jobs,
+        "bx": bx_body, "pending": pend_body, "cockpit_jobs": jobs,
         "exit_health_summary": eh.get("summary") if isinstance(eh, dict) else None,
         "sources": _source_status(inp, names), "lookback_min": int(cfg.get("lookback_min", 65))})
-    res["notify"] = "problem" if res["status"] == "problem" else ("daily_ok" if daily else None)
+    # Silent when nothing is wrong. The old 20:xx daily OK line is not sent.
+    res["notify"] = "problem" if res["status"] == "problem" else None
     return res
 
 
@@ -581,7 +592,8 @@ def daily_audit(inp: Dict[str, Any], now: datetime, cfg: Dict[str, Any]) -> Dict
         "bx": {**bx_body, "orders_24h": bx_orders},
         "trade_review": {"fills": fills_review, "missed_entries": list(missed.values()), "exits": exits},
         "sources": _source_status(inp, names)})
-    res["notify"] = "problem" if res["status"] == "problem" else None
+    # The 09:22 audit always produces one summary. Problems are inside that message.
+    res["notify"] = "report"
     return res
 
 

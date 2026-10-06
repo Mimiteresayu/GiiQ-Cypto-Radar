@@ -13,7 +13,11 @@ from typing import Any, Dict, Optional
 
 from . import rules
 
-HL_READ_TYPES = frozenset({"clearinghouseState", "frontendOpenOrders", "userFillsByTime", "candleSnapshot"})
+HL_READ_TYPES = frozenset({
+    "clearinghouseState", "frontendOpenOrders", "userFills", "userFillsByTime",
+    "userFunding", "candleSnapshot", "allMids",
+})
+_HL_NO_USER = frozenset({"candleSnapshot", "allMids"})
 HL_FILLS_LOOKBACK_DAYS = 30
 
 
@@ -37,12 +41,14 @@ def _call(req: urllib.request.Request, timeout: float) -> Dict[str, Any]:
 
 
 class Sources:
-    def __init__(self, cockpit_url: str, ai_key: str, hl_address: str, hl_info_url: str, timeout: float = 20.0):
+    def __init__(self, cockpit_url: str, ai_key: str, hl_address: str, hl_info_url: str, timeout: float = 20.0,
+                 bx_base: str = "https://fapi.bitunix.com"):
         self.cockpit_url = (cockpit_url or "").rstrip("/")
         self.ai_key = ai_key or ""
         self.hl_address = hl_address or ""
         self.hl_info_url = hl_info_url
         self.timeout = timeout
+        self.bx_base = bx_base or "https://fapi.bitunix.com"
 
     def cockpit(self, path: str) -> Dict[str, Any]:
         if not self.cockpit_url or not self.ai_key:
@@ -54,10 +60,27 @@ class Sources:
     def hl(self, body: Dict[str, Any]) -> Dict[str, Any]:
         if body.get("type") not in HL_READ_TYPES:
             raise ValueError(f"HL info type {body.get('type')!r} is not an allowed read type")
-        if body.get("type") != "candleSnapshot" and not self.hl_address:
+        if body.get("type") not in _HL_NO_USER and not self.hl_address:
             return _res(False, error="HL_ADDRESS not set")
         req = urllib.request.Request(self.hl_info_url, data=json.dumps(body).encode(), method="POST",
                                      headers={"Content-Type": "application/json"})
+        return _call(req, self.timeout)
+
+    def cockpit_public(self, path: str) -> Dict[str, Any]:
+        """GET a cockpit route that does not take the AI key (for example /api/public/radar)."""
+        if not self.cockpit_url:
+            return _res(False, error="COCKPIT_URL not set")
+        if "key=" in path.lower():
+            raise ValueError("cockpit_public refuses a key in the URL")
+        req = urllib.request.Request(self.cockpit_url + path, method="GET", headers={"Accept": "application/json"})
+        return _call(req, self.timeout)
+
+    def bx_klines(self, symbol: str, interval: str = "1h", limit: int = 200) -> Dict[str, Any]:
+        """Bitunix public futures kline. GET only, no key."""
+        import urllib.parse
+        q = urllib.parse.urlencode({"symbol": symbol, "interval": interval, "limit": str(min(int(limit), 200))})
+        url = self.bx_base.rstrip("/") + "/api/v1/futures/market/kline?" + q
+        req = urllib.request.Request(url, method="GET", headers={"Accept": "application/json"})
         return _call(req, self.timeout)
 
 
@@ -77,6 +100,7 @@ def exit_monitor_inputs(src: Sources, now: datetime, lookback_min: int, bx_enabl
     }
     if bx_enabled:
         inp["bx_status"] = src.cockpit("/api/bx/status")
+    inp["pending"] = src.cockpit("/api/exec/pending")
     return inp
 
 
@@ -93,12 +117,31 @@ def daily_audit_inputs(src: Sources, now: datetime, bx_enabled: bool, window_h: 
     if bx_enabled:
         inp["bx_status"] = src.cockpit("/api/bx/status")
         inp["bx_day"] = src.cockpit(f"/api/bx/day?date={today}")
+    inp["hl_state"] = src.hl({"type": "clearinghouseState", "user": src.hl_address})
+    inp["hl_orders"] = src.hl({"type": "frontendOpenOrders", "user": src.hl_address})
+    inp["all_mids"] = src.hl({"type": "allMids"})
     candles: Dict[str, Any] = {}
     for req in rules.candle_requests(inp["hl_fills"], now, window_h):
         candles[req["coin"]] = src.hl({"type": "candleSnapshot", "req": {
             "coin": req["coin"], "interval": "1h", "startTime": req["start_ms"], "endTime": req["end_ms"]}})
     inp["candles"] = candles
+    inp["pos_candles"] = _position_candles(src, inp["hl_state"], now)
     return inp
+
+
+def _position_candles(src: Sources, state_res: Dict[str, Any], now: datetime) -> Dict[str, Any]:
+    """1H and 4H candles for each open HL coin, enough bars for the GC channel."""
+    from . import hlparse
+    coins = [p["coin"] for p in hlparse.positions(state_res.get("data") if state_res.get("ok") else None)]
+    out: Dict[str, Any] = {}
+    end_ms = int(now.timestamp() * 1000)
+    for coin in coins:
+        out[coin] = {}
+        for interval, n_bars, bar_ms in (("1h", 400, 3_600_000), ("4h", 450, 14_400_000)):
+            out[coin][interval] = src.hl({"type": "candleSnapshot", "req": {
+                "coin": coin, "interval": interval,
+                "startTime": end_ms - n_bars * bar_ms, "endTime": end_ms}})
+    return out
 
 
 def utcnow() -> datetime:
