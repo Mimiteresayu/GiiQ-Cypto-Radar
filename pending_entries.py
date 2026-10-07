@@ -160,6 +160,7 @@ def band(kind: str, row_1d: Optional[dict], row_4h: Optional[dict]) -> Dict[str,
             "prev_upper": _f(d1.get("prev_upper")),
             "trend": d1.get("trend"),
             "bar_time": d1.get("bar_time"),
+            "dual_cross_up": d1.get("dual_cross_up"),  # Real radar field (closed-bar)
         },
         "4h": {
             "upper": _f(d4.get("upper")),
@@ -170,6 +171,7 @@ def band(kind: str, row_1d: Optional[dict], row_4h: Optional[dict]) -> Dict[str,
             "prev_upper": _f(d4.get("prev_upper")),
             "trend": d4.get("trend"),
             "bar_time": d4.get("bar_time"),
+            "dual_cross_up": d4.get("dual_cross_up"),  # Real radar field (closed-bar)
         }
     }
 
@@ -258,15 +260,33 @@ def evaluate(rec: dict, bnd: Dict[str, Any], mid: Optional[float], now: datetime
     
     # Step 1: Check for 1D breakout if not yet marked
     if not rec.get("breakout_1d"):
-        if not all([d1d.get("close"), d1d.get("upper"), d1d.get("prev_close"), d1d.get("prev_upper")]):
-            return "wait", "waiting for 1D dual cross up above 1D Upper", {}
+        if not all([d1d.get("close"), d1d.get("upper"), d1d.get("trend")]):
+            return "wait", "missing 1D band values", {}
         
-        if (d1d.get("close") > d1d.get("upper") and 
-            d1d.get("prev_close") <= d1d.get("prev_upper") and 
-            d1d.get("trend") == "Green"):
+        # Check for 1D dual cross up: use prev fields if available, else use dual_cross_up flag (real radar)
+        has_prev = d1d.get("prev_close") is not None and d1d.get("prev_upper") is not None
+        crossed_up = False
+        
+        if has_prev:
+            # Test data path: explicit prev close/upper
+            crossed_up = (d1d.get("close") > d1d.get("upper") and 
+                         d1d.get("prev_close") <= d1d.get("prev_upper"))
+        elif d1d.get("dual_cross_up") is not None:
+            # Production path: use radar's dual_cross_up flag (closed-bar)
+            crossed_up = d1d.get("dual_cross_up")
+        
+        # Accept existing breakout if trend still Green and price above Upper (don't require fresh cross)
+        if crossed_up and d1d.get("trend") == "Green":
             upd["breakout_1d"] = True
             upd["breakout_date_1d"] = now.astimezone(HKT).strftime("%Y-%m-%d")
             return "wait", f"Step 1 complete: 1D breakout detected (close {d1d.get('close'):.6g} > Upper {d1d.get('upper'):.6g})", upd
+        
+        # Also accept if currently above Upper and Green (older breakout still valid)
+        if d1d.get("close") > d1d.get("upper") and d1d.get("trend") == "Green":
+            upd["breakout_1d"] = True
+            upd["breakout_date_1d"] = now.astimezone(HKT).strftime("%Y-%m-%d")
+            return "wait", f"Step 1 complete: 1D above Upper with Green trend (close {d1d.get('close'):.6g} > Upper {d1d.get('upper'):.6g})", upd
+        
         return "wait", "waiting for 1D dual cross up above 1D Upper", {}
     
     # Step 2: Check for 4H retrace if not yet touched or if we've had a new 4H bar since last retrace
@@ -285,13 +305,22 @@ def evaluate(rec: dict, bnd: Dict[str, Any], mid: Optional[float], now: datetime
     if not rec.get("retrace_touched"):
         return "wait", "waiting for 4H retrace down to 4H Filter or Lower", {}
     
-    if not all([d4h.get("close"), d4h.get("upper"), d4h.get("prev_close"), d4h.get("prev_upper")]):
-        return "wait", "waiting for 4H dual cross up data", {}
+    if not all([d4h.get("close"), d4h.get("upper"), d4h.get("trend")]):
+        return "wait", "missing 4H band values for breakout check", {}
     
-    # Check for 4H dual cross up
-    if (d4h.get("close") > d4h.get("upper") and 
-        d4h.get("prev_close") <= d4h.get("prev_upper") and 
-        d4h.get("trend") == "Green"):
+    # Check for 4H dual cross up: use prev fields if available, else use dual_cross_up flag (real radar)
+    has_prev = d4h.get("prev_close") is not None and d4h.get("prev_upper") is not None
+    crossed_up = False
+    
+    if has_prev:
+        # Test data path: explicit prev close/upper
+        crossed_up = (d4h.get("close") > d4h.get("upper") and 
+                     d4h.get("prev_close") <= d4h.get("prev_upper"))
+    elif d4h.get("dual_cross_up") is not None:
+        # Production path: use radar's dual_cross_up flag (closed-bar)
+        crossed_up = d4h.get("dual_cross_up")
+    
+    if crossed_up and d4h.get("trend") == "Green":
         if not mid or mid <= d4h.get("lower", 0):
             return "wait", f"4H cross-up confirmed but live mid {mid} not above 4H Lower {d4h.get('lower'):.6g}", {}
         # TRIGGER!

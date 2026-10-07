@@ -262,11 +262,13 @@ def run_preflight(hl: Any = None, signed_probe: bool = True, now: Optional[datet
         pend = pending_summary(load_pending(), rows_1d, rows_4h, pmids)
         res["pending"] = pend
         for p in pend:
+            # New 3-step display: show current step and key band levels
             add(f"pending:{p['symbol']}", True,
-                f"{p['kind']} zone {p['band_tf'].upper()} [{p['zone_lower']}, {p['zone_filter']}] mid {p['mid']}"
-                f"{' IN ZONE' if p['in_zone'] else ''} exp {p['expires_at']}", blocking=False)
+                f"{p['kind']} {p['current_step']} | 1D: {p['1d_close']:.4g} ({p['1d_trend']}) "
+                f"| 4H: {p['4h_close']:.4g} ({p['4h_trend']}, filter {p['4h_filter']:.4g}) "
+                f"| mid {p['mid']:.4g if p.get('mid') else 'N/A'} | exp {p['expires_at']}", blocking=False)
         if not pend:
-            add("pending", True, "no active pending pullback entries", blocking=False)
+            add("pending", True, "no active 3-step pending entries", blocking=False)
     except Exception as e:  # noqa: BLE001
         add("pending", False, f"pending list failed: {e}", blocking=False)
     return res

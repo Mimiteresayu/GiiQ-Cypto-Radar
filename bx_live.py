@@ -892,7 +892,13 @@ def run_entries(now: Optional[datetime] = None, trade_api=None, egress: Optional
                 rep["skipped"].append({"symbol": c["symbol"], "reason": "no ENTRY_DESK approval"})
                 continue
             if c["type"] == "Chase":
-                rep["pending"].append(create_live_pending(pend, c, appr, now))
+                # Check PENDING_CONTINUATION_DISABLED flag before creating BX CONT record
+                from pending_entries import pending_disabled
+                if pending_disabled():
+                    rep["skipped"].append({"symbol": c["symbol"], "reason": "Chase (CONT) approved but pending disabled"})
+                    _log(f"[BX_LIVE] {c['symbol']} Chase approved but CONT pending disabled - acknowledged, no entry")
+                else:
+                    rep["pending"].append(create_live_pending(pend, c, appr, now))
                 continue
             _try_enter(api, conn, c, meta_all, acct, nav, book, now, market, tiers_fn, rep)
         save_live_pending(pend)
