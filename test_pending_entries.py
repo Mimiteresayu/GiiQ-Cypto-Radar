@@ -219,7 +219,7 @@ class TestEvaluate(unittest.TestCase):
         self.assertTrue(c1)
         self.assertFalse(c2)
         self.assertEqual(len(entries), 1)
-        self.assertEqual(r1["expires_at"], (NOW + timedelta(days=7)).isoformat())
+        self.assertEqual(r1["expires_at"], (NOW + timedelta(days=30)).isoformat())
         # Original values preserved (not overwritten by second call)
         self.assertEqual(r1["size_pct"], 3)
         self.assertEqual(r1["leverage"], 2)

@@ -115,6 +115,24 @@ def run_job(job: str) -> Dict[str, Any]:
     return res
 
 
+def run_manual_entries(symbols: List[str]) -> Dict[str, Any]:
+    """Manual BX entry run for the listed symbols only (same gates as the 08:56 job). Never raises."""
+    if not bx_live.env_on("BX_ENABLED", "1"):
+        return {"status": "skipped", "why": "BX_ENABLED=0"}
+    if not _lock.acquire(timeout=30):
+        return {"status": "busy", "why": "another BX job is running"}
+    try:
+        bx_live._log(f"[BX_MANUAL] entries requested for {symbols}")
+        rep = bx_live.run_entries(only=symbols)
+        bx_live._log("[BX_MANUAL] result " + json.dumps(
+            {k: rep.get(k) for k in ("live", "gate", "entered", "pending", "skipped")}, default=str)[:900])
+        return {"status": "done", **rep}
+    except Exception as e:  # noqa: BLE001
+        return {"status": "error", "message": f"{type(e).__name__}: {str(e)[:200]}"}
+    finally:
+        _lock.release()
+
+
 def _write_json(name: str, obj: Any) -> None:
     p = OUT_DIR / name
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -283,6 +301,15 @@ class Handler(BaseHTTPRequestHandler):
                 return
             res = bx_live.store_decisions(decs, str(body.get("source") or "claude"))
             self._send(200 if res.get("ok") else 422, res)
+            return
+        if u.path == "/api/bx/run":
+            syms = body.get("symbols")
+            if body.get("confirm") is not True or not isinstance(syms, list) or not syms \
+                    or not all(isinstance(x, str) and x.strip() for x in syms):
+                self._send(400, {"ok": False, "error": "need {\"confirm\": true, \"symbols\": [\"BRUSDT\", ...]}"})
+                return
+            res = run_manual_entries([x.strip().upper() for x in syms])
+            self._send(200 if res.get("status") == "done" else 409, {"ok": res.get("status") == "done", "result": res})
             return
         self._send(404, {"ok": False, "error": "not found"})
 

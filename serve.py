@@ -1733,6 +1733,42 @@ def _scheduled_executor(manual: bool = False, live_api: bool = False) -> dict:
     return res
 
 
+def _scheduled_daily_addon(manual: bool = False) -> dict:
+    """08:57 HKT: Signum-style top-up of held winners -> daily_addon.py (OFF unless DAILY_ADDON_ENABLED=1).
+    Same env as the executor (LIVE iff EXEC_DRY_RUN=0); manual (password) runs are forced DRY_RUN."""
+    job_name = "manual_daily_addon" if manual else "daily_addon"
+    res: dict = {}
+    if not _exec_lock.acquire(timeout=120):
+        _update_job_status(job_name, "skipped", "executor pass already running")
+        return {"status": "busy"}
+    try:
+        rc, out, err = _run_worker("daily_addon.py", [], timeout=300, force_dry_run=manual)
+        try:
+            res = json.loads(out)
+        except Exception:
+            res = {}
+        status = res.get("status", "unknown")
+        if res.get("checked") or res.get("filled") or status != "success":
+            _record_run_report(job_name, res)
+        msg = (f"[{SOT_ID}] {res.get('mode', '?')} {status}: checked={len(res.get('checked', []))} "
+               f"filled={len(res.get('filled', []))} skipped={len(res.get('skipped', []))}"
+               + (f" | {res.get('message')}" if res.get("message") else ""))
+        if rc == 0 and status in ("success", "fail_closed"):
+            _update_job_status(job_name, status, msg)
+        else:
+            _update_job_status(job_name, "error", msg, (err or out)[-1500:])
+        sys.stderr.write(f"[SCHEDULER] {job_name} {status}: {msg}\n")
+    except subprocess.TimeoutExpired:
+        _update_job_status(job_name, "error", "", "daily_addon timed out (>300s)")
+        res = {"status": "error", "message": "daily_addon timed out (>300s)"}
+    except Exception as e:
+        _update_job_status(job_name, "error", "", str(e))
+        res = {"status": "error", "message": str(e)}
+    finally:
+        _exec_lock.release()
+    return res
+
+
 def _scheduled_pending(manual: bool = False, after_exits: str | None = None) -> dict:
     """Every 4h at :10 HKT, right after the 4H closed-bar scan (called from the 4H job):
     pending 3-step entries (ADD_ON / CONT) -> pending_worker.py.
@@ -2134,6 +2170,7 @@ MANUAL_JOBS = {
     "executor": _scheduled_executor,
     "live": _scheduled_live_radar,
     "pending": _scheduled_pending,
+    "addon": _scheduled_daily_addon,
     "dims": _scheduled_dims,
     "dims_outcomes": _scheduled_dims_outcomes,
     "dims_backfill": _scheduled_dims_backfill,
@@ -2218,6 +2255,8 @@ def _init_scheduler() -> BackgroundScheduler | None:
                           id="exec_preflight_boot", name="LIVE preflight at boot", **common)
         scheduler.add_job(_scheduled_executor, CronTrigger(hour=8, minute=55, timezone=hkt),
                           id="executor", name="Auto-Executor", **common)
+        scheduler.add_job(_scheduled_daily_addon, CronTrigger(hour=8, minute=57, timezone=hkt),
+                          id="daily_addon", name="Daily ADD_ON top-up (Signum rule; OFF by default)", **common)
         # LIVE radar every 10 min; first run ~30s after boot (does boot scans if cache missing)
         scheduler.add_job(_scheduled_live_radar, CronTrigger(minute=LIVE_RADAR_MINUTES, timezone=hkt),
                           id="live_radar", name="LIVE radar 1D/4H/1H + candidates sync",
@@ -2533,6 +2572,9 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if path == "/api/exec/run":
             self._exec_run()
+            return
+        if path == "/api/bx/run":
+            self._bx_run()
             return
         if path == "/api/exec/preflight":
             self._exec_preflight()
@@ -2933,6 +2975,23 @@ class Handler(SimpleHTTPRequestHandler):
             self._send_json(409, {"ok": False, **res})
             return
         self._send_json(200, {"ok": res.get("status") in ("success", "fail_closed"), "date": today, "result": res})
+
+    def _bx_run(self) -> None:
+        """POST /api/bx/run (keyed, X-AI-Key): manual Bitunix entry run for the listed symbols only.
+        Body {"confirm": true, "symbols": ["BRUSDT"]}. Forwarded to bx-exec, which applies the same gates as the
+        08:56 job (live gate, breaker, egress, radar freshness, Hard SL, liq, 80% cap) and enters each symbol
+        at most once per HKT day."""
+        if not self._ai_key_ok():
+            return
+        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            body = json.loads((self.rfile.read(length) if length else b"{}").decode() or "{}")
+        except Exception:
+            self._send_json(400, {"ok": False, "error": "invalid json"})
+            return
+        code, res = _bx_service("/api/bx/run", {"confirm": body.get("confirm"), "symbols": body.get("symbols")},
+                                timeout=150.0)
+        self._send_json(code, res)
 
     def _ai_decision(self) -> None:
         """POST /api/ai/decision: store AI approval/veto decisions.

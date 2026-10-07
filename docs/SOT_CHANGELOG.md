@@ -284,7 +284,7 @@ This is the first versioned SoT. It collects every executor change made on 2026-
   - Bar N is a closed band-TF bar with low ≤ Filter and close > Lower.
   - Bar N+1 must close > Lower and > bar N's close, with trend Green. The entry is then placed at
     the live mid.
-- **Cancelled** on any band-TF close below Lower, after 7 days, when a CONTINUATION coin is
+- **Cancelled** on any band-TF close below Lower, after 30 days (was 7; MMT 2026-10-07), when a CONTINUATION coin is
   already held, or when an ADD_ON's base position has closed.
 - All fail-closed SoT checks run again at fill time:
   - radar freshness
@@ -361,3 +361,21 @@ used for orders.
 - Spread limit unchanged at 10 bp. Spread depth is now measured for every contract with vol >= $200K.
 - `bx_live`: candidates and orders on coins under $1M 24h volume carry the flag `low_vol_under_1M` (never blocks).
 - `LIQ_EXIT_VOL` $1M -> $200K (MMT): `liquidity_exit` for open BX trades now only below $200K or spread > 30 bp.
+
+## Pending CONT / ADD_ON expiry 7 -> 30 days; manual BX run; naming (2026-10-07, MMT)
+- `pending_entries.PENDING_TTL_DAYS` 7 -> **30** (also the `PENDING_STALE` health check). Still cancelled on a 1D close below 1D Lower.
+- New manual route `POST /api/bx/run` (cockpit, X-AI-Key; forwarded to bx-exec): body `{"confirm": true, "symbols": ["BRUSDT"]}`.
+  Runs the normal 08:56 entry checks for the listed symbols only, at most once per HKT day per symbol.
+- Naming: the signal formerly called **"Chase"** is a **4H Breakout** signal (1D Green + 4H Green + 4H close crossing up through the 4H Upper).
+  It is a signal, not an order. An approved 4H Breakout becomes a **CONT** (coin not held) or **ADD_ON** (coin held) pending.
+  Internal data values (`type: "Chase"` in the candidates / decisions API) are unchanged so the desk and Railway keep working.
+
+## CONT dropped, ADD_ON = Signum top-up (2026-10-07, MMT) — OFF by default
+- No CONT: a coin you do not hold enters only through the Base (fresh daily cross + Green). The 4H "Chase" CONT / ADD_ON pullback
+  pendings stay disabled (`PENDING_CONTINUATION_DISABLED`, default on) and are not used.
+- New `daily_addon.py` (08:57 HKT, after the 08:55 executor; `DAILY_ADDON_ENABLED=1` to switch on, DRY_RUN unless live): for each coin held LONG,
+  add 2% NAV margin at the position's existing isolated leverage when the latest CLOSED 1D bar's close is still above the 1D Upper,
+  the position's PRICE gain is >= +10% and the coin's notional after the add stays <= 20% NAV. Once per coin per HKT day.
+  Same fail-closed checks as every entry (radar row-count + freshness, liq beyond Hard SL, Hard SL per tier, SL distance, price sanity,
+  min order, 80% total margin). Mechanical (no desk decision), like Signum.
+- Manual dry-run: cockpit job `addon`. Tests: `test_daily_addon.py`.

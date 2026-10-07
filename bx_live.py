@@ -674,6 +674,12 @@ def live_entries_today(conn, now: datetime) -> int:
                if r[0] and hkt_date(datetime.fromisoformat(r[0])) == day)
 
 
+def _traded_today(conn, bx_symbol: str, now: datetime) -> bool:
+    day = hkt_date(now)
+    return any(r[0] and hkt_date(datetime.fromisoformat(r[0])) == day for r in
+               conn.execute("SELECT entry_time FROM shadow_trades WHERE mode='live' AND bx_symbol=?", (bx_symbol,)))
+
+
 def realized_live_pnl(conn) -> float:
     return float(conn.execute("SELECT COALESCE(SUM(pnl_usd),0) FROM shadow_trades "
                               "WHERE mode='live' AND status='closed'").fetchone()[0] or 0.0)
@@ -822,7 +828,8 @@ def _trade_api(dry: bool = False):
 def run_entries(now: Optional[datetime] = None, trade_api=None, egress: Optional[dict] = None,
                 nav_fn: Callable[[], Optional[float]] = hl_nav, market: Callable[[str], dict] = live_market,
                 tiers_fn=None, conn=None,
-                hl_margin_fn: Callable[[], Optional[float]] = hl_margin_used) -> Dict[str, Any]:
+                hl_margin_fn: Callable[[], Optional[float]] = hl_margin_used,
+                only: Optional[List[str]] = None) -> Dict[str, Any]:
     """08:56 HKT: approved BX candidates -> live entries (Base / 4H NewToken) or live pending (Chase).
     GIIQ-SoT-5 ADD-1: BX radar freshness check before any orders."""
     import bx_egress
@@ -835,7 +842,15 @@ def run_entries(now: Optional[datetime] = None, trade_api=None, egress: Optional
                            "entered": [], "pending": [], "skipped": []}
     cand_doc = _read(candidates_path()) or {}
     cands = cand_doc.get("candidates") or [] if cand_doc.get("date") == hkt_date(now) else []
-    
+    if only is not None:
+        # Manual run (POST /api/bx/run): only the listed symbols, each at most once per HKT day.
+        want = {str(x).upper() for x in only}
+        listed = {c["symbol"].upper() for c in cands}
+        for x in sorted(want - listed):
+            rep["skipped"].append({"symbol": x, "reason": "not in today's BX candidate list"})
+        cands = [c for c in cands if c["symbol"].upper() in want]
+        rep["manual"] = True
+
     # GIIQ-SoT-5 ADD-1: check BX radar freshness before any orders
     if ok:
         radar_1d = bx_radar.load_radar("1d")
@@ -895,6 +910,9 @@ def run_entries(now: Optional[datetime] = None, trade_api=None, egress: Optional
             save_live_pending(pend)
             _log(f"[BX_LIVE] Cancelled {len(old_gone)} old-style (N/N+1) BX pendings: {[e.get('id') for e in old_gone]}")
         for c in cands:
+            if only is not None and _traded_today(conn, c["symbol"], now):
+                rep["skipped"].append({"symbol": c["symbol"], "reason": "already entered today (manual run is once per day)"})
+                continue
             appr = approval_for(c["symbol"], now, fallback=fallback_map)
             if not appr:
                 rep["skipped"].append({"symbol": c["symbol"], "reason": "no ENTRY_DESK approval"})

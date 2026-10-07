@@ -82,7 +82,7 @@ class TestExitHealth(unittest.TestCase):
                 "executor": {"last_run": (NOW - timedelta(hours=5)).isoformat(), "status": "error", "error": "boom"},
                 "manual_executor": {"last_run": NOW.isoformat(), "status": "error"}}
         pend = [{"status": "pending", "symbol": "SUI", "kind": "ADD_ON",
-                 "created_at": (NOW - timedelta(days=8)).isoformat()}]
+                 "created_at": (NOW - timedelta(days=31)).isoformat()}]
         r = self.run_check(_perp(_pos("MON", margin="900")), [{"coin": "MON", "reduceOnly": True}],
                            r1h=_radar([], age_h=3), jobs=jobs, pending=pend)
         codes = sorted(p["code"] for p in r["problems"])

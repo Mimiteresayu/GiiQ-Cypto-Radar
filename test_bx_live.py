@@ -304,6 +304,27 @@ class TestEntriesFailClosed(Tmp):
         self.assertEqual([e["status"] for e in rep["entered"]], ["filled"] * 3)
         self.assertEqual(rep["skipped"], [])
 
+    def _manual(self, api, only, now=T0):
+        self.touch_radar(now)
+        return L.run_entries(now=now, trade_api=api, egress=SG, nav_fn=lambda: 10_000.0,
+                             market=lambda s: dict(LIVE), tiers_fn=lambda s: TIERS, conn=self.conn,
+                             hl_margin_fn=lambda: 0.0, only=only)
+
+    def test_manual_run_only_listed_symbols_once_per_day(self):
+        syms = ["FOOUSDT", "BARUSDT"]
+        self.seed([cand(s) for s in syms], [meta(s) for s in syms],
+                  [{"coin": s.replace("USDT", ""), "action": "APPROVE", "size_pct": 2, "leverage": 2} for s in syms])
+        api = FakeAPI()
+        rep = self._manual(api, ["BARUSDT", "NOPEUSDT"])
+        self.assertEqual([e["status"] for e in rep["entered"]], ["filled"])          # BAR only, not FOO
+        self.assertEqual(len(api.orders()), 1)
+        self.assertTrue(rep["manual"])
+        self.assertIn("NOPEUSDT", [x["symbol"] for x in rep["skipped"]])             # not in today's list
+        rep2 = self._manual(api, ["BARUSDT"])                                        # second press: no 2nd order
+        self.assertEqual(rep2["entered"], [])
+        self.assertEqual(len(api.orders()), 1)
+        self.assertIn("already", rep2["skipped"][0]["reason"])
+
     def test_total_margin_cap_hl_plus_bx(self):
         """NAV = 10k HL + 1k BX = 11k. HL margin 8,500 + 1st BX 220 (2%) = 79.3% ok; 2nd -> 81.3% > 80% refused."""
         syms = ["FOOUSDT", "BARUSDT"]
