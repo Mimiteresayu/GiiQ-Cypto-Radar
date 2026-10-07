@@ -93,6 +93,8 @@ class TestLiquidityAndSignals(unittest.TestCase):
                                    k.get("spr"), k.get("ign"), k.get("cem", False), k.get("new", False))
         self.assertEqual(t(vol=5e6, spr=4), "tradeable")
         self.assertEqual(t(vol=5e6, spr=12), "watch")
+        self.assertEqual(t(vol=2.5e5, spr=4), "tradeable")              # new BX listings: >= $200K is enough
+        self.assertEqual(t(vol=1.5e5, spr=4), "exclude")
         self.assertEqual(t(vol=5e6, spr=None), "watch")                 # unknown spread never tradeable
         self.assertEqual(t(vol=1e6), "watch")
         self.assertEqual(t(vol=1e5), "exclude")
