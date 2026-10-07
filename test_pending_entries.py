@@ -225,6 +225,81 @@ class TestEvaluate(unittest.TestCase):
         self.assertEqual(r1["leverage"], 2)
 
 
+class TestRealRadarShape(unittest.TestCase):
+    """Test with REAL radar row shape (no prev fields, only dual_cross_up flag)."""
+    
+    def real_row(self, symbol="AAA", close=1.05, upper=1.0, lower=0.9, filter=0.95, 
+                 trend="Green", dual_cross_up=False):
+        """Real production radar row shape (from /api/ai/candidates DESK_DATA)."""
+        return {
+            "symbol": symbol,
+            "close": close,
+            "upper": upper,
+            "lower": lower,
+            "filter": filter,
+            "trend": trend,
+            "dual_cross_up": dual_cross_up,
+            "dual_cross_down": False,
+            "bar_time": T0,
+        }
+    
+    def real_bnd(self, d1d_close=1.1, d1d_upper=1.0, d1d_lower=0.9, d1d_dual_cross_up=True,
+                 d4h_close=1.05, d4h_upper=1.0, d4h_filter=0.95, d4h_lower=0.9, d4h_dual_cross_up=False):
+        """Real band dict using radar rows with dual_cross_up flag (no prev fields)."""
+        row_1d = self.real_row(close=d1d_close, upper=d1d_upper, lower=d1d_lower, 
+                               dual_cross_up=d1d_dual_cross_up)
+        row_4h = self.real_row(close=d4h_close, upper=d4h_upper, lower=d4h_lower, 
+                               filter=d4h_filter, dual_cross_up=d4h_dual_cross_up)
+        return pe.band("CONT", row_1d, row_4h)
+    
+    def rec(self, breakout_1d=False, retrace_touched=False, last_retrace_bar_t=None):
+        """Create a pending record."""
+        return {
+            "id": "test", "symbol": "AAA", "kind": pe.CONT, "status": "pending",
+            "created_at": (NOW - timedelta(days=1)).isoformat(),
+            "expires_at": (NOW + timedelta(days=6)).isoformat(),
+            "breakout_1d": breakout_1d,
+            "retrace_touched": retrace_touched,
+            "last_retrace_bar_t": last_retrace_bar_t,
+        }
+    
+    def test_step1_with_dual_cross_up_flag(self):
+        """Step 1 detects 1D breakout using dual_cross_up flag (real radar shape)."""
+        r = self.rec(breakout_1d=False)
+        bnd = self.real_bnd(d1d_close=1.1, d1d_upper=1.0, d1d_dual_cross_up=True)
+        a, why, upd = pe.evaluate(r, bnd, 1.05, NOW, set())
+        self.assertEqual(a, "wait")
+        self.assertIn("Step 1 complete", why)
+        self.assertTrue(upd["breakout_1d"])
+    
+    def test_step1_accepts_existing_breakout(self):
+        """Step 1 accepts existing breakout if still Green and above Upper."""
+        r = self.rec(breakout_1d=False)
+        # Close above Upper, Green, but dual_cross_up=False (older breakout)
+        bnd = self.real_bnd(d1d_close=1.1, d1d_upper=1.0, d1d_dual_cross_up=False)
+        a, why, upd = pe.evaluate(r, bnd, 1.05, NOW, set())
+        self.assertEqual(a, "wait")
+        self.assertIn("Step 1 complete", why)
+        self.assertTrue(upd["breakout_1d"])
+    
+    def test_step3_with_dual_cross_up_flag(self):
+        """Step 3 triggers using dual_cross_up flag (real radar shape)."""
+        r = self.rec(breakout_1d=True, retrace_touched=True, last_retrace_bar_t=T0 - H4)
+        bnd = self.real_bnd(d4h_close=1.05, d4h_upper=1.0, d4h_dual_cross_up=True)
+        a, why, upd = pe.evaluate(r, bnd, 1.02, NOW, set())
+        self.assertEqual(a, "trigger")
+        self.assertIn("Step 3 complete", why)
+    
+    def test_no_prev_fields_no_dual_cross_up_waits(self):
+        """Without prev fields or dual_cross_up flag, step waits."""
+        r = self.rec(breakout_1d=False)
+        bnd = self.real_bnd(d1d_close=0.95, d1d_upper=1.0, d1d_dual_cross_up=False)
+        a, why, upd = pe.evaluate(r, bnd, 1.0, NOW, set())
+        self.assertEqual(a, "wait")
+        self.assertIn("waiting for 1d", why.lower())
+        self.assertEqual(upd, {})
+
+
 class TestOldStyleCleanup(unittest.TestCase):
     """Tests for old-style (N/N+1 zone trigger) pending cleanup."""
     
