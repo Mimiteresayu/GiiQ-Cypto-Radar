@@ -26,7 +26,7 @@ DAY_MS = 86_400_000
 NEW_CONTRACT_DAYS = 30
 NEW_TOKEN_DAYS = 30            # asset first seen < 30 days before the BX launch -> new token
 VOL_TRADEABLE = 2_000_000.0
-VOL_WATCH_MIN = 300_000.0
+VOL_WATCH_MIN = 200_000.0
 SPREAD_TRADEABLE_BP = 10.0
 MAX_SIZE_OF_VOL = 0.005        # shadow notional <= 0.5% of 24h volume
 IGNITION_X = 3.0
@@ -213,7 +213,7 @@ def ignition(vol24h: Optional[float], prior_daily_vols: List[float]) -> Optional
 
 def liq_tier(vol24h: Optional[float], status: str, delist_ms: Optional[int], cls: str,
              spread_bp: Optional[float], ign_x: Optional[float], is_cemetery: bool, new_tok: bool) -> str:
-    """Harbor tiers. exclude: vol < $0.3M (unless ignition-flagged C / new token), not OPEN, delisting,
+    """Harbor tiers. exclude: vol < $0.2M (unless ignition-flagged C / new token), not OPEN, delisting,
     unknown class. tradeable: vol >= $2M and spread <= 10 bp (unknown spread -> watch)."""
     v = _f(vol24h) or 0.0
     if str(status or "").upper() != "OPEN" or delist_ms or cls == "unknown":

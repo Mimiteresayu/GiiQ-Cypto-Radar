@@ -236,7 +236,7 @@ def build_catalog(pairs: List[dict], tickers: List[dict], hl_mids: Dict[str, flo
 
 def scan_set(meta_rows: List[dict]) -> List[dict]:
     """Contracts we pull candles for: BX-only crypto + all TradFi, OPEN, not delisting, not unknown class,
-    and either >= $0.3M 24h volume or a new contract / cemetery candidate (ignition needs their candles)."""
+    and either >= $0.2M 24h volume or a new contract / cemetery candidate (ignition needs their candles)."""
     out = []
     for r in meta_rows:
         if r["ex"] != "BX" or r["asset_class"] == "unknown":
