@@ -401,8 +401,9 @@ def _execute(
             r1d_p = next((r for r in radar_1d.get("rows", []) if r.get("symbol") == symbol), None)
             r4h_p = next((r for r in radar_4h.get("rows", []) if r.get("symbol") == symbol), None)
             bnd = pending_band(kind, r1d_p, r4h_p)
-            info = {"symbol": symbol, "kind": kind, "band_tf": bnd["tf"], "zone_lower": bnd["lower"],
-                    "zone_filter": bnd["filter"], "size_pct": decision.get("size_pct"),
+            d4h = bnd.get("4h", {})
+            info = {"symbol": symbol, "kind": kind, "4h_lower": d4h.get("lower"),
+                    "4h_filter": d4h.get("filter"), "size_pct": decision.get("size_pct"),
                     "leverage": decision.get("leverage")}
             if live:
                 rec, created = create_pending(pend_entries, symbol, kind, decision, cand, bnd, now)
@@ -412,7 +413,7 @@ def _execute(
             else:
                 info["would_create"] = True
             result["pending"].append(info)
-            _log(f"{mode} PENDING {kind} {symbol}: zone {bnd['tf'].upper()} [{bnd['lower']}, {bnd['filter']}]"
+            _log(f"{mode} PENDING {kind} {symbol}: 3-step rule (1D breakout → 4H retrace → 4H cross-up)"
                  f"{'' if live else ' (DRY_RUN: not stored)'}")
             continue
         if not is_base:
