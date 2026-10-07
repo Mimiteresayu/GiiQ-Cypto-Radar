@@ -2,7 +2,7 @@
 """Bitunix shadow book — simulated entries / exits for BX-only signals. NO ORDERS, NO KEYS.
 
 Harbor-approved rules (2026-09-29):
-  Signals      same locked GC rules as HL. Base = 1D close crosses above 1D Upper + 1D Green.
+  Signals      same locked GC rules as HL. Base = 1D close crosses above 1D Upper (fresh cross only; MMT 2026-10-07).
                Chase = 1D Green + 4H Green + 4H cross above 4H Upper -> simulated pending pullback
                (CONTINUATION / ADD_ON, N / N+1 confirmation via pending_entries.evaluate, 7-day TTL).
                New tokens (history too short for a 1D GC): 4H cross + 4H Green; 1H cross + 1H Green when even
@@ -131,7 +131,7 @@ def classify_signal(meta: dict, r1d: Optional[dict], r4h: Optional[dict], r1h: O
         return None
     gtf = meta.get("gc_tf")
     if gtf == "1d" and r1d:
-        if r1d.get("dual_cross_up") and r1d.get("trend") == "Green":
+        if r1d.get("dual_cross_up"):
             return {"type": "Base", "gc_tf": "1d", "row": r1d}
         if (r4h and r1d.get("trend") == "Green" and r4h.get("trend") == "Green" and r4h.get("dual_cross_up")):
             return {"type": "Chase", "gc_tf": "1d", "row": r4h}

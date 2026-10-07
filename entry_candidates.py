@@ -2,7 +2,7 @@
 """Entry candidates builder: rule-based daily entry list (no LLM).
 
 Rules (closed bars only, from gc_radar_1d / gc_radar_4h):
-- Base: 1D Upper dual_cross_up (close > upper AND prev_close <= prev_upper) AND 1D Green
+- Base: 1D Upper dual_cross_up only (close > upper AND prev_close <= prev_upper); no trend-colour condition (MMT 2026-10-07)
 - Chase: 1D Green + 4H Green + 4H Upper dual_cross_up
 - Universe: rows already in radar (dayNtlVlm >= $75k gate applied by scanner)
 
@@ -201,10 +201,10 @@ def build_candidates(
         if not symbol:
             continue
         
-        # Base entry: 1D Upper dual_cross_up AND 1D Green (SoT requirement, PR #6 fix)
+        # Base entry: fresh 1D Upper dual_cross_up ONLY (MMT 2026-10-07: the 1D Green requirement of PR #6 is removed)
         dual_cross_up_1d = r1d.get("dual_cross_up", False)
         trend_1d = r1d.get("trend", "")
-        base = dual_cross_up_1d and trend_1d == "Green"
+        base = bool(dual_cross_up_1d)
         
         # Chase entry: 1D Green + 4H Green + 4H Upper dual_cross_up
         r4h = r4h_map.get(symbol)
