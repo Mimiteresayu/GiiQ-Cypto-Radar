@@ -13,7 +13,7 @@ Bitunix once `BX_SERVICE_URL` is set; it only proxies read views and forwards EN
 | 4 | ENTRY_DESK approval (source=claude, today HKT, this symbol). No fallback for BX. | `bx_live.approval_for`, `check_entry` |
 
 ## Pilot rules
-- **Universe:** BX-only crypto, 24h vol ≥ $200K (flag `low_vol_under_1M` under $1M; note the liquidity exit still fires below $1M), spread < 10 bp (re-measured right before the order), position ≤ 0.5% of 24h vol. No watch tier, no 1H-GC signals, no stock / commodity / index contracts.
+- **Universe:** BX-only crypto, 24h vol ≥ $200K (flag `low_vol_under_1M` under $1M; liquidity exit below $200K), spread < 10 bp (re-measured right before the order), position ≤ 0.5% of 24h vol. No watch tier, no 1H-GC signals, no stock / commodity / index contracts.
 - **Signals:** Base (1D), Chase (as a simulated-then-live N/N+1 CONTINUATION pending, 7-day TTL), new tokens on a 4H GC. Only candidates present at 08:02 HKT can be approved; later intraday signals stay shadow-only.
 - **Size:** isolated margin 1% of NAV, 3x. NAV = HL NAV (public HL API, same definition as the HL executor) + Bitunix futures equity. Downsized to 0.5% of 24h vol; skipped below the contract minimum.
 - **Caps:** max 2 open BX positions; max 1 new BX entry per HKT day (pending fills count).
