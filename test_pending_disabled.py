@@ -27,8 +27,10 @@ LIVE_ENV = {"EXEC_DRY_RUN": "0", "HL_API_PRIVATE_KEY": KEY}
 
 
 def _active(sym="BTC", kind=pe.CONTINUATION, created=NOW - timedelta(hours=1)):
+    """An active 3-step record (create_pending always stores breakout_1d / retrace_touched)."""
     return {"id": f"{sym}_{kind}_20261005", "symbol": sym, "kind": kind, "status": pe.ACTIVE,
-            "created_at": created.isoformat(), "expires_at": (created + timedelta(days=7)).isoformat()}
+            "created_at": created.isoformat(), "expires_at": (created + timedelta(days=7)).isoformat(),
+            "breakout_1d": False, "retrace_touched": False}
 
 
 def _cands(*items, at=NOW - timedelta(minutes=50)):
@@ -186,7 +188,7 @@ class TestExecutorDisabled(TmpStore):
     def test_reenabled_creates_pending_again(self):
         res, _ = self.run_exec({**LIVE_ENV, pe.DISABLE_ENV: "0"})
         self.assertEqual(res["no_entry"], [])
-        self.assertEqual([(p["symbol"], p["kind"]) for p in res["pending"]], [("BTC", "CONTINUATION")])
+        self.assertEqual([(p["symbol"], p["kind"]) for p in res["pending"]], [("BTC", "CONT")])
         self.assertEqual(len(pe.active(pe.load_pending())), 1)
 
 
@@ -342,7 +344,7 @@ class TestPreflight(TmpStore):
         res = self.run_pf({pe.DISABLE_ENV: "0"}, _cands(CHIP),
                           snap=dict(_cands(BTC_CHASE, CHIP), frozen_at=NOW.isoformat(), frozen_by="1d_scan"))
         self.assertIn(SNAP, res["candidates_source"])
-        self.assertIn("becomes pending CONTINUATION", self.guard(res, "BTC")["detail"])
+        self.assertIn("CONT -> no 08:55 entry; 3-step watch", self.guard(res, "BTC")["detail"])
         self.assertEqual(res["warnings"], [])
 
     def test_disabled_chase_is_ok_no_entry(self):

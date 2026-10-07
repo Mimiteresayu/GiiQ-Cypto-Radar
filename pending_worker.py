@@ -5,7 +5,8 @@ Run in the Railway 4H :10 job (right after the 4H scan + exits).
 DISABLED by default (Cove HEALTH FAIL 2026-10-05): the pass only cancels active pendings (LIVE) and
 never evaluates or fills, unless PENDING_CONTINUATION_DISABLED=0.
 
-For each ACTIVE pending entry (created by the executor from AI-approved Chase decisions):
+Old-style N/N+1 records are cancelled at the start of every pass (OLD_STYLE_REPLACED_BY_3STEP).
+For each ACTIVE 3-step CONT / ADD_ON entry (created by the executor from AI-approved decisions):
   3-step evaluation (see pending_entries.py):
     1. 1D breakout: 1D dual cross up above 1D Upper
     2. 4H retrace: 4H close down to 4H Filter or Lower
@@ -74,6 +75,7 @@ from exec_common import (  # noqa: E402
 )
 from pending_entries import ACTIVE, ADD_ON, CONT, band, evaluate, load_pending, save_pending, summary  # noqa: E402
 from pending_entries import DISABLE_ENV, DISABLED_REASON, cancel_active_pending, pending_disabled  # noqa: E402
+from pending_entries import OLD_STYLE_REASON, cancel_old_style  # noqa: E402
 
 # SoT size bands (margin % of equity). CONT / ADD_ON both use 2-4%.
 PENDING_SIZE_BANDS = {"CONT": (2.0, 4.0), "CONTINUATION": (2.0, 4.0), "ADD_ON": (2.0, 4.0)}
@@ -124,6 +126,17 @@ def _run_pending(hl: Any = None, radar_1d: Optional[dict] = None, radar_4h: Opti
         res["sequence"] = f"exits (done {after_exits}) -> positions re-fetched -> pending entries"
     persist = entries is None
     entries = load_pending() if entries is None else entries
+    # Old N/N+1 records are cancelled first, in LIVE and DRY_RUN (housekeeping, never an order); evaluate()
+    # also refuses them, so the 4H pass cannot act on one even if this cleanup or its save fails.
+    old = cancel_old_style(entries, now, tag="HL", log=_log)
+    if old:
+        res["cancelled"].extend({"id": e.get("id"), "symbol": e.get("symbol"), "kind": e.get("kind"),
+                                 "reason": OLD_STYLE_REASON} for e in old)
+        if persist:
+            try:
+                save_pending(entries)
+            except Exception as e:  # noqa: BLE001
+                res["alerts"].append(f"old-style pending cleanup not saved: {e}")
     if pending_disabled():
         # no evaluation, no fills: cancel what is still active (LIVE) and stop
         res["disabled"] = DISABLED_REASON
@@ -131,8 +144,8 @@ def _run_pending(hl: Any = None, radar_1d: Optional[dict] = None, radar_4h: Opti
             gone = cancel_active_pending(entries, now)
         else:
             gone = [e for e in entries if e.get("status") == ACTIVE]
-        res["cancelled"] = [{"id": e.get("id"), "symbol": e.get("symbol"), "kind": e.get("kind"),
-                             "reason": DISABLED_REASON + ("" if live else " (DRY_RUN: would cancel)")} for e in gone]
+        res["cancelled"] += [{"id": e.get("id"), "symbol": e.get("symbol"), "kind": e.get("kind"),
+                              "reason": DISABLED_REASON + ("" if live else " (DRY_RUN: would cancel)")} for e in gone]
         if live and gone and persist:
             try:
                 save_pending(entries)

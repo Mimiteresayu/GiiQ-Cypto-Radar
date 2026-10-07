@@ -80,7 +80,7 @@ DESK_DATA_CHUNK_BYTES = int(os.environ.get("DESK_DATA_CHUNK_BYTES") or "32000")
 # :10 4H closed-bar jobs so it never races them (it also takes the scan lock).
 LIVE_RADAR_MINUTES = (os.environ.get("OTR_LIVE_MINUTES") or "3-59/10").strip()
 # GIIQ-SoT-3: at 08:50 HKT, if Claude's ENTRY_DESK POST never arrived, Railway stores fallback decisions
-# itself (Base only, 2% margin; Chase vetoed) so the system does not depend on any desktop/agent.
+# itself (Base only, 2% margin; CONT/ADD_ON vetoed) so the system does not depend on any desktop/agent.
 # AUTO_FALLBACK=0 disables it (then no Claude POST = no trade, fail-closed).
 AUTO_FALLBACK = (os.environ.get("AUTO_FALLBACK") or "1").strip().lower() not in ("0", "false", "no", "off")
 LIVE_LOCK_WAIT_S = int(os.environ.get("OTR_LIVE_LOCK_WAIT_S") or "240")
@@ -314,7 +314,7 @@ def _freeze_decision_candidates(source: str, overwrite: bool) -> dict:
 
 
 def _chase_no_entry_note(stored: list) -> dict:
-    """While CONTINUATION / ADD_ON is disabled, tell the AI desk which Chase approvals will not enter."""
+    """While CONT / ADD_ON is disabled, tell the AI desk which CONT/ADD_ON approvals will not enter."""
     try:
         from entry_candidates import load_decision_candidates
         from pending_entries import DISABLE_ENV, DISABLED_REASON, pending_disabled
@@ -330,12 +330,27 @@ def _chase_no_entry_note(stored: list) -> dict:
     out = {"pending_disabled": f"{DISABLED_REASON} (re-enable {DISABLE_ENV}=0)"}
     if chase:
         out["chase_no_entry"] = chase
-        sys.stderr.write(f"[AI_DECISION] Chase approvals acknowledged, no entry (pending disabled): {chase}\n")
+        sys.stderr.write(f"[AI_DECISION] CONT/ADD_ON approvals acknowledged, no entry (3-step entries disabled): {chase}\n")
     return out
 
 
+def _cleanup_old_style_pending_at_boot() -> dict:
+    """Startup: cancel every old N/N+1 pending record (OLD_STYLE_REPLACED_BY_3STEP), whatever the flag.
+    The 3-step rule never evaluates or fills them (pending_entries.evaluate also refuses them)."""
+    try:
+        from pending_entries import cleanup_old_style
+        r = cleanup_old_style(tag="HL")
+    except Exception as e:
+        sys.stderr.write(f"[PENDING] !!!!!!!! boot old-style pending cleanup failed: {e}\n")
+        return {"error": str(e)}
+    gone = r.get("cancelled") or []
+    sys.stderr.write(f"[PENDING] boot old-style cleanup: "
+                     + (f"cancelled {len(gone)} {gone} ({r.get('reason')})" if gone else "none found") + "\n")
+    return r
+
+
 def _enforce_pending_disabled_at_boot() -> dict:
-    """Deploy + restart clears active CONTINUATION / ADD_ON pendings while the disable flag is on."""
+    """Deploy + restart clears active CONT / ADD_ON pendings while the disable flag is on."""
     try:
         from pending_entries import DISABLE_ENV, enforce_disabled
         r = enforce_disabled()
@@ -344,10 +359,11 @@ def _enforce_pending_disabled_at_boot() -> dict:
         return {"error": str(e)}
     if r.get("disabled"):
         gone = r.get("cancelled") or []
-        msg = (f"CONTINUATION/ADD_ON pending DISABLED ({r.get('reason')}; re-enable {DISABLE_ENV}=0): "
+        msg = (f"CONT/ADD_ON 3-step entries DISABLED ({r.get('reason')}; re-enable {DISABLE_ENV}=0): "
                + (f"cancelled {len(gone)} active at boot {gone}" if gone else "no active pendings"))
     else:
-        msg = f"CONTINUATION/ADD_ON pending ENABLED ({DISABLE_ENV}=0)"
+        msg = (f"CONT/ADD_ON 3-step entries ENABLED ({DISABLE_ENV}=0): 1D dual cross up above 1D Upper -> "
+               f"4H retrace to 4H Filter/Lower -> 4H dual cross up above 4H Upper -> IOC entry + Hard SL")
     sys.stderr.write(f"[PENDING] {msg}\n")
     return r
 
@@ -1456,7 +1472,7 @@ def _acquire_scan_lock(job_name: str) -> bool:
 
 
 def _scheduled_1d_scan(manual: bool = False) -> None:
-    """08:05 HKT: 1D + 4H scan (fresh 4H bar for Chase/stale check) -> candidates -> [DESK_DATA]."""
+    """08:05 HKT: 1D + 4H scan (fresh 4H bar for CONT/ADD_ON + stale check) -> candidates -> [DESK_DATA]."""
     job_name = "manual_1d_scan_candidates" if manual else "1d_scan_candidates"
     if not _acquire_scan_lock(job_name):
         return
@@ -1874,7 +1890,7 @@ def _scheduled_dims(manual: bool = False, mode: str = "snapshot") -> dict:
 
 def build_fallback_decisions(cd: dict, now: datetime | None = None) -> tuple[list, str]:
     """GIIQ-SoT-5: Fallback decisions approve every executable candidate at floor size (2% margin).
-    Chase will still become pending, not an immediate entry.
+    CONT/ADD_ON approvals become 3-step watches (entry only on the 4H BO), not an immediate entry.
     Returns (decisions, why_not) — decisions empty with a reason when candidates are unusable."""
     now = now or datetime.now(timezone.utc)
     gen = parse_ts((cd or {}).get("generated_at"))
@@ -2219,10 +2235,10 @@ def _init_scheduler() -> BackgroundScheduler | None:
         _SCHED_REF["s"] = scheduler
         try:
             from pending_entries import pending_disabled
-            chase_line = ("Base now; Chase -> no entry (CONTINUATION/ADD_ON pending DISABLED)" if pending_disabled()
-                          else "Base now; Chase -> pending pullback")
+            chase_line = ("Base now; CONT/ADD_ON -> no entry (3-step entries DISABLED)" if pending_disabled()
+                          else "Base now; CONT/ADD_ON -> 3-step watch (1D BO -> 4H retrace -> 4H BO)")
         except Exception:
-            chase_line = "Base now; Chase -> pending pullback"
+            chase_line = "Base now; CONT/ADD_ON -> 3-step watch (1D BO -> 4H retrace -> 4H BO)"
         sys.stderr.write(
             "[SCHEDULER] APScheduler started (Asia/Hong_Kong)\n"
             "  - 08:05 HKT: 1D+4H scan + entry candidates\n"
@@ -2233,7 +2249,8 @@ def _init_scheduler() -> BackgroundScheduler | None:
             "  - Every 4h :10: 4H scan + Mega/Large exits\n"
             "  - boot + 08:45 HKT: LIVE executor preflight\n"
             f"  - 08:55 HKT: Auto-executor ({chase_line})\n"
-            "  - Every 4h :10 (after 4H scan): pending pullback entries (cancel-only while disabled)\n"
+            "  - Every 4h :10 (after 4H scan): CONT/ADD_ON 3-step check -> IOC entry + Hard SL on 4H BO "
+            "(cancel-only while disabled; old-style pendings cancelled)\n"
             f"  - cron minute {LIVE_RADAR_MINUTES}: LIVE radar 1D/4H/1H + candidates sync + DESK_DATA\n"
             + ("  - BX shadow (no orders): 08:20 daily, 4h :25 (08:20 run covers 08), hourly :27\n"
                if BX_ENABLED and not BX_SERVICE_URL else
@@ -3164,6 +3181,7 @@ class Handler(SimpleHTTPRequestHandler):
 def main() -> None:
     os.chdir(ROOT)
     os.makedirs(OUT_DIR, exist_ok=True)
+    _cleanup_old_style_pending_at_boot()
     _enforce_pending_disabled_at_boot()
     
     # Initialize APScheduler (new in-process scheduler)

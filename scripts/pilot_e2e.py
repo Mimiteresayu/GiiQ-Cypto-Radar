@@ -775,7 +775,7 @@ def step5(R: Report, ctx: dict, args: argparse.Namespace) -> None:
     R.check("5", "no daily entry limit (SoT-5): 3 entries in one run, no daily cap function",
             len(ex) == 3 and not hasattr(exec_common, "daily_entry_cap_ok"),
             f"entries this run: {len(ex)}; entries_today_before={r.get('entries_today_before')}")
-    R.check("5", "Chase under the CONTINUATION freeze (default): acknowledged, no pending, no order",
+    R.check("5", "CONT under the freeze (default): acknowledged, no watch record, no order",
             r.get("pending") == [] and "disabled" in r["no_entry"][0]["reason"], r["no_entry"])
 
     # 80% cap with REAL (exchange) margin: existing margin 72% NAV -> BTC +4% ok, ETH +3% ok, SOL +2% -> 81% blocked
@@ -795,13 +795,13 @@ def step5(R: Report, ctx: dict, args: argparse.Namespace) -> None:
     R.check("5", "$10 HL minimum order: $8 notional entries skipped, nothing sent",
             not hl3.writes() and len(r3["skipped"]) == 3 and all("minimum" in s["reason"] for s in r3["skipped"]),
             [s["reason"] for s in r3["skipped"]])
-    # Chase with the freeze lifted (PENDING_CONTINUATION_DISABLED=0): pending, never an 08:55 order
+    # CONT with the flag lifted (PENDING_CONTINUATION_DISABLED=0): 3-step watch record, never an 08:55 order
     os.environ["EXEC_DRY_RUN"] = "1"
     os.environ["PENDING_CONTINUATION_DISABLED"] = "0"
     try:
         r4 = executor.execute_approved_candidates(hl=SimHL(HL_NAV, HL_META, HL_MIDS), now=now)
-        R.check("5", "Chase with the freeze lifted -> CONTINUATION pending (DRY_RUN would_create), no order",
-                [p["symbol"] for p in r4["pending"]] == ["AR"] and r4["pending"][0]["kind"] == "CONTINUATION",
+        R.check("5", "CONT with the flag lifted -> 3-step watch record (DRY_RUN would_create), no 08:55 order",
+                [p["symbol"] for p in r4["pending"]] == ["AR"] and r4["pending"][0]["kind"] == "CONT",
                 r4["pending"])
     finally:
         os.environ.pop("PENDING_CONTINUATION_DISABLED", None)
