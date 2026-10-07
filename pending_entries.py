@@ -68,6 +68,32 @@ def cancel_active_pending(entries: List[dict], now: datetime, reason: str = DISA
     return gone
 
 
+def is_old_style_record(e: dict) -> bool:
+    """Detect old-style (N/N+1 zone trigger) records that must be cancelled at startup & 4H worker.
+    Old-style records have `setup` dict, `zone_at_create`, or lack new 3-step state fields."""
+    if e.get("status") != ACTIVE or e.get("kind") not in PENDING_KINDS:
+        return False
+    # Old records had setup dict or zone_at_create
+    if "setup" in e or "zone_at_create" in e:
+        return True
+    # New records always have breakout_1d boolean (even if False) and last_retrace_bar_t (None or timestamp)
+    # If these are missing, it's an old record created before the 3-step refactor
+    if "breakout_1d" not in e or "last_retrace_bar_t" not in e:
+        return True
+    return False
+
+
+def cancel_old_style_pending(entries: List[dict], now: datetime) -> List[dict]:
+    """Cancel all old-style (N/N+1 zone trigger) pending records. Returns cancelled records."""
+    gone = []
+    for e in entries:
+        if is_old_style_record(e):
+            e.update(status="cancelled", closed_at=now.isoformat(), 
+                    close_reason="OLD_STYLE_REPLACED_BY_3STEP")
+            gone.append(e)
+    return gone
+
+
 def enforce_disabled(now: Optional[datetime] = None) -> Dict[str, Any]:
     """If disabled: cancel active CONT / ADD_ON in the store and save (boot hook, one-shot clear)."""
     if not pending_disabled():

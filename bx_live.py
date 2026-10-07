@@ -310,7 +310,7 @@ def rules_summary() -> Dict[str, Any]:
             "leverage_cap": "never above the contract max_leverage",
             "total_margin_cap_pct_nav": BX_TOTAL_MARGIN_CAP_PCT, "total_margin_scope": "HL + BX combined",
             "max_size_of_24h_vol": MAX_SIZE_OF_VOL, "min_sl_dist_pct": MIN_SL_DIST_PCT,
-            "breaker_pct_nav": BREAKER_PCT_NAV, "no_fallback": "no approval -> no order"}
+            "breaker_pct_nav": BREAKER_PCT_NAV, "fallback": "no Claude POST -> approve all at 2%/2x (RAILWAY_FALLBACK)"}
 
 
 # ---------------------------------------------------------------------------------------------
@@ -424,11 +424,33 @@ def store_decisions(decisions: List[dict], source: str, now: Optional[datetime] 
     return {"ok": bool(stored), "stored": len(stored), "rejected": rejected, "late": late, "date": day}
 
 
-def approval_for(symbol: str, now: Optional[datetime] = None) -> Optional[dict]:
+def build_fallback_decisions(cand_doc: dict, now: Optional[datetime] = None) -> Tuple[List[dict], str]:
+    """Build fallback decisions for BX: approve all executable candidates at 2% / 2x (same as HL).
+    Returns (decisions, why_not) - decisions empty with reason when candidates are unusable."""
+    now = now or _now()
+    if not cand_doc or cand_doc.get("date") != hkt_date(now):
+        return [], "candidates not generated today"
+    out = []
+    for c in cand_doc.get("candidates") or []:
+        sym = c.get("symbol")
+        if not sym:
+            continue
+        # Approve all Base candidates at floor size (Chase will still become pending)
+        out.append({"symbol": sym, "decision": "approve", "type": c.get("type", "Base"),
+                    "size_pct": 2.0, "leverage": 2,
+                    "reason": "RAILWAY_FALLBACK: no Claude POST by 08:50 - all BX candidates at floor size (2%, 2x)"})
+    return out, ""
+
+
+def approval_for(symbol: str, now: Optional[datetime] = None, fallback: Optional[dict] = None) -> Optional[dict]:
+    """Get approval for symbol. If fallback dict provided, use it for missing approvals."""
     day = hkt_date(now or _now())
     rec = ((_read(decisions_path(day)) or {}).get("decisions") or {}).get(symbol)
     if rec and rec.get("decision") == "approve" and rec.get("source") == "claude":
         return rec
+    # Check fallback if provided
+    if fallback:
+        return fallback.get(symbol)
     return None
 
 
@@ -844,11 +866,28 @@ def run_entries(now: Optional[datetime] = None, trade_api=None, egress: Optional
         rep["margin"] = {"hl_used": hl_m, "bx_used": bx_margin_in_use(acct), "nav": nav,
                          "cap_pct": BX_TOTAL_MARGIN_CAP_PCT}
 
+        # Check for ENTRY_DESK decisions; create fallback if missing (same as HL 08:50 RAILWAY_FALLBACK)
+        decisions_doc = _read(decisions_path(hkt_date(now))) or {}
+        has_claude = any(rec.get("source") == "claude" for rec in (decisions_doc.get("decisions") or {}).values())
+        fallback_map = {}
+        if not has_claude:
+            fb_list, why = build_fallback_decisions(cand_doc, now)
+            if fb_list:
+                fallback_map = {d["symbol"]: d for d in fb_list}
+                _log(f"[BX_LIVE] RAILWAY_FALLBACK: no Claude POST by 08:50, approving {len(fb_list)} BX candidates at 2%/2x")
+                rep["fallback"] = {"applied": True, "count": len(fb_list), "reason": "no Claude ENTRY_DESK POST"}
+        
         # GIIQ-SoT-5: no daily approval limit -- every approved candidate is tried, in list order,
         # each one limited only by the checks in check_entry (incl. the running HL+BX margin cap).
         pend = load_live_pending()
+        # Clean up old-style (N/N+1) pending records before evaluating
+        from pending_entries import cancel_old_style_pending
+        old_gone = cancel_old_style_pending(pend, now)
+        if old_gone:
+            save_live_pending(pend)
+            _log(f"[BX_LIVE] Cancelled {len(old_gone)} old-style (N/N+1) BX pendings: {[e.get('id') for e in old_gone]}")
         for c in cands:
-            appr = approval_for(c["symbol"], now)
+            appr = approval_for(c["symbol"], now, fallback=fallback_map)
             if not appr:
                 rep["skipped"].append({"symbol": c["symbol"], "reason": "no ENTRY_DESK approval"})
                 continue

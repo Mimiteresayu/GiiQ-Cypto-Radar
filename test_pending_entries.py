@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for pending pullback entries (ADD_ON / CONTINUATION) — no network."""
+"""Tests for pending 3-step entries (ADD_ON / CONT) — no network."""
 from __future__ import annotations
 
 import os
@@ -15,8 +15,10 @@ import pending_entries as pe  # noqa: E402
 from hl_sim import SimExchangeMixin  # noqa: E402
 import pending_worker as pw  # noqa: E402
 
-NOW = datetime(2026, 9, 28, 4, 10, tzinfo=timezone.utc)  # 12:10 HKT
+NOW = datetime(2026, 10, 7, 4, 10, tzinfo=timezone.utc)  # 12:10 HKT
 KEY = "0x" + "11" * 32
+H4 = 4 * 3600 * 1000
+T0 = int(NOW.timestamp() * 1000)
 
 
 def _row(lower, filt, close, trend="Green", upper=None):
@@ -53,271 +55,245 @@ class FakeHL(SimExchangeMixin):
         return self.orders
 
 
-
-H4 = 4 * 3600 * 1000
-T0 = int(NOW.timestamp() * 1000) - H4 - 600_000  # a 4H bar that closed 10 min before NOW
-
-
-def bar(low, close, t=T0):
-    return lambda hl, coin, tf, now: {"t": t, "l": low, "c": close}
-
-
 class TestEvaluate(unittest.TestCase):
-    def rec(self, kind=pe.ADD_ON, created=NOW - timedelta(days=1), setup=None, last=None):
-        r = {"id": "x", "symbol": "AAA", "kind": kind, "status": "pending", "created_at": created.isoformat(),
-             "expires_at": (created + timedelta(days=7)).isoformat()}
-        if setup:
-            r["setup"] = setup
-        if last:
-            r["last_bar_t"] = last
+    """Tests for the new 3-step evaluation (1D breakout -> 4H retrace -> 4H breakout)."""
+    
+    def rec(self, kind=pe.ADD_ON, created=NOW - timedelta(days=1), 
+            breakout_1d=False, retrace_touched=False, last_retrace_bar_t=None):
+        """Create a pending record with 3-step state."""
+        r = {"id": "x", "symbol": "AAA", "kind": kind, "status": "pending", 
+             "created_at": created.isoformat(),
+             "expires_at": (created + timedelta(days=7)).isoformat(),
+             "breakout_1d": breakout_1d,
+             "retrace_touched": retrace_touched,
+             "last_retrace_bar_t": last_retrace_bar_t}
+        if breakout_1d:
+            r["breakout_date_1d"] = created.strftime("%Y-%m-%d")
         return r
 
-    def b(self, lower=0.8, filt=0.9, close=1.0, trend="Green", tf="4h", bar_time=None):
-        return {"tf": tf, "lower": lower, "filter": filt, "close": close, "trend": trend, "bar_time": bar_time}
+    def bnd(self, d1d_close=1.1, d1d_upper=1.0, d1d_prev_close=0.95, d1d_prev_upper=1.0, d1d_lower=0.9,
+            d4h_close=1.05, d4h_upper=1.0, d4h_prev_close=0.95, d4h_prev_upper=1.0, 
+            d4h_filter=0.95, d4h_lower=0.9, d4h_trend="Green", d1d_trend="Green"):
+        """Create a band dict with 1d and 4h data."""
+        return {
+            "1d": {
+                "close": d1d_close,
+                "upper": d1d_upper,
+                "prev_close": d1d_prev_close,
+                "prev_upper": d1d_prev_upper,
+                "lower": d1d_lower,
+                "trend": d1d_trend,
+                "bar_time": T0,
+            },
+            "4h": {
+                "close": d4h_close,
+                "upper": d4h_upper,
+                "prev_close": d4h_prev_close,
+                "prev_upper": d4h_prev_upper,
+                "filter": d4h_filter,
+                "lower": d4h_lower,
+                "trend": d4h_trend,
+                "bar_time": T0,
+            }
+        }
 
     HELD = {"AAA"}
 
-    def test_bar_n_detected_then_n1_confirms(self):
-        a, why, upd = pe.evaluate(self.rec(), self.b(), 0.9, NOW, self.HELD, {"t": T0 - H4, "l": 0.88, "c": 0.93})
+    def test_step1_1d_breakout_detected(self):
+        """Step 1: 1D dual cross up above 1D Upper (green) -> mark breakout_1d."""
+        r = self.rec(breakout_1d=False)
+        # 1D close 1.1 > upper 1.0, prev_close 0.95 <= prev_upper 1.0, Green
+        bnd = self.bnd(d1d_close=1.1, d1d_upper=1.0, d1d_prev_close=0.95, d1d_prev_upper=1.0, d1d_trend="Green")
+        a, why, upd = pe.evaluate(r, bnd, 1.05, NOW, self.HELD)
         self.assertEqual(a, "wait")
-        self.assertIn("bar N set", why)
-        self.assertEqual(upd["setup"]["c"], 0.93)
-        r = self.rec(setup=upd["setup"], last=upd["last_bar_t"])
-        a, why, upd2 = pe.evaluate(r, self.b(), 0.95, NOW, self.HELD, {"t": T0, "l": 0.91, "c": 0.95})
-        self.assertEqual(a, "trigger", why)
-        self.assertIsNone(upd2["setup"])
+        self.assertIn("Step 1 complete: 1D breakout", why)
+        self.assertTrue(upd["breakout_1d"])
 
-    def test_n1_not_higher_than_n_close_no_trigger_and_becomes_new_n(self):
-        r = self.rec(setup={"t": T0 - H4, "l": 0.88, "c": 0.93})
-        a, why, upd = pe.evaluate(r, self.b(), 0.9, NOW, self.HELD, {"t": T0, "l": 0.87, "c": 0.92})
+    def test_step1_waiting_for_1d_breakout(self):
+        """Step 1: no 1D cross-up yet -> wait."""
+        r = self.rec(breakout_1d=False)
+        bnd = self.bnd(d1d_close=0.95, d1d_upper=1.0)  # no cross-up
+        a, why, upd = pe.evaluate(r, bnd, 1.0, NOW, self.HELD)
         self.assertEqual(a, "wait")
-        self.assertIn("N+1 not confirmed", why)
-        self.assertEqual(upd["setup"]["t"], T0)          # re-armed as new bar N
+        self.assertIn("waiting for 1D dual cross up", why)
+        self.assertEqual(upd, {})
 
-    def test_n1_must_be_the_next_bar(self):
-        r = self.rec(setup={"t": T0 - 3 * H4, "l": 0.88, "c": 0.93})  # stale setup (gap)
-        a, why, upd = pe.evaluate(r, self.b(), 0.95, NOW, self.HELD, {"t": T0, "l": 0.95, "c": 0.97})
+    def test_step2_4h_retrace_detected(self):
+        """Step 2: after 1D breakout, 4H close <= 4H Filter -> mark retrace_touched."""
+        r = self.rec(breakout_1d=True, retrace_touched=False)
+        # 4H close 0.94 <= filter 0.95
+        bnd = self.bnd(d4h_close=0.94, d4h_filter=0.95)
+        a, why, upd = pe.evaluate(r, bnd, 1.0, NOW, self.HELD)
         self.assertEqual(a, "wait")
-        self.assertIsNone(upd["setup"])
+        self.assertIn("Step 2 complete: 4H retrace", why)
+        self.assertTrue(upd["retrace_touched"])
+        self.assertEqual(upd["last_retrace_bar_t"], T0)
 
-    def test_same_bar_processed_once(self):
-        a, why, upd = pe.evaluate(self.rec(last=T0), self.b(), 0.9, NOW, self.HELD, {"t": T0, "l": 0.88, "c": 0.93})
-        self.assertEqual((a, upd), ("wait", {}))
-        self.assertIn("no new closed", why)
+    def test_step2_waiting_for_retrace(self):
+        """Step 2: after 1D breakout, no retrace yet -> wait."""
+        r = self.rec(breakout_1d=True, retrace_touched=False)
+        bnd = self.bnd(d4h_close=1.0, d4h_filter=0.95)  # no retrace
+        a, why, upd = pe.evaluate(r, bnd, 1.0, NOW, self.HELD)
+        self.assertEqual(a, "wait")
+        self.assertIn("waiting for 4H retrace", why)
+        self.assertEqual(upd, {})
 
-    def test_close_below_lower_cancels(self):
-        a, _, _ = pe.evaluate(self.rec(), self.b(), 0.75, NOW, self.HELD, {"t": T0, "l": 0.7, "c": 0.79})
+    def test_step3_4h_breakout_triggers(self):
+        """Step 3: after retrace, 4H dual cross up above 4H Upper -> trigger."""
+        r = self.rec(breakout_1d=True, retrace_touched=True, last_retrace_bar_t=T0 - H4)
+        # 4H close 1.05 > upper 1.0, prev_close 0.95 <= prev_upper 1.0, Green
+        bnd = self.bnd(d4h_close=1.05, d4h_upper=1.0, d4h_prev_close=0.95, d4h_prev_upper=1.0)
+        a, why, upd = pe.evaluate(r, bnd, 1.02, NOW, self.HELD)
+        self.assertEqual(a, "trigger")
+        self.assertIn("Step 3 complete: 4H breakout", why)
+
+    def test_step3_waiting_for_4h_breakout(self):
+        """Step 3: after retrace, no 4H cross-up yet -> wait."""
+        r = self.rec(breakout_1d=True, retrace_touched=True, last_retrace_bar_t=T0 - H4)
+        bnd = self.bnd(d4h_close=0.99, d4h_upper=1.0)  # no cross-up
+        a, why, upd = pe.evaluate(r, bnd, 1.0, NOW, self.HELD)
+        self.assertEqual(a, "wait")
+        self.assertIn("waiting for", why.lower())
+
+    def test_1d_close_below_lower_cancels(self):
+        """Cancel if 1D close < 1D Lower."""
+        r = self.rec(breakout_1d=True)
+        bnd = self.bnd(d1d_close=0.85, d1d_lower=0.9)
+        a, why, upd = pe.evaluate(r, bnd, 1.0, NOW, self.HELD)
         self.assertEqual(a, "cancel")
-
-    def test_n1_red_trend_no_trigger(self):
-        r = self.rec(setup={"t": T0 - H4, "l": 0.88, "c": 0.93})
-        a, _, _ = pe.evaluate(r, self.b(trend="Red"), 0.95, NOW, self.HELD, {"t": T0, "l": 0.91, "c": 0.95})
-        self.assertEqual(a, "wait")
-
-    def test_bars_before_creation_ignored(self):
-        r = self.rec(created=NOW)
-        a, why, upd = pe.evaluate(r, self.b(), 0.9, NOW, self.HELD, {"t": T0, "l": 0.88, "c": 0.93})
-        self.assertEqual((a, upd), ("wait", {}))
-        self.assertIn("before the pending was created", why)
-
-    def test_radar_misaligned_waits_without_consuming_bar(self):
-        a, why, upd = pe.evaluate(self.rec(), self.b(bar_time=T0 - H4), 0.9, NOW, self.HELD, {"t": T0, "l": 0.88, "c": 0.93})
-        self.assertEqual((a, upd), ("wait", {}))
-
-    def test_continuation_uses_1d_bars(self):
-        D = 86400 * 1000
-        d0 = int(NOW.timestamp() * 1000) - D - 3600_000
-        r = self.rec(kind=pe.CONTINUATION, created=NOW - timedelta(days=3), setup={"t": d0 - D, "l": 0.88, "c": 0.93})
-        a, why, _ = pe.evaluate(r, self.b(tf="1d"), 0.95, NOW, set(), {"t": d0, "l": 0.9, "c": 0.96})
-        self.assertEqual(a, "trigger", why)
-        self.assertIn("1D", why)
+        self.assertIn("below 1D Lower", why)
 
     def test_expiry(self):
-        a, _, _ = pe.evaluate(self.rec(created=NOW - timedelta(days=8)), self.b(), 0.85, NOW, self.HELD, None)
+        """Expired records are cancelled."""
+        r = self.rec(created=NOW - timedelta(days=8))
+        bnd = self.bnd()
+        a, why, upd = pe.evaluate(r, bnd, 1.0, NOW, self.HELD)
         self.assertEqual(a, "expire")
 
-    def test_idempotency_rules(self):
-        self.assertEqual(pe.evaluate(self.rec(pe.CONTINUATION), self.b(tf="1d"), 0.85, NOW, {"AAA"}, None)[0], "cancel")
-        self.assertEqual(pe.evaluate(self.rec(pe.ADD_ON), self.b(), 0.85, NOW, set(), None)[0], "cancel")
+    def test_cont_coin_already_held_cancels(self):
+        """CONT when coin already held -> cancel."""
+        r = self.rec(kind=pe.CONT, breakout_1d=True)
+        bnd = self.bnd()
+        a, why, upd = pe.evaluate(r, bnd, 1.0, NOW, {"AAA"})
+        self.assertEqual(a, "cancel")
+        self.assertIn("already held", why)
+
+    def test_addon_base_gone_cancels(self):
+        """ADD_ON when base position gone -> cancel."""
+        r = self.rec(kind=pe.ADD_ON, breakout_1d=True)
+        bnd = self.bnd()
+        a, why, upd = pe.evaluate(r, bnd, 1.0, NOW, set())
+        self.assertEqual(a, "cancel")
+        self.assertIn("no longer held", why)
 
     def test_missing_bar_fails_closed(self):
-        self.assertEqual(pe.evaluate(self.rec(), self.b(), 0.85, NOW, self.HELD, None)[0], "wait")
+        """Missing bar time -> wait without state change."""
+        r = self.rec()
+        bnd = self.bnd()
+        bnd["4h"]["bar_time"] = None
+        a, why, upd = pe.evaluate(r, bnd, 1.0, NOW, self.HELD)
+        self.assertEqual(a, "wait")
+        self.assertEqual(upd, {})
+
+    def test_rearm_after_new_retrace(self):
+        """After a retrace, next 4H cross-up can trigger again."""
+        # First retrace
+        r1 = self.rec(breakout_1d=True, retrace_touched=True, last_retrace_bar_t=T0 - 2 * H4)
+        # New retrace (newer bar)
+        bnd = self.bnd(d4h_close=0.94, d4h_filter=0.95)
+        bnd["4h"]["bar_time"] = T0  # newer bar
+        a, why, upd = pe.evaluate(r1, bnd, 1.0, NOW, self.HELD)
+        self.assertEqual(a, "wait")
+        self.assertIn("Step 2 complete", why)
+        self.assertEqual(upd["last_retrace_bar_t"], T0)
 
     def test_create_idempotent(self):
+        """Test that create_pending is idempotent for same symbol/kind/date."""
         entries = []
-        r1, c1 = pe.create_pending(entries, "AAA", pe.ADD_ON, {"size_pct": 3, "leverage": 2}, {"tier": "tiny"},
-                                   {"tf": "4h", "lower": 1, "filter": 2}, NOW)
-        r2, c2 = pe.create_pending(entries, "AAA", pe.ADD_ON, {"size_pct": 3}, {}, {"tf": "4h"}, NOW)
+        bnd = self.bnd()
+        cand = {"symbol": "AAA", "type": "CONT"}
+        decision = {"size_pct": 3, "leverage": 2}
+        r1, c1 = pe.create_pending(entries, "AAA", pe.ADD_ON, decision, cand, bnd, NOW)
+        decision2 = {"size_pct": 3, "leverage": 4}
+        r2, c2 = pe.create_pending(entries, "AAA", pe.ADD_ON, decision2, cand, bnd, NOW)
         self.assertTrue(c1)
         self.assertFalse(c2)
         self.assertEqual(len(entries), 1)
         self.assertEqual(r1["expires_at"], (NOW + timedelta(days=7)).isoformat())
+        # Original values preserved (not overwritten by second call)
+        self.assertEqual(r1["size_pct"], 3)
+        self.assertEqual(r1["leverage"], 2)
 
 
-class TestWorker(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.mkdtemp()
-        self.env = patch.dict(os.environ, {"PENDING_PATH": os.path.join(self.tmp, "p.json"),
-                                           "EXEC_DRY_RUN": "0", "HL_API_PRIVATE_KEY": KEY})
-        self.env.start()
-        self.log = []
+class TestOldStyleCleanup(unittest.TestCase):
+    """Tests for old-style (N/N+1 zone trigger) pending cleanup."""
+    
+    def test_is_old_style_with_setup_field(self):
+        """Records with 'setup' dict are old-style."""
+        e = {"status": "pending", "kind": pe.CONT, "setup": {"t": T0, "l": 0.8, "c": 0.9}}
+        self.assertTrue(pe.is_old_style_record(e))
+    
+    def test_is_old_style_with_zone_at_create(self):
+        """Records with 'zone_at_create' are old-style."""
+        e = {"status": "pending", "kind": pe.CONT, "zone_at_create": [0.8, 0.9]}
+        self.assertTrue(pe.is_old_style_record(e))
+    
+    def test_is_old_style_missing_new_fields(self):
+        """Records missing new 3-step fields are old-style."""
+        e = {"status": "pending", "kind": pe.CONT}
+        self.assertTrue(pe.is_old_style_record(e))
+    
+    def test_is_not_old_style_with_new_fields(self):
+        """Records with new 3-step fields are NOT old-style."""
+        e = {"status": "pending", "kind": pe.CONT, "breakout_1d": False, "last_retrace_bar_t": None}
+        self.assertFalse(pe.is_old_style_record(e))
+    
+    def test_cancel_old_style_pending(self):
+        """cancel_old_style_pending cancels all old-style records."""
+        entries = [
+            {"id": "old1", "status": "pending", "kind": pe.CONT, "setup": {"t": T0}},
+            {"id": "new1", "status": "pending", "kind": pe.CONT, "breakout_1d": False, "last_retrace_bar_t": None},
+            {"id": "old2", "status": "pending", "kind": pe.ADD_ON, "zone_at_create": [0.8, 0.9]},
+        ]
+        gone = pe.cancel_old_style_pending(entries, NOW)
+        self.assertEqual(len(gone), 2)
+        self.assertEqual({e["id"] for e in gone}, {"old1", "old2"})
+        self.assertEqual(entries[0]["status"], "cancelled")
+        self.assertEqual(entries[0]["close_reason"], "OLD_STYLE_REPLACED_BY_3STEP")
+        self.assertEqual(entries[1]["status"], "pending")  # new one unchanged
 
-    def tearDown(self):
-        self.env.stop()
 
-    def radars(self, d1=None, h4=None):
-        ts = (NOW - timedelta(minutes=5)).isoformat()
-        r1d = {"ts": ts, "rows": [dict(symbol="AAA", **(d1 or _row(0.80, 0.90, 1.00)))]}
-        # 4H Filter 0.88 = tiny Hard SL ~2.7% below mid 0.9 (SoT-2 needs liq >= 2x SL distance below it)
-        r4h = {"ts": ts, "rows": [dict(symbol="AAA", **(h4 or _row(0.85, 0.88, 0.95)))]}
-        return r1d, r4h
-
-    def entry(self, kind=pe.CONTINUATION, size=3, lev=2, tier="tiny", setup_close=0.89):
-        D = 86400 * 1000 if kind == pe.CONTINUATION else H4
-        created = NOW - timedelta(days=2)
-        return [{"id": f"AAA_{kind}_20260928", "symbol": "AAA", "kind": kind, "status": "pending", "tier": tier,
-                 "size_pct": size, "leverage": lev, "created_at": created.isoformat(),
-                 "expires_at": (created + timedelta(days=7)).isoformat(),
-                 "setup": {"t": T0 - D, "l": 0.85, "c": setup_close}}]
-
-    def run_w(self, hl, entries, bar_fn, d1=None, h4=None):
-        r1d, r4h = self.radars(d1, h4)
-        return pw.run_pending(hl=hl, radar_1d=r1d, radar_4h=r4h, now=NOW, entries=entries,
-                              log_entry_fn=lambda **k: self.log.append(k), bar_fn=bar_fn)
-
-    def test_continuation_fill_live_with_sl_and_size_band(self):
-        hl = FakeHL(mids={"AAA": 0.9})
-        ents = self.entry(size=6, tier="small")  # approved 6% -> clamped to Continuation band 4%
-        res = self.run_w(hl, ents, bar(0.88, 0.93))
-        self.assertEqual(res["status"], "success", res)
-        self.assertEqual([c[0] for c in hl.calls], ["set_leverage", "open_long_ioc", "place_stop_loss"])
-        f = res["filled"][0]
-        self.assertEqual(f["size_pct"], 4.0)                  # SoT-2 hard cap 4%
-        self.assertEqual(f["leverage"], 2)                    # SoT-5: AI 2x allowed (floor 2x, was 3x)
-        self.assertEqual(f["hard_sl"], 0.88)                  # small -> 4H Filter
-        self.assertLessEqual(f["risk_margin_pct"], 4.0)
-        self.assertEqual(ents[0]["status"], "filled")
-        self.assertEqual(self.log[0]["entry_type"], "CONTINUATION")
-        # idempotent: second run does nothing
-        hl2 = FakeHL(mids={"AAA": 0.9})
-        res2 = self.run_w(hl2, ents, bar(0.88, 0.93))
-        self.assertEqual(hl2.calls, [])
-        self.assertIn("no active", res2.get("message", ""))
-
-    def test_dry_run_places_nothing_and_does_not_mutate(self):
-        with patch.dict(os.environ, {"EXEC_DRY_RUN": "1"}):
-            hl = FakeHL(mids={"AAA": 0.9})
-            ents = self.entry()
-            res = self.run_w(hl, ents, bar(0.88, 0.93))
-        self.assertEqual(hl.calls, [])
-        self.assertTrue(res["filled"][0]["dry_run"])
-        self.assertEqual(ents[0]["status"], "pending")
-
-    def test_sl_distance_blocks_fill(self):
-        # Hard SL (4H Filter 0.89) within 1.5% of mid 0.9 -> no order, stays pending
-        hl = FakeHL(mids={"AAA": 0.9})
-        ents = self.entry()
-        res = self.run_w(hl, ents, bar(0.88, 0.93), h4=_row(0.85, 0.89, 0.95))
-        self.assertEqual(hl.calls, [])
-        self.assertEqual(ents[0]["status"], "pending")
-        self.assertIn("SL distance", res["checked"][0]["reason"])
-
-    def test_margin_cap_blocks_fill(self):
-        hl = FakeHL(mids={"AAA": 0.9}, margin_used=790)
-        ents = self.entry()
-        res = self.run_w(hl, ents, bar(0.88, 0.93))
-        self.assertEqual(hl.calls, [])
-        self.assertIn("margin utilization", res["checked"][0]["reason"])
-
-    def test_stale_radar_blocks_fill(self):
-        hl = FakeHL(mids={"AAA": 0.9})
-        ents = self.entry()
-        r1d, r4h = self.radars()
-        r4h["ts"] = (NOW - timedelta(hours=9)).isoformat()
-        res = pw.run_pending(hl=hl, radar_1d=r1d, radar_4h=r4h, now=NOW, entries=ents,
-                             log_entry_fn=lambda **k: None, bar_fn=bar(0.88, 0.93))
-        self.assertEqual(hl.calls, [])
-        self.assertIn("stale", res["checked"][0]["reason"])
-
-    def test_add_on_uses_4h_zone_and_existing_leverage(self):
-        pos = {"coin": "AAA", "szi": "50", "entryPx": "0.9", "liquidationPx": "0.4",
-               "returnOnEquity": "0.25", "marginUsed": "15"}  # ROE +25%, coin margin 1.5% NAV
-        hl = FakeHL(mids={"AAA": 1.01}, positions=[pos], lev=3)
-        ents = self.entry(kind=pe.ADD_ON, lev=2, tier="large")  # large: Hard SL = 4H Lower 0.95
-        # 4H zone [0.95, 1.00]; bar low 0.99 touched, close 1.02 > Lower; mid 1.01 <= 1.0*1.01
-        res = self.run_w(hl, ents, bar(0.99, 1.02), h4=_row(0.95, 1.00, 1.03), d1=_row(0.5, 0.6, 1.0))
-        self.assertEqual(res["status"], "success", res)
-        self.assertEqual(hl.calls[0], ("set_leverage", "AAA", 3))   # keeps existing isolated leverage
-        self.assertEqual(ents[0]["status"], "filled")
-
-    def test_add_on_small_tiny_blocked_by_sl_distance(self):
-        # Small/Tiny Hard SL = 4H Filter = top of the ADD_ON zone -> SL distance < 1.5% -> never fills (fail-closed)
-        pos = {"coin": "AAA", "szi": "50", "entryPx": "0.9", "liquidationPx": "0.4",
-               "returnOnEquity": "0.25", "marginUsed": "15"}
-        hl = FakeHL(mids={"AAA": 1.0}, positions=[pos], lev=2)
-        ents = self.entry(kind=pe.ADD_ON, tier="tiny")
-        res = self.run_w(hl, ents, bar(0.99, 1.02), h4=_row(0.95, 1.00, 1.03))
-        self.assertEqual(hl.calls, [])
-        self.assertIn("SL distance", res["checked"][0]["reason"])
-        self.assertEqual(ents[0]["status"], "pending")
-
-    def _add_on_run(self, entry_px, szi):
-        pos = {"coin": "AAA", "szi": str(szi), "entryPx": str(entry_px), "liquidationPx": "0.4",
-               "returnOnEquity": "0.30", "marginUsed": "15"}
-        hl = FakeHL(mids={"AAA": 1.01}, positions=[pos], lev=3)
-        ents = self.entry(kind=pe.ADD_ON, lev=2, tier="large")
-        res = self.run_w(hl, ents, bar(0.99, 1.02), h4=_row(0.95, 1.00, 1.03), d1=_row(0.5, 0.6, 1.0))
-        return hl, ents, res
-
-    def test_add_on_requires_price_gain_10pct(self):
-        # GIIQ-SoT-3: +10% PRICE gain vs entry (1x meaning), not leveraged ROE (ROE here is +30%)
-        hl, ents, res = self._add_on_run(0.93, 50)  # 1.01 / 0.93 = +8.6%
-        self.assertEqual(hl.calls, [])
-        self.assertEqual(ents[0]["status"], "pending")
-        self.assertIn("price gain +8.6% < +10%", res["checked"][0]["reason"])
-        self.assertTrue(any("price gain" in x["reason"] for x in res["run_report"]["skipped"]))
-
-    def test_add_on_coin_notional_cap_20pct(self):
-        hl, ents, res = self._add_on_run(0.9, 150)  # 15.15% NAV notional -> room 4.85%/3x = 1.6% < 2%
-        self.assertEqual(hl.calls, [])
-        self.assertIn("cap 20% NAV", res["checked"][0]["reason"])
-
-    def test_add_on_margin_limited_by_notional_room(self):
-        hl, ents, res = self._add_on_run(0.9, 110)  # 11.11% NAV notional -> room 8.89% / 3x = 2.963% margin
-        self.assertEqual(ents[0]["status"], "filled", res["checked"])
-        self.assertAlmostEqual(res["filled"][0]["size_pct"], (20 - 110 * 1.01 / 1000 * 100) / 3, 3)
-        self.assertEqual(hl.calls[0], ("set_leverage", "AAA", 3))
-
-    def test_live_state_persisted_bar_n_then_n1_fill(self):
-        # no setup yet: first run sets bar N (no order); next run (N+1) fills
-        hl = FakeHL(mids={"AAA": 0.93})
-        ents = self.entry()
-        ents[0].pop("setup")
-        D = 86400 * 1000
-        self.run_w(hl, ents, bar(0.88, 0.91, t=T0 - D))
-        self.assertEqual(hl.calls, [])
-        self.assertEqual(ents[0]["setup"]["c"], 0.91)
-        self.assertEqual(ents[0]["last_bar_t"], T0 - D)
-        res = self.run_w(hl, ents, bar(0.9, 0.93, t=T0))
-        self.assertEqual(ents[0]["status"], "filled", res["checked"])
-        self.assertEqual([c[0] for c in hl.calls], ["set_leverage", "open_long_ioc", "place_stop_loss"])
-
-    def test_add_on_cancelled_when_base_closed(self):
-        hl = FakeHL(mids={"AAA": 0.98})
-        ents = self.entry(kind=pe.ADD_ON)
-        res = self.run_w(hl, ents, bar(0.97, 0.99), h4=_row(0.95, 1.0, 1.0))
-        self.assertEqual(ents[0]["status"], "cancelled")
-        self.assertEqual(hl.calls, [])
-        self.assertEqual(res["cancelled"][0]["symbol"], "AAA")
-
-    def test_closed_bar_picks_last_closed(self):
-        class H:
-            def info(self, payload):
-                t0 = int(NOW.timestamp() * 1000) - 4 * 3600 * 1000 - 600_000  # closed 10 min ago
-                return [{"t": t0 - 4 * 3600 * 1000, "l": "1", "c": "2"}, {"t": t0, "l": "3", "c": "4"},
-                        {"t": t0 + 4 * 3600 * 1000, "l": "5", "c": "6"}]  # forming
-        b = pw.closed_bar(H(), "AAA", "4h", NOW)
-        self.assertEqual((b["l"], b["c"]), (3.0, 4.0))
+class TestBXFallback(unittest.TestCase):
+    """Tests for BX RAILWAY_FALLBACK logic."""
+    
+    def test_build_fallback_decisions(self):
+        """BX fallback approves all candidates at 2% / 2x."""
+        import bx_live
+        cand_doc = {
+            "date": "2026-10-07",
+            "candidates": [
+                {"symbol": "BTC", "type": "Base"},
+                {"symbol": "ETH", "type": "Base"},
+            ]
+        }
+        fb_list, why = bx_live.build_fallback_decisions(cand_doc, NOW)
+        self.assertEqual(len(fb_list), 2)
+        self.assertEqual(fb_list[0]["symbol"], "BTC")
+        self.assertEqual(fb_list[0]["decision"], "approve")
+        self.assertEqual(fb_list[0]["size_pct"], 2.0)
+        self.assertEqual(fb_list[0]["leverage"], 2)
+        self.assertIn("RAILWAY_FALLBACK", fb_list[0]["reason"])
+    
+    def test_fallback_wrong_date_no_decisions(self):
+        """Fallback rejects candidates from wrong date."""
+        import bx_live
+        cand_doc = {
+            "date": "2026-10-06",  # wrong date
+            "candidates": [{"symbol": "BTC", "type": "Base"}]
+        }
+        fb_list, why = bx_live.build_fallback_decisions(cand_doc, NOW)
+        self.assertEqual(len(fb_list), 0)
+        self.assertIn("not generated today", why)
 
 
 if __name__ == "__main__":

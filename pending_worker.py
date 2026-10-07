@@ -74,6 +74,7 @@ from exec_common import (  # noqa: E402
 )
 from pending_entries import ACTIVE, ADD_ON, CONT, band, evaluate, load_pending, save_pending, summary  # noqa: E402
 from pending_entries import DISABLE_ENV, DISABLED_REASON, cancel_active_pending, pending_disabled  # noqa: E402
+from pending_entries import cancel_old_style_pending  # noqa: E402
 
 # SoT size bands (margin % of equity). CONT / ADD_ON both use 2-4%.
 PENDING_SIZE_BANDS = {"CONT": (2.0, 4.0), "CONTINUATION": (2.0, 4.0), "ADD_ON": (2.0, 4.0)}
@@ -124,6 +125,17 @@ def _run_pending(hl: Any = None, radar_1d: Optional[dict] = None, radar_4h: Opti
         res["sequence"] = f"exits (done {after_exits}) -> positions re-fetched -> pending entries"
     persist = entries is None
     entries = load_pending() if entries is None else entries
+    
+    # Cancel old-style (N/N+1) pendings at the start of every 4H worker run
+    old_gone = cancel_old_style_pending(entries, now)
+    if old_gone and live and persist:
+        try:
+            save_pending(entries)
+            _log(f"{mode} Cancelled {len(old_gone)} old-style (N/N+1) pendings: {[e.get('id') for e in old_gone]}")
+        except Exception as e:  # noqa: BLE001
+            res.update(status="error", message=f"pending store write failed during old-style cleanup: {e}")
+            return res
+    
     if pending_disabled():
         # no evaluation, no fills: cancel what is still active (LIVE) and stop
         res["disabled"] = DISABLED_REASON
