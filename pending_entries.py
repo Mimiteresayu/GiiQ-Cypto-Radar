@@ -17,7 +17,7 @@ Rules (MMT, 2026-10-07, replacing old N/N+1 pullback):
     with Hard SL, using the same fail-closed checks as the Base executor.
   
 Created only from AI-approved decisions (approved size_pct / leverage kept, re-clamped to SoT bands
-at fill time). Cancelled when 1D close < 1D Lower or after PENDING_TTL_DAYS (7).
+at fill time). Cancelled when 1D close < 1D Lower or after PENDING_TTL_DAYS (30).
 Idempotent: one record per (symbol, kind, HKT decision date); filled/cancelled records are never
 re-armed; a CONT whose coin is already held is cancelled; an ADD_ON whose base position is gone is
 cancelled.
@@ -40,7 +40,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from exec_common import HKT, parse_ts
 
 ROOT = Path(__file__).resolve().parent
-PENDING_TTL_DAYS = 7
+PENDING_TTL_DAYS = 30
 BAR_MS = {"4h": 4 * 3600 * 1000, "1d": 86400 * 1000}
 ADD_ON = "ADD_ON"
 CONTINUATION = "CONTINUATION"

@@ -29,7 +29,7 @@ TF_MS = {"1h": 3_600_000, "4h": 14_400_000}
 EXIT_GRACE_MIN = 25          # exit jobs run at :07 (1H) / :10 (4H) -> allow 25 min after the bar close
 MARGIN_ALERT_PCT = 80.0
 LEV_MIN, LEV_MAX = 3, 5
-PENDING_TTL_DAYS = 7
+PENDING_TTL_DAYS = 30
 RADAR_MAX_AGE_H = {"1h": 2.0, "4h": 5.0}
 JOB_MAX_AGE_MIN = {"1h_scan_exits": 75, "4h_scan_exits": 4 * 60 + 25}
 HKT = timezone(timedelta(hours=8))

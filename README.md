@@ -235,7 +235,7 @@ python3 executor.py
   with close > Lower and close > bar N close -> enter at the live mid. Fill time re-checks: radar
   freshness, Hard SL per tier, SL distance >= 1.5%, size band (Continuation/Add-on 2-4%), leverage
   1-5x / coin max (ADD_ON keeps existing isolated leverage), 80% cumulative margin, isolated liq beyond
-  Hard SL. Cancelled on any band-TF close below Lower, after 7 days, or by idempotency rules
+  Hard SL. Cancelled on any band-TF close below Lower, after 30 days, or by idempotency rules
   (CONTINUATION already held / ADD_ON base closed). Records are written only in LIVE mode.
 - Visible in the cockpit (blue pending bar), `GET /api/exec/pending` (X-AI-Key), executor results
   (`pending`, `pending_active`) and the 08:45 preflight (`pending:<SYM>` lines).

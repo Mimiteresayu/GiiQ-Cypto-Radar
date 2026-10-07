@@ -2534,6 +2534,9 @@ class Handler(SimpleHTTPRequestHandler):
         if path == "/api/exec/run":
             self._exec_run()
             return
+        if path == "/api/bx/run":
+            self._bx_run()
+            return
         if path == "/api/exec/preflight":
             self._exec_preflight()
             return
@@ -2933,6 +2936,23 @@ class Handler(SimpleHTTPRequestHandler):
             self._send_json(409, {"ok": False, **res})
             return
         self._send_json(200, {"ok": res.get("status") in ("success", "fail_closed"), "date": today, "result": res})
+
+    def _bx_run(self) -> None:
+        """POST /api/bx/run (keyed, X-AI-Key): manual Bitunix entry run for the listed symbols only.
+        Body {"confirm": true, "symbols": ["BRUSDT"]}. Forwarded to bx-exec, which applies the same gates as the
+        08:56 job (live gate, breaker, egress, radar freshness, Hard SL, liq, 80% cap) and enters each symbol
+        at most once per HKT day."""
+        if not self._ai_key_ok():
+            return
+        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            body = json.loads((self.rfile.read(length) if length else b"{}").decode() or "{}")
+        except Exception:
+            self._send_json(400, {"ok": False, "error": "invalid json"})
+            return
+        code, res = _bx_service("/api/bx/run", {"confirm": body.get("confirm"), "symbols": body.get("symbols")},
+                                timeout=150.0)
+        self._send_json(code, res)
 
     def _ai_decision(self) -> None:
         """POST /api/ai/decision: store AI approval/veto decisions.
