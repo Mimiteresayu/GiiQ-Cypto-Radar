@@ -62,7 +62,7 @@ BTC upper 78,249 vs 78,218; filter 75,065 vs 75,056; lower 71,882 vs 71,895. ETH
 - Do not put any key in this project; public price data only.
 - Live repo files worth copying: `scan_gc_radar.py` (`compute_gc`, `TF_CONFIG`, `cross_up_ages`), `bt_gc_ltf_period.py`, `scripts/bt_base_green_vs_cross.py`,
   `UNIVERSE.md`, `data/bx_asset_class.json` (BX commodity/stock/index seeds), `docs/SOT_CHANGELOG.md` (history of every rule change and why).
-- Live-trading status: manual Bitunix route `POST /api/bx/run` exists; BRUSDT (Base) was not bought on 2026-10-07 because Bitunix had no fallback at 08:56 (added after).
+- Live-trading status: manual Bitunix route `POST /api/bx/run` exists; BRUSDT (Base) was not bought on 2026-10-07; the likely reason is that Bitunix had no desk approval and no fallback at 08:56 (the BX fallback was merged afterwards). **UNVERIFIED in the logs.**
 
 ## 9. Starter prompt for the research session
 > This is a research project, not live trading. Read `docs/research/GC_RESEARCH_HANDOFF.md` (copy it into this repo first). Goal: best Gaussian Channel settings, timeframe and
