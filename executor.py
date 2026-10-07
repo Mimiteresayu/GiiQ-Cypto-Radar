@@ -332,7 +332,7 @@ def _execute(
             if gone:
                 pend_dirty = True
                 result["pending_cancelled"] = [e.get("id") for e in gone]
-                _log(f"LIVE cancelled active CONTINUATION/ADD_ON ({DISABLED_REASON}): {result['pending_cancelled']}")
+                _log(f"LIVE cancelled active CONT/ADD_ON ({DISABLED_REASON}): {result['pending_cancelled']}")
     if equity <= 0:
         result.update(status="error", message="Equity is 0 / unavailable")
         return result
@@ -388,7 +388,7 @@ def _execute(
         # Chase will still become pending, not an immediate entry
         if not is_base and entry_type == "Chase":
             if disabled:
-                why = (f"Chase acknowledged, no entry: CONTINUATION/ADD_ON pending disabled ({DISABLED_REASON}; "
+                why = (f"Chase acknowledged, no entry: CONT/ADD_ON pending disabled ({DISABLED_REASON}; "
                        f"re-enable {DISABLE_ENV}=0)")
                 result["no_entry"].append({"symbol": symbol, "type": "Chase", "reason": why})
                 _log(f"{mode} NO ENTRY {symbol}: {why}")

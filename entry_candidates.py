@@ -252,6 +252,34 @@ def build_candidates(
         # Already held
         already_held = symbol in held_symbols
         
+        # New 3-step state fields for CONT / ADD_ON
+        entry_kind = "BASE"
+        if chase:
+            entry_kind = "ADD_ON" if already_held else "CONT"
+        
+        # 1D breakout age (cross_age_days_1d)
+        cross_age_days_1d = None
+        breakout_date_1d = None
+        if base and r1d.get("last_cross_up_at"):
+            try:
+                cross_ms = int(r1d["last_cross_up_at"])
+                cross_dt = datetime.fromtimestamp(cross_ms / 1000, timezone.utc)
+                cross_age_days_1d = round((now.timestamp() * 1000 - cross_ms) / 86_400_000, 1)
+                breakout_date_1d = cross_dt.astimezone(HKT).strftime("%Y-%m-%d")
+            except (ValueError, TypeError):
+                pass
+        
+        # 4H retrace touched (4H close at/below 4H Filter)
+        retrace_touched = False
+        if chase and r4h:
+            c4h = r4h.get("close")
+            f4h = r4h.get("filter")
+            if c4h is not None and f4h is not None and c4h <= f4h:
+                retrace_touched = True
+        
+        # 4H breakout (dual_cross_up_4h)
+        bo_4h_cross_up = dual_cross_up_4h if chase else False
+        
         candidates.append({
             "symbol": symbol,
             "type": entry_type,
@@ -277,6 +305,13 @@ def build_candidates(
             "hard_sl_dist_pct": hard_sl_dist_pct,
             "dayNtlVlm": day_ntl_vlm,
             "already_held": already_held,
+            # New 3-step state fields
+            "entry_kind": entry_kind,
+            "has_base_position": already_held,
+            "cross_age_days_1d": cross_age_days_1d,
+            "breakout_date_1d": breakout_date_1d,
+            "retrace_touched": retrace_touched,
+            "bo_4h_cross_up": bo_4h_cross_up,
         })
     
     # Sort: Chase first, then by symbol

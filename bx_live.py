@@ -975,19 +975,18 @@ def run_manage(job: str, now: Optional[datetime] = None, trade_api=None, egress:
 def run_live_pending(api, conn, now, gate_ok, gate_why, meta_all, acct, nav, market, tiers_fn) -> List[dict]:
     import bx_radar
     import bx_shadow as S
-    from pending_entries import evaluate
+    from pending_entries import band, evaluate
     pend = load_live_pending()
     r1d = S._rows_by_symbol(bx_radar.load_radar("1d"))
+    r4h = S._rows_by_symbol(bx_radar.load_radar("4h"))
     held = {t["bx_symbol"] for t in open_live_trades(conn)}
     out = []
     for rec in [e for e in pend if e.get("status") == "pending"]:
         sym = rec["symbol"]
-        row = r1d.get(sym) or {}
-        bnd = {"tf": "1d", "lower": _f(row.get("lower")), "filter": _f(row.get("filter")), "close": _f(row.get("close")),
-               "trend": row.get("trend"), "bar_time": row.get("bar_time")}
-        bar = {"t": row.get("bar_time"), "l": row.get("low"), "c": row.get("close")} if row else None
+        # New 3-step rule: need both 1D and 4H data
+        bnd = band(rec.get("kind") or "CONTINUATION", r1d.get(sym), r4h.get(sym))
         mid = _f((meta_all.get(sym) or {}).get("price"))
-        action, reason, upd = evaluate(rec, bnd, mid, now, held, bar)
+        action, reason, upd = evaluate(rec, bnd, mid, now, held)
         rec.update(upd)
         rec["last_check"] = now.isoformat()
         if action in ("expire", "cancel"):
