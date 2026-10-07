@@ -75,6 +75,13 @@ FALLBACK_LEVERAGE = 2           # GIIQ-SoT-5: fallback = floor size, 2% margin a
 TINY_MAX_LEV = 3
 TINY_MAX_MARGIN_PCT = 2.0
 NON_TINY_TIERS = ("mega", "large", "small")
+# MMT 2026-10-07: flat Base size by tier, isolated margin as % of NAV (the desk no longer picks the size).
+TIER_MARGIN_PCT = {"tiny": 2.0, "small": 3.0, "large": 4.0, "mega": 5.0}
+
+
+def tier_margin_pct(tier: Optional[str]) -> float:
+    """Flat margin % of NAV for a tier; unknown / empty tier = Tiny."""
+    return TIER_MARGIN_PCT.get((tier or "").strip().lower(), TIER_MARGIN_PCT["tiny"])
 
 
 def is_tiny_tier(tier: Optional[str]) -> bool:
@@ -433,7 +440,7 @@ def build_run_report(run: str, result: Dict[str, Any], nav: Optional[dict] = Non
 def size_by_margin(nav: float, entry_px: float, hard_sl: float, coin_max_leverage: Optional[float],
                    ai_size_pct: Any = None, ai_leverage: Any = None, fixed_leverage: Optional[int] = None,
                    max_margin_pct: Optional[float] = None, liq_ref_px: Optional[float] = None,
-                   tier: Optional[str] = None) -> Dict[str, Any]:
+                   tier: Optional[str] = None, flat_tier_size: bool = False) -> Dict[str, Any]:
     """GIIQ-SoT-2/SoT-5: choose (leverage, margin %) for a LONG entry. Risk = the isolated margin.
 
     - margin = AI size clamped to 2-4% NAV (AI value = maximum; missing -> the 4% cap; an AI value
@@ -449,9 +456,13 @@ def size_by_margin(nav: float, entry_px: float, hard_sl: float, coin_max_leverag
     notes: list = []
     if not nav or nav <= 0 or not entry_px or entry_px <= 0 or not hard_sl or hard_sl <= 0 or hard_sl >= entry_px:
         return {"ok": False, "reason": "sizing inputs invalid (NAV / entry / Hard SL)", "notes": notes}
+    flat = bool(flat_tier_size) and tier is not None
     m = SOT2_MAX_MARGIN_PCT
     a_sz = _f(ai_size_pct)
-    if a_sz is not None and a_sz > 0:
+    if flat:  # MMT 2026-10-07: tiny 2% / small 3% / large 4% / mega 5% of NAV, whatever the desk sent
+        m = tier_margin_pct(tier)
+        notes.append(f"flat tier size {m:g}% NAV ({(tier or 'unknown')})")
+    elif a_sz is not None and a_sz > 0:
         if a_sz < SOT2_MIN_MARGIN_PCT:
             notes.append(f"AI size {a_sz:g}% < {SOT2_MIN_MARGIN_PCT:g}% floor -> {SOT2_MIN_MARGIN_PCT:g}%")
         m = min(m, max(SOT2_MIN_MARGIN_PCT, a_sz))
@@ -477,6 +488,11 @@ def size_by_margin(nav: float, entry_px: float, hard_sl: float, coin_max_leverag
                 notes.append(f"AI leverage {a_lev:g}x < {SOT2_MIN_LEV}x floor -> {SOT2_MIN_LEV}x")
             l_max = min(l_max, max(SOT2_MIN_LEV, int(math.floor(a_lev + 1e-9))))
         l_max = min(l_max, coin_cap)
+        if flat:  # keep one coin's notional (margin x leverage) within the 20% NAV cap, e.g. mega 5% -> max 4x
+            l_cap = int(math.floor(MAX_COIN_NOTIONAL_NAV_PCT / m + 1e-9))
+            if l_max > l_cap:
+                notes.append(f"flat {m:g}% margin: leverage {l_max}x -> {l_cap}x (coin notional <= {MAX_COIN_NOTIONAL_NAV_PCT:g}% NAV)")
+                l_max = l_cap
         if tiny and l_max > TINY_MAX_LEV:
             notes.append(f"Tiny tier: leverage {l_max}x -> {TINY_MAX_LEV}x cap")
             l_max = TINY_MAX_LEV

@@ -464,7 +464,8 @@ def _execute(
         # GIIQ-SoT-5: a fallback decision is always floor size, 2% margin at 2x (whatever the record says)
         ai_size = FALLBACK_MARGIN_PCT if fallback else decision.get("size_pct")
         ai_lev = FALLBACK_LEVERAGE if fallback else decision.get("leverage")
-        sz = size_by_margin(equity, limit_px, hard_sl, coin_max, ai_size, ai_lev, tier=tier)
+        sz = size_by_margin(equity, limit_px, hard_sl, coin_max, ai_size, ai_lev, tier=tier,
+                           flat_tier_size=not fallback)
         if not sz["ok"]:
             skip(sz["reason"], mid=mid)
             continue

@@ -834,6 +834,7 @@
           <th data-k="trend" class="closed-col" title="LAST CLOSED bar — signal input">Trend·closed <span class="arrow">↕</span></th>
           <th data-k="dual_cross_up" class="closed-col" title="LAST CLOSED bar — signal input">Cross Up·closed <span class="arrow">↕</span></th>
           <th data-k="dual_cross_down_filter" class="closed-col" title="LAST CLOSED bar — signal input">Cross Dn·closed <span class="arrow">↕</span></th>
+          <th data-k="cross_age_bars" class="closed-col" title="Age of the latest cross-up: 0 = the last closed bar. In brackets: age of the cross-up before it (info only)">Age·cross <span class="arrow">↕</span></th>
           <th data-k="rvol">RVOL <span class="arrow">↕</span></th>
           <th data-k="mom_score">mom_score <span class="arrow">↕</span></th>
           <th data-k="mom_rank">mom_rank <span class="arrow">↕</span></th>
@@ -1110,6 +1111,14 @@
     if (a >= 1)     return n.toLocaleString(undefined, {minimumFractionDigits:2,maximumFractionDigits:4});
     return n.toLocaleString(undefined, {minimumFractionDigits:4,maximumFractionDigits:8});
   }
+    // Age of the latest cross-up in the scanned timeframe (0 = last closed bar), previous cross in brackets.
+    function ageCell(r){
+      const unit = radarTf==="1d" ? "d" : radarTf==="4h" ? "×4h" : "h";
+      if (r.cross_age_bars==null) return "—";
+      const prev = r.prev_cross_age_bars==null ? "" : ` <span style="color:var(--muted)">(${r.prev_cross_age_bars}${unit})</span>`;
+      return `${r.cross_age_bars}${unit}${prev}`;
+    }
+
   function boolCell(v, isBad=false) {
     if (v) return isBad ? '<span class="bool-bad">✓</span>' : '<span class="bool-y">✓</span>';
     return '<span class="bool-n">—</span>';
@@ -1856,6 +1865,7 @@
         <td class="closed-col ${tCls}">${r.trend}</td>
         <td class="closed-col">${boolCell(r.dual_cross_up)}</td>
         <td class="closed-col">${boolCell(r.dual_cross_down_filter,true)}</td>
+        <td class="closed-col">${ageCell(r)}</td>
         <td>${r.rvol!=null?Number(r.rvol).toFixed(2):(r.vol_accel!=null?Number(r.vol_accel).toFixed(2):"—")}</td>
         <td>${r.mom_score!=null?Number(r.mom_score).toFixed(3):"—"}</td>
         <td>${r.mom_rank??"—"}</td>

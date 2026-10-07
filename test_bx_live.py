@@ -35,7 +35,7 @@ def meta(sym="FOOUSDT", **kw):
 
 
 def cand(sym="FOOUSDT", **kw):
-    c = {"symbol": sym, "coin": sym.replace("USDT", ""), "type": "Base", "gc_tf": "1d", "tier": "small",
+    c = {"symbol": sym, "coin": sym.replace("USDT", ""), "type": "Base", "gc_tf": "1d", "tier": "tiny",
          "close": 2.0, "hard_sl": 1.86, "hard_sl_rule": "4h_filter"}
     c.update(kw)
     return c
@@ -285,8 +285,9 @@ class TestEntriesFailClosed(Tmp):
         t = L.open_live_trades(self.conn)[0]
         self.assertEqual((t["mode"], t["position_id"], t["size_pct_nav"]), ("live", "P1", 2.0))  # default 2%
 
-    def test_desk_size_and_leverage_used(self):
-        self.seed([cand()], [meta()], [{"symbol": "FOOUSDT", "decision": "approve", "size_pct": 3, "leverage": 4}])
+    def test_flat_tier_size_and_desk_leverage_used(self):
+        """MMT 2026-10-07: size is flat by tier (small 3%) whatever the desk sent; the desk leverage is still used."""
+        self.seed([cand(tier="small")], [meta()], [{"symbol": "FOOUSDT", "decision": "approve", "size_pct": 2, "leverage": 4}])
         api = FakeAPI()
         rep = self.entries(api)
         self.assertEqual(rep["entered"][0]["status"], "filled", rep)
@@ -404,10 +405,16 @@ class TestPilotRules(unittest.TestCase):
         self.assertAlmostEqual(r["plan"]["margin_usd"], 200.0)   # default 2% of 10k NAV
         self.assertLess(r["plan"]["liq_est"], 1.86)
 
+    def test_flat_tier_sizing(self):
+        for tier, pct in (("tiny", 2.0), ("small", 3.0), ("large", 4.0), ("mega", 5.0), ("", 2.0)):
+            self.assertEqual(L.desk_sizing({"size_pct": 2, "leverage": 3}, None, tier=tier), (pct, 3), tier)
+        fb = {"size_pct": 2.0, "leverage": 2, "reason": "RAILWAY_FALLBACK: no Claude POST"}
+        self.assertEqual(L.desk_sizing(fb, None, tier="mega"), (2.0, 2))              # fallback keeps the 2% floor
+
     def test_desk_sizing_bounds(self):
         r = self.chk(appr=dict(APPROVED, size_pct=4, leverage=5))
         self.assertTrue(r["ok"], r)
-        self.assertEqual((r["plan"]["margin_usd"], r["plan"]["leverage"]), (400.0, 5))
+        self.assertEqual((r["plan"]["margin_usd"], r["plan"]["leverage"]), (200.0, 5))   # flat tiny 2%, desk 4% ignored
         self.assertEqual(L.desk_sizing({"size_pct": 10, "leverage": 9}), (4.0, 5))     # clamped to 4% / 5x
         self.assertEqual(L.desk_sizing({"size_pct": 0.5, "leverage": 1}), (2.0, 2))    # floor 2% / 2x
         self.assertEqual(L.desk_sizing({}), (2.0, 2))                                  # default

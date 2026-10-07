@@ -895,6 +895,21 @@ def classify_upper_status(
     return "below"
 
 
+def cross_up_ages(closes: List[float], uppers: List[float], i: int):
+    """Closed-bar cross-ups (close > upper AND prev_close <= prev_upper), newest first, looking back from bar i.
+    -> (index of the latest cross-up bar or None, its age in bars (0 = bar i), age of the cross-up before it or None).
+    Information only: never a signal input (MMT 2026-10-07)."""
+    last = age = prev_age = None
+    for j in range(i, 0, -1):
+        if closes[j - 1] <= uppers[j - 1] and closes[j] > uppers[j]:
+            if last is None:
+                last, age = j, i - j
+            else:
+                prev_age = i - j
+                break
+    return last, age, prev_age
+
+
 def scan_symbol(coin: str, tf: str, ctx: Optional[Dict[str, Any]] = None) -> Optional[dict]:
     period = gc_period_for_tf(tf)
     bars = fetch_candles(coin, tf)
@@ -948,11 +963,8 @@ def scan_symbol(coin: str, tf: str, ctx: Optional[Dict[str, Any]] = None) -> Opt
     upper_status = classify_upper_status(
         s_open, s_high, s_close, s_upper, s_prev_close, s_prev_upper
     )
-    last_cross_up_at = None
-    for j in range(i, 0, -1):
-        if closes[j - 1] <= gc[j - 1]["upper"] and closes[j] > gc[j]["upper"]:
-            last_cross_up_at = bars[j]["t"]
-            break
+    j_last, cross_age_bars, prev_cross_age_bars = cross_up_ages(closes, [g["upper"] for g in gc], i)
+    last_cross_up_at = bars[j_last]["t"] if j_last is not None else None
 
     ath = max(highs)
     atl = min(lows)
@@ -991,6 +1003,8 @@ def scan_symbol(coin: str, tf: str, ctx: Optional[Dict[str, Any]] = None) -> Opt
         "drop_from_ath_pct": drop_from_ath_pct,
         "from_atl_pct": from_atl_pct,
         "last_cross_up_at": last_cross_up_at,
+        "cross_age_bars": cross_age_bars,
+        "prev_cross_age_bars": prev_cross_age_bars,
         "bars": len(bars),
         "bar_time": bars[i]["t"],  # open time of the LAST CLOSED bar (top-level = closed SoT)
         # live = forming bar at scan time (display only; never a signal input).
