@@ -178,22 +178,30 @@ class TestExits(ShadowCase):
 
 
 class TestChasePending(ShadowCase):
-    def test_continuation_fills_on_n_plus_1(self):
-        # day 0: Chase signal -> simulated CONTINUATION pending (no immediate entry)
+    def test_continuation_fills_on_3_step_rule(self):
+        # day 0: 1D Green + 4H cross signal -> simulated CONT watch record (no immediate entry)
         self.write([meta()], r1d=[row()], r4h=[row(dual_cross_up=True)])
         rep = S.run("daily", now=T0, nav_usd=10_000, conn=self.conn)
         self.assertEqual(rep["opened"], [])
         pend = S.load_pending()
         self.assertEqual((pend[0]["kind"], pend[0]["status"]), ("CONTINUATION", "pending"))
-        # day 1: bar N (low <= Filter, close > Lower)
+        # step 1: 1D dual cross up above 1D Upper
         d1 = T0 + timedelta(days=1)
-        self.write([meta()], r1d=[row(low=1.79, close=1.85, bar_time=ms(d1) - DAY)], r4h=[row()])
+        self.write([meta()], r1d=[row(close=2.0, upper=1.9, prev_close=1.85, prev_upper=1.88, bar_time=ms(d1) - DAY)],
+                   r4h=[row(bar_time=ms(d1) - H4)])
         S.run("daily", now=d1, nav_usd=10_000, conn=self.conn)
-        self.assertIsNotNone(S.load_pending()[0].get("setup"))
-        # day 2: bar N+1 closes above Lower and above N close -> fill
-        d2 = T0 + timedelta(days=2)
-        self.write([meta(price=1.95)], r1d=[row(low=1.84, close=1.93, bar_time=ms(d2) - DAY)], r4h=[row()])
-        rep = S.run("daily", now=d2, nav_usd=10_000, conn=self.conn)
+        self.assertTrue(S.load_pending()[0]["breakout_1d"])
+        # step 2: 4H retrace down to the 4H Filter
+        d2 = d1 + timedelta(hours=4)
+        self.write([meta()], r1d=[row(bar_time=ms(d1) - DAY)], r4h=[row(close=1.75, bar_time=ms(d2) - H4)])
+        S.run("4h", now=d2, nav_usd=10_000, conn=self.conn)
+        self.assertTrue(S.load_pending()[0]["retrace_touched"])
+        self.assertEqual(self.trades(), [])
+        # step 3: 4H dual cross up above 4H Upper -> fill
+        d3 = d2 + timedelta(hours=4)
+        self.write([meta(price=2.0)], r1d=[row(bar_time=ms(d1) - DAY)],
+                   r4h=[row(close=2.0, upper=1.9, prev_close=1.85, prev_upper=1.88, bar_time=ms(d3) - H4)])
+        rep = S.run("4h", now=d3, nav_usd=10_000, conn=self.conn)
         self.assertEqual(rep["opened"][0]["kind"], "Chase")
         self.assertEqual(S.load_pending()[0]["status"], "filled")
         self.assertEqual(self.trades()[0]["counted"], 1)

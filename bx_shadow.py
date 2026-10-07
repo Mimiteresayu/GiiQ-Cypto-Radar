@@ -260,7 +260,7 @@ def run(job: str, now: Optional[datetime] = None, nav_usd: Optional[float] = Non
     out/bx_shadow_pending.json. Returns a report dict."""
     import bx_radar
     import dim_ledger
-    from pending_entries import ADD_ON, CONTINUATION, create_pending, evaluate
+    from pending_entries import ADD_ON, CONTINUATION, band, create_pending, evaluate
     now = now or datetime.now(timezone.utc)
     own = conn is None
     conn = conn or connect()
@@ -322,17 +322,14 @@ def run(job: str, now: Optional[datetime] = None, nav_usd: Optional[float] = Non
         rep["opened"].append({"symbol": meta["symbol"], "kind": kind, "px": round(px, 10), "size_pct": size,
                               "hard_sl": sl, "counted": counted})
 
-    # 2) pending pullback fills (Chase) — every job that has fresh band bars
+    # 2) CONT / ADD_ON 3-step fills (shadow) — every job (old N/N+1 records are cancelled by evaluate())
     pend = load_pending()
     for rec in [e for e in pend if e.get("status") == "pending"]:
         sym = rec["symbol"]
-        tf = "4h" if rec["kind"] == ADD_ON else "1d"
-        row = (r4h if tf == "4h" else r1d).get(sym) or {}
-        bnd = {"tf": tf, "lower": _f(row.get("lower")), "filter": _f(row.get("filter")), "close": _f(row.get("close")),
-               "trend": row.get("trend"), "bar_time": row.get("bar_time")}
-        bar = {"t": row.get("bar_time"), "l": row.get("low"), "c": row.get("close")} if row else None
+        # 3-step rule (1D BO -> 4H retrace -> 4H BO) on the BX 1D + 4H rows, same evaluate() as HL / BX live
+        bnd = band(rec["kind"], r1d.get(sym), r4h.get(sym))
         meta = meta_all.get(sym) or {}
-        action, reason, upd = evaluate(rec, bnd, _f(meta.get("price")), now, held, bar)
+        action, reason, upd = evaluate(rec, bnd, _f(meta.get("price")), now, held)
         rec.update(upd)
         rec["last_check"] = now.isoformat()
         rec.setdefault("history", []).append({"t": now.isoformat(), "action": action, "reason": reason[:200]})

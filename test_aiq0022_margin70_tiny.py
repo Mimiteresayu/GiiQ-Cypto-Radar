@@ -118,17 +118,16 @@ class TestExecutorCaps(EnvMixin, unittest.TestCase):
 
 
 class TestPendingTiny(unittest.TestCase):
-    """Borrows the pending-worker fixtures from test_pending_entries.TestWorker (not its tests)."""
+    """Borrows the pending-worker fixtures from test_pending_entries.TestWorker (not its tests).
+    A Tiny CONT that fires on the 3-step rule is still clamped to 2% / 3x."""
     setUp = TPE.TestWorker.setUp
-    radars = TPE.TestWorker.radars
-    entry = TPE.TestWorker.entry
     run_w = TPE.TestWorker.run_w
     tearDown = TPE.TestWorker.tearDown
 
     def test_tiny_continuation_clamped(self):
-        hl = TPE.FakeHL(mids={"AAA": 0.9})
-        ents = self.entry(size=6, lev=5, tier="tiny")
-        res = self.run_w(hl, ents, TPE.bar(0.88, 0.93))
+        hl = TPE.FakeHL(mids={"AAA": 1.06})
+        ents = [TPE.new_rec(TPE.pe.CONT, breakout=True, retrace=True, size=6, lev=5, tier="tiny")]
+        res = self.run_w(hl, ents)
         self.assertEqual(res["status"], "success", res)
         f = res["filled"][0]
         self.assertEqual(f["size_pct"], 2.0)

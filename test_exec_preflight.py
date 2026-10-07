@@ -93,7 +93,7 @@ class TestPreflight(unittest.TestCase):
     def test_entry_guard_preview_chase_is_pending(self):
         r = self._preview([{"symbol": "AAA", "type": "Chase", "upper_4h": 1.05}],
                           {"AAA": {"decision": "approve", "leverage": 2}, "BBB": {"decision": "approve"}})
-        self.assertEqual(r["entry_guard"]["AAA"]["pending_kind"], "CONTINUATION")
+        self.assertEqual(r["entry_guard"]["AAA"]["pending_kind"], "CONT")
         self.assertEqual(r["entry_guard"]["BBB"]["note"], "not in current candidate list")
 
     def test_never_prints_key(self):

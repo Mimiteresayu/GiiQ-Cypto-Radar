@@ -9,11 +9,11 @@ Surfaces, BEFORE the 08:55 executor, every reason LIVE entries would fail:
   4. signing: side-effect-free signed probe (cancel of a non-existent oid) is accepted by HL
   5. decisions/candidates (informational before 08:55): today's approvals, candidate freshness,
      approved coins listed on HL with maxLeverage >= requested (clamped) leverage, and the
-     at-entry Upper guard (Base only: live mid vs 1D Upper; Chase approvals become pending, or
-     "no entry" while CONTINUATION / ADD_ON pending is disabled). Approvals are matched against
+     at-entry Upper guard (Base only: live mid vs 1D Upper; CONT/ADD_ON approvals become 3-step watches, or
+     "no entry" while CONT / ADD_ON is disabled). Approvals are matched against
      today's frozen entry_candidates_decision_YYYYMMDD.json (fallback: latest). An approval missing
-     from the list is OK when an active CONTINUATION / ADD_ON pending already exists for it.
-  6. pending pullback entries (ADD_ON / CONTINUATION) with trigger zones, and whether they are disabled
+     from the list is OK when an active CONT / ADD_ON 3-step watch record already exists for it.
+  6. CONT / ADD_ON 3-step watch records with their current step, and whether they are disabled
   7. GIIQ-SoT-1 guardrails preview: radar row-count (1D/4H/1H; entries fail closed below the
      threshold), NAV snapshot definition, minimum order = max($10, 1% NAV)
 
@@ -159,9 +159,11 @@ def run_preflight(hl: Any = None, signed_probe: bool = True, now: Optional[datet
                                  pending_disabled)
     disabled = pending_disabled()
     res["pending_disabled"] = disabled
-    add("pending_mode", True, (f"CONTINUATION/ADD_ON pending DISABLED ({DISABLED_REASON}): Chase approvals -> "
+    add("pending_mode", True, (f"CONT/ADD_ON 3-step entries DISABLED ({DISABLED_REASON}): CONT/ADD_ON approvals -> "
                                f"no entry; re-enable with {DISABLE_ENV}=0") if disabled
-        else f"CONTINUATION/ADD_ON pending enabled ({DISABLE_ENV}=0)", blocking=False)
+        else (f"CONT/ADD_ON 3-step entries enabled ({DISABLE_ENV}=0): 1D dual cross up above 1D Upper -> "
+              f"4H retrace to 4H Filter/Lower -> 4H dual cross up above 4H Upper -> IOC entry + Hard SL"),
+        blocking=False)
     try:
         pend_all = load_pending()
     except Exception:  # noqa: BLE001
@@ -220,7 +222,7 @@ def run_preflight(hl: Any = None, signed_probe: bool = True, now: Optional[datet
                     if disabled and str(approved[sym].get("type") or "").upper() == "CHASE":
                         guard[sym] = {"type": "Chase", "pending_kind": None, "no_entry": True,
                                       "note": "not in candidate list"}
-                        add(f"guard:{sym}", True, f"Chase approval -> no entry (CONTINUATION/ADD_ON pending "
+                        add(f"guard:{sym}", True, f"CONT/ADD_ON approval -> no entry (3-step entries "
                             f"disabled: {DISABLED_REASON})", blocking=False)
                         continue
                     guard[sym] = {"type": None, "note": "not in current candidate list"}
@@ -230,13 +232,13 @@ def run_preflight(hl: Any = None, signed_probe: bool = True, now: Optional[datet
                 if c.get("type") == "Chase" and not c.get("is_base"):
                     if disabled:
                         guard[sym] = {"type": "Chase", "pending_kind": None, "no_entry": True}
-                        add(f"guard:{sym}", True, f"Chase -> no entry (CONTINUATION/ADD_ON pending disabled: "
+                        add(f"guard:{sym}", True, f"CONT/ADD_ON -> no entry (3-step entries disabled: "
                             f"{DISABLED_REASON})", blocking=False)
                         continue
-                    kind = "ADD_ON" if sym in held else "CONTINUATION"
+                    kind = "ADD_ON" if sym in held else "CONT"
                     guard[sym] = {"type": "Chase", "pending_kind": kind}
-                    add(f"guard:{sym}", True, f"Chase -> no 08:55 entry; becomes pending {kind} "
-                        f"({'4H' if kind == 'ADD_ON' else '1D'} pullback zone, N+1 confirmation)", blocking=False)
+                    add(f"guard:{sym}", True, f"{kind} -> no 08:55 entry; 3-step watch (1D BO -> 4H retrace to "
+                        f"Filter/Lower -> 4H BO -> IOC entry + Hard SL)", blocking=False)
                     continue
                 c = dict(c, type="Base")
                 up, label = entry_upper_ref(c, rows_1d.get(sym), rows_4h.get(sym))
@@ -250,7 +252,7 @@ def run_preflight(hl: Any = None, signed_probe: bool = True, now: Optional[datet
             add("guard", False, f"at-entry Upper guard preview failed: {e}", blocking=False)
     else:
         add("decisions", True, "no approvals stored yet for today (AI desk posts before 08:55)", blocking=False)
-    # Pending pullback entries (ADD_ON / CONTINUATION): list + trigger zones (informational)
+    # CONT / ADD_ON 3-step watch records: list + current step (informational)
     try:
         from pending_entries import load_pending, summary as pending_summary
         rows_1d = {r.get("symbol"): r for r in (_load("gc_radar_1d.json").get("rows") or [])}
@@ -263,10 +265,10 @@ def run_preflight(hl: Any = None, signed_probe: bool = True, now: Optional[datet
         res["pending"] = pend
         for p in pend:
             add(f"pending:{p['symbol']}", True,
-                f"{p['kind']} zone {p['band_tf'].upper()} [{p['zone_lower']}, {p['zone_filter']}] mid {p['mid']}"
-                f"{' IN ZONE' if p['in_zone'] else ''} exp {p['expires_at']}", blocking=False)
+                f"{p['kind']} {p.get('current_step')} | 4H Filter {p.get('4h_filter')} Lower {p.get('4h_lower')} "
+                f"Upper {p.get('4h_upper')} mid {p.get('mid')} exp {p.get('expires_at')}", blocking=False)
         if not pend:
-            add("pending", True, "no active pending pullback entries", blocking=False)
+            add("pending", True, "no active CONT/ADD_ON 3-step watch records", blocking=False)
     except Exception as e:  # noqa: BLE001
         add("pending", False, f"pending list failed: {e}", blocking=False)
     return res

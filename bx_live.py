@@ -793,7 +793,7 @@ def run_entries(now: Optional[datetime] = None, trade_api=None, egress: Optional
                 nav_fn: Callable[[], Optional[float]] = hl_nav, market: Callable[[str], dict] = live_market,
                 tiers_fn=None, conn=None,
                 hl_margin_fn: Callable[[], Optional[float]] = hl_margin_used) -> Dict[str, Any]:
-    """08:56 HKT: approved BX candidates -> live entries (Base / 4H NewToken) or live pending (Chase).
+    """08:56 HKT: approved BX candidates -> live entries (Base / 4H NewToken) or a CONT/ADD_ON 3-step watch record.
     GIIQ-SoT-5 ADD-1: BX radar freshness check before any orders."""
     import bx_egress
     import bx_radar
@@ -896,6 +896,12 @@ def _try_enter(api, conn, c, meta_all, acct, nav, book, now, market, tiers_fn, r
     return res.get("status") in ("filled", "dry_run")
 
 
+def cleanup_old_style_live_pending(now: Optional[datetime] = None) -> Dict[str, Any]:
+    """bx-exec startup: cancel old N/N+1 BX live pendings (OLD_STYLE_REPLACED_BY_3STEP), whatever the flag."""
+    from pending_entries import cleanup_old_style
+    return cleanup_old_style(now, tag="BX", load=load_live_pending, save=save_live_pending, log=_log)
+
+
 def live_pending_path() -> Path:
     return OUT_DIR / "bx_live_pending.json"
 
@@ -924,7 +930,7 @@ def create_live_pending(entries: List[dict], cand: dict, approval: dict, now: da
 def run_manage(job: str, now: Optional[datetime] = None, trade_api=None, egress: Optional[dict] = None,
                nav_fn: Callable[[], Optional[float]] = hl_nav, market: Callable[[str], dict] = live_market,
                tiers_fn=None, conn=None) -> Dict[str, Any]:
-    """4h / hourly: exits + SL repair (close-only), live pending Chase fills (4h, full gate), breaker."""
+    """4h / hourly: exits + SL repair (close-only), CONT/ADD_ON 3-step entries (4h, full gate), breaker."""
     import bx_egress
     import bx_radar
     import bx_shadow as S
@@ -960,7 +966,7 @@ def run_manage(job: str, now: Optional[datetime] = None, trade_api=None, egress:
         rep["breaker"] = br
         if br["trip"] and not breaker_state().get("tripped"):
             rep["breaker_state"] = trip_breaker(br, now)
-        # pending Chase fills (4h job only; the full live gate applies, incl. the breaker)
+        # CONT/ADD_ON 3-step entries (4h job only; the full live gate applies, incl. the breaker)
         if job == "4h":
             egress = egress if egress is not None else bx_egress.check()
             ok, why = live_gate(egress, bx_trade.keys_present(), breaker_state())
@@ -975,12 +981,16 @@ def run_manage(job: str, now: Optional[datetime] = None, trade_api=None, egress:
 def run_live_pending(api, conn, now, gate_ok, gate_why, meta_all, acct, nav, market, tiers_fn) -> List[dict]:
     import bx_radar
     import bx_shadow as S
-    from pending_entries import band, evaluate
+    from pending_entries import OLD_STYLE_REASON, band, cancel_old_style, evaluate
     pend = load_live_pending()
+    # old N/N+1 records: cancelled before any evaluation (evaluate() also refuses them)
+    old = cancel_old_style(pend, now, tag="BX", log=_log)
+    out = [{"symbol": e.get("symbol"), "action": "cancel", "reason": OLD_STYLE_REASON} for e in old]
+    if old:
+        save_live_pending(pend)
     r1d = S._rows_by_symbol(bx_radar.load_radar("1d"))
     r4h = S._rows_by_symbol(bx_radar.load_radar("4h"))
     held = {t["bx_symbol"] for t in open_live_trades(conn)}
-    out = []
     for rec in [e for e in pend if e.get("status") == "pending"]:
         sym = rec["symbol"]
         # New 3-step rule: need both 1D and 4H data
@@ -991,6 +1001,7 @@ def run_live_pending(api, conn, now, gate_ok, gate_why, meta_all, acct, nav, mar
         rec["last_check"] = now.isoformat()
         if action in ("expire", "cancel"):
             rec["status"] = "expired" if action == "expire" else "cancelled"
+            rec.setdefault("close_reason", reason)
         elif action == "trigger":
             if not gate_ok:
                 reason += f" | not sent: {'; '.join(gate_why)}"

@@ -255,7 +255,8 @@ class TestExecutorGuardrails(EnvMixin, unittest.TestCase):
 
 class TestPendingGuardrails(EnvMixin, unittest.TestCase):
     def test_rowcount_fail_closed_no_state_change(self):
-        entries = [{"id": "AAA_CONTINUATION_20260928", "symbol": "AAA", "kind": "CONTINUATION", "status": "pending"}]
+        entries = [{"id": "AAA_CONT_20260928", "symbol": "AAA", "kind": "CONT", "status": "pending",
+                    "breakout_1d": True, "retrace_touched": True}]   # a 3-step record
         before = [dict(e) for e in entries]
         hl = FakeHL(mids={"AAA": 1.0})
         with patch.dict(os.environ, {"EXEC_RADAR_MIN_ROWS": "120"}):

@@ -8,13 +8,15 @@ SoT enforcement (see exec_common.py):
 - Isolated liq price must lie below the Hard SL
 - Base (fresh 1D dual-cross-up) enters now, guarded: a live HL mid fetched right before the
   order must be ABOVE the 1D Upper from the latest closed-bar scan, else skip
-- Chase signals never enter at 08:55: they become pending pullback entries (pending_entries.py)
-  ADD_ON (coin already held LONG, zone [4H Lower, 4H Filter]) or CONTINUATION (no position,
-  zone [1D Lower, 1D Filter]); pending_worker.py checks them every 4h at :10 HKT, right after the 4H exits,
-  with the same SoT checks (skipped for that run if the exit step failed).
-  Pending records are only written in LIVE mode (DRY_RUN reports "would_create").
-  DISABLED by default (Cove HEALTH FAIL 2026-10-05): Chase approvals are acknowledged with no entry
-  (result "no_entry", no pending) and active CONTINUATION / ADD_ON pendings are cancelled (LIVE),
+- CONT / ADD_ON approvals (radar type "Chase") never enter at 08:55: they become 3-step watch records
+  (pending_entries.py): CONT = no Base position in the coin, ADD_ON = Base position held. Entry only when
+  1D dual cross up above 1D Upper -> 4H retrace to 4H Filter/Lower -> 4H dual cross up above 4H Upper;
+  pending_worker.py checks every 4h at :10 HKT (after the 4H exits) and places an immediate IOC entry with
+  the Hard SL (no resting orders), with the same SoT checks.
+  Watch records are only written in LIVE mode (DRY_RUN reports "would_create"). Old N/N+1 records are
+  cancelled here too (OLD_STYLE_REPLACED_BY_3STEP), so they can never block a new 3-step record.
+  DISABLED by default (Cove HEALTH FAIL 2026-10-05): CONT/ADD_ON approvals are acknowledged with no entry
+  (result "no_entry", no record) and active CONT / ADD_ON records are cancelled (LIVE),
   unless PENDING_CONTINUATION_DISABLED=0. Base is unchanged.
 - Approvals are matched against today's frozen decision snapshot entry_candidates_decision_YYYYMMDD.json
   (HKT), falling back to entry_candidates_latest.json only when it is missing; the freshness guard
@@ -99,6 +101,7 @@ from pending_entries import band as pending_band  # noqa: E402
 from pending_entries import classify_chase, create_pending, load_pending, save_pending  # noqa: E402
 from pending_entries import summary as pending_summary  # noqa: E402
 from pending_entries import DISABLE_ENV, DISABLED_REASON, cancel_active_pending, pending_disabled  # noqa: E402
+from pending_entries import cancel_old_style  # noqa: E402
 from entry_candidates import load_decision_candidates  # noqa: E402
 
 try:
@@ -324,6 +327,10 @@ def _execute(
     held_long = {p["coin"] for p in account["positions"] if p["side"] == "LONG"}
     pend_entries = load_pending()
     pend_dirty = False
+    old_style = cancel_old_style(pend_entries, now, tag="HL", log=_log)   # housekeeping, any mode
+    if old_style:
+        pend_dirty = True
+        result["pending_cancelled_old_style"] = [e.get("id") for e in old_style]
     disabled = pending_disabled()
     if disabled:
         result["pending_disabled"] = DISABLED_REASON
@@ -364,7 +371,7 @@ def _execute(
     entries_run = 0
     result["entries_today_before"] = entries_today
     
-    # GIIQ-SoT-5: process approvals in desk priority order (Chase first), then candidate order
+    # GIIQ-SoT-5: process approvals in desk priority order (CONT/ADD_ON first), then candidate order
     approved_list = sorted(approved, key=lambda s: (
         0 if (next((c for c in candidates if c.get("symbol") == s), {}) or {}).get("type") == "Chase" else 1,
         s
@@ -385,17 +392,17 @@ def _execute(
         is_base = bool(cand.get("is_base")) or entry_type == "Base"
         fallback = str(decision.get("source") or "") == "fallback"
         # GIIQ-SoT-5: fallback approves every executable candidate at floor size (not just Base)
-        # Chase will still become pending, not an immediate entry
+        # CONT / ADD_ON (radar type "Chase") -> 3-step watch record, never an immediate entry
         if not is_base and entry_type == "Chase":
             if disabled:
-                why = (f"Chase acknowledged, no entry: CONT/ADD_ON pending disabled ({DISABLED_REASON}; "
+                why = (f"CONT/ADD_ON acknowledged, no entry: 3-step entries disabled ({DISABLED_REASON}; "
                        f"re-enable {DISABLE_ENV}=0)")
-                result["no_entry"].append({"symbol": symbol, "type": "Chase", "reason": why})
+                result["no_entry"].append({"symbol": symbol, "type": classify_chase(symbol, held_long), "reason": why})
                 _log(f"{mode} NO ENTRY {symbol}: {why}")
                 continue
-            # Chase -> pending pullback entry (ADD_ON / CONTINUATION), never an 08:55 order
+            # CONT / ADD_ON -> 3-step watch record (entry only on the 4H BO), never an 08:55 order
             if symbol in held and symbol not in held_long:
-                skip("Chase signal on a SHORT position: no pending add-on")
+                skip("CONT/ADD_ON signal on a SHORT position: no add-on")
                 continue
             kind = classify_chase(symbol, held_long)
             r1d_p = next((r for r in radar_1d.get("rows", []) if r.get("symbol") == symbol), None)
@@ -420,7 +427,7 @@ def _execute(
             skip(f"unknown entry type {entry_type!r} (fail-closed)")
             continue
         entry_type = "Base"
-        cand = dict(cand, type="Base")  # Base guard = 1D Upper even if the row is also a 4H Chase
+        cand = dict(cand, type="Base")  # Base guard = 1D Upper even if the row is also a 4H CONT/ADD_ON signal
 
         if symbol in held:
             skip("already holding a position")

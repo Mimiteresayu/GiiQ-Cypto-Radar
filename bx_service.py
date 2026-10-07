@@ -10,7 +10,7 @@ egress blocks every live order (bx_live.live_gate); a US egress with BX_LIVE=1 a
 Schedule (HKT, APScheduler, one lock, each step a subprocess with a hard timeout):
   08:02         bx_radar daily -> bx_shadow daily -> bx_live candidates  (ready before the 08:10 ENTRY_DESK)
   08:56         bx_live entries        (approved candidates only; no approval -> no order)
-  every 4h :05  bx_radar 4h -> bx_shadow 4h -> bx_live 4h   (exits, SL repair, Chase pending fills, breaker)
+  every 4h :05  bx_radar 4h -> bx_shadow 4h -> bx_live 4h   (exits, SL repair, CONT/ADD_ON 3-step entries, breaker)
   hourly :09    bx_radar 1h -> bx_shadow 1h -> bx_live 1h   (exits, SL repair, breaker)
 Switches: BX_ENABLED=0 stops everything (no scans, no orders; exchange SL orders stay in place).
           BX_LIVE=0 (default) -> shadow only: no new live orders; exits / SL repair of open live positions continue.
@@ -305,6 +305,11 @@ def start_scheduler():
 def main() -> int:
     eg = bx_egress.check(force=True)
     bx_live._log(bx_egress.log_line(eg))
+    try:  # old N/N+1 live pendings are never evaluated or filled by the 3-step rule
+        r = bx_live.cleanup_old_style_live_pending()
+        bx_live._log(f"[BX] boot old-style pending cleanup: {r.get('cancelled') or 'none found'}")
+    except Exception as e:  # noqa: BLE001
+        bx_live._log(f"[BX_ALERT] boot old-style pending cleanup failed: {e}")
     if not eg.get("ok") and bx_live.env_on("BX_LIVE", "0"):
         bx_live._log(f"[BX_ALERT] BX_LIVE=1 but egress not verified non-US ({eg.get('reason')}): live orders blocked")
     if bx_live.env_on("BX_ENABLED", "1"):

@@ -286,7 +286,7 @@ class TestExecutorDryRun(EnvMixin, unittest.TestCase):
         hl = FakeHL(equity=1000, meta=self.META, mids={"AAA": 1.0})
         res = self.run_exec(hl, _cands(_cand("AAA", typ="Chase")), {"AAA": {"decision": "approve", "size_pct": 3}})
         self.assertEqual(res["actions"], [])
-        self.assertEqual(res["pending"][0]["kind"], "CONTINUATION")
+        self.assertEqual(res["pending"][0]["kind"], "CONT")
         self.assertTrue(res["pending"][0]["would_create"])
         self.assertFalse(os.path.exists(os.environ["PENDING_PATH"]))
         self.assertEqual(hl.calls, [])
@@ -402,7 +402,8 @@ class TestExecutorLive(EnvMixin, unittest.TestCase):
         res = self._live_chase(hl)
         self.assertEqual(hl.calls, [])                       # no order at 08:55
         p = res["pending"][0]
-        self.assertEqual((p["kind"], p["band_tf"], p["zone_lower"], p["zone_filter"]), ("CONTINUATION", "1d", 0.7, 0.8))
+        # 3-step watch record: no zone, the 4H Filter / Lower are reported for the retrace step
+        self.assertEqual((p["kind"], p["4h_lower"], p["4h_filter"]), ("CONT", 0.85, 0.92))
         self.assertTrue(p["created"])
         import pending_entries as pe
         stored = pe.load_pending()
@@ -420,7 +421,7 @@ class TestExecutorLive(EnvMixin, unittest.TestCase):
         res = self._live_chase(hl)
         self.assertEqual(hl.calls, [])
         p = res["pending"][0]
-        self.assertEqual((p["kind"], p["band_tf"], p["zone_lower"], p["zone_filter"]), ("ADD_ON", "4h", 0.85, 0.92))
+        self.assertEqual((p["kind"], p["4h_lower"], p["4h_filter"]), ("ADD_ON", 0.85, 0.92))
         self.assertEqual(res["skipped"], [])                 # not "already holding"
 
     def test_live_sl_failure_closes_position(self):

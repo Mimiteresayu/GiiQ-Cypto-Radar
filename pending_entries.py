@@ -50,6 +50,47 @@ ACTIVE = "pending"
 PENDING_KINDS = (ADD_ON, CONTINUATION, CONT)
 DISABLE_ENV = "PENDING_CONTINUATION_DISABLED"
 DISABLED_REASON = "disabled by Cove HEALTH FAIL 2026-10-05"
+# Records written by the OLD N/N+1 pullback rule (zone 1D/4H Lower-Filter, `setup` bar N, `band_tf`).
+# They are never evaluated or filled by the 3-step rule: cancelled at service startup, at the start of every
+# 4H pending worker / BX pending pass, and evaluate() refuses them even if that cleanup failed.
+OLD_STYLE_REASON = "OLD_STYLE_REPLACED_BY_3STEP"
+_OLD_STYLE_KEYS = ("zone_at_create", "band_tf", "setup", "last_bar_t")
+
+
+def is_old_style(rec: Any) -> bool:
+    """True for a pending record created by the old N/N+1 rule (or anything not written by the 3-step
+    create_pending, which always stores `breakout_1d`)."""
+    if not isinstance(rec, dict):
+        return True
+    if "breakout_1d" not in rec:
+        return True
+    return any(k in rec for k in _OLD_STYLE_KEYS)
+
+
+def cancel_old_style(entries: List[dict], now: datetime, tag: str = "HL", log: Any = None) -> List[dict]:
+    """Cancel every ACTIVE old-style record (mutates `entries`), logging each one. Returns those records."""
+    import sys
+    gone = []
+    for e in entries:
+        if isinstance(e, dict) and e.get("status") == ACTIVE and is_old_style(e):
+            e.update(status="cancelled", closed_at=now.isoformat(), close_reason=OLD_STYLE_REASON)
+            gone.append(e)
+            msg = (f"[PENDING] {tag} cancelled {e.get('id')} ({e.get('symbol')} {e.get('kind')}): "
+                   f"{OLD_STYLE_REASON}")
+            (log or (lambda m: sys.stderr.write(m + "\n")))(msg)
+    return gone
+
+
+def cleanup_old_style(now: Optional[datetime] = None, tag: str = "HL", load: Any = None, save: Any = None,
+                      log: Any = None) -> Dict[str, Any]:
+    """Load a pending store, cancel its old-style records, save if anything changed (startup hook).
+    Defaults to the HL store; BX passes its own load/save."""
+    now = now or datetime.now(timezone.utc)
+    entries = (load or load_pending)()
+    gone = cancel_old_style(entries, now, tag=tag, log=log)
+    if gone:
+        (save or save_pending)(entries)
+    return {"cancelled": [e.get("id") for e in gone], "reason": OLD_STYLE_REASON if gone else None}
 
 
 def pending_disabled() -> bool:
@@ -201,6 +242,10 @@ def evaluate(rec: dict, bnd: Dict[str, Any], mid: Optional[float], now: datetime
     fields the caller persists in LIVE mode. Missing/misaligned data -> wait without state change
     (fail-closed, retried next 4H run)."""
     
+    if is_old_style(rec):
+        # never evaluate / fill an old N/N+1 record, even if the startup / worker cleanup failed
+        return "cancel", OLD_STYLE_REASON, {}
+
     exp = parse_ts(rec.get("expires_at"))
     if exp and now >= exp:
         return "expire", f"expired after {PENDING_TTL_DAYS} days", {}
@@ -285,7 +330,9 @@ def summary(entries: List[dict], rows_1d: Dict[str, dict], rows_4h: Dict[str, di
         d1d, d4h = b.get("1d", {}), b.get("4h", {})
         
         # Determine current step
-        if not e.get("breakout_1d"):
+        if is_old_style(e):
+            step = f"old-style record: will be cancelled ({OLD_STYLE_REASON}), never filled"
+        elif not e.get("breakout_1d"):
             step = "Step 1: waiting for 1D breakout"
         elif not e.get("retrace_touched"):
             step = "Step 2: waiting for 4H retrace"

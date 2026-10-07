@@ -414,7 +414,7 @@ def build_run_report(run: str, result: Dict[str, Any], nav: Optional[dict] = Non
         rep.setdefault("pending_created", []).append(
             {"symbol": p.get("symbol"), "kind": p.get("kind"), "zone": [p.get("zone_lower"), p.get("zone_filter")],
              "band_tf": p.get("band_tf"), "stored": bool(p.get("id")), "created": p.get("created")})
-    # pending disabled: Chase approvals acknowledged with no entry - not counted as skips
+    # pending disabled: CONT/ADD_ON approvals acknowledged with no entry - not counted as skips
     for n in result.get("no_entry", []) or []:
         rep.setdefault("no_entry", []).append({"symbol": n.get("symbol"), "reason": n.get("reason")})
     if result.get("pending_disabled"):
