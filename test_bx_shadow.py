@@ -171,7 +171,7 @@ class TestExits(ShadowCase):
         # liquidity exit on a second token
         self.write([meta("NEW", gc_tf="4h", asset_age="new_token")], r4h=[row("NEW", dual_cross_up=True)])
         S.run("4h", now=later, nav_usd=10_000, conn=self.conn)
-        self.write([meta("NEW", gc_tf="4h", asset_age="new_token", vol24h_usd=5e5)],
+        self.write([meta("NEW", gc_tf="4h", asset_age="new_token", vol24h_usd=1.5e5)],
                    r4h=[row("NEW", bar_time=ms(later))])
         rep = S.run("4h", now=later + timedelta(hours=4), conn=self.conn)
         self.assertEqual(rep["closed"][0]["reason"], "liquidity_exit")

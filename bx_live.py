@@ -72,7 +72,8 @@ BX_RADAR_MAX_AGE_H = {"1d": 36.0, "4h": 4.5}
 BX_RADAR_MIN_ROWS_PCT = 0.70    # 70% of normal row count
 TIME_CAP_DAYS = 7
 TIME_CAP_DAYS_NEW_TOKEN = 5
-LIQ_EXIT_VOL = 1_000_000.0
+LIQ_EXIT_VOL = 200_000.0
+LOW_VOL_FLAG_USD = 1_000_000.0  # MMT 2026-10-07: flag any BX candidate / order on a coin under $1M 24h volume
 LIQ_EXIT_SPREAD_BP = 30.0
 LIVE_GC_TFS = ("1d", "4h")
 DECISION_LATE_HKT = (8, 50)
@@ -344,6 +345,12 @@ def pilot_eligible(meta: dict) -> Tuple[bool, str]:
     return True, ""
 
 
+def low_vol_flags(vol: Any) -> List[str]:
+    """Statistics flag only (never blocks): 24h volume under $1M (or unknown)."""
+    v = _f(vol)
+    return ["low_vol_under_1M"] if v is None or v < LOW_VOL_FLAG_USD else []
+
+
 def build_candidates(now: Optional[datetime] = None) -> dict:
     """08:02 HKT (after the BX daily radar): today's pilot-eligible BX signals for the 08:10 ENTRY_DESK."""
     import bx_radar
@@ -377,6 +384,7 @@ def build_candidates(now: Optional[datetime] = None) -> dict:
             "hard_sl": sl, "hard_sl_rule": sl_rule,
             "sl_dist_pct": round((close - sl) / close * 100, 3) if close and sl else None,
             "vol24h_usd": m.get("vol24h_usd"), "spread_bp": m.get("spread_bp"), "ign_x": m.get("ign_x"),
+            "flags": low_vol_flags(m.get("vol24h_usd")),
             "narrative": bool(m.get("narrative")), "cat_tags": m.get("cat_tags"), "mcap_usd": m.get("mcap_usd"),
             "max_leverage": m.get("max_leverage"), "contract_age_days": m.get("contract_age_days"),
             "asset_age": m.get("asset_age"),
@@ -931,6 +939,14 @@ def _try_enter(api, conn, c, meta_all, acct, nav, book, now, market, tiers_fn, r
         # the order may still have reached the exchange: stop further entries this run (fail closed)
         book["margin_used"] = None
         return False
+    vol = _f((live or {}).get("vol24h"))
+    if vol is None:
+        vol = _f(meta.get("vol24h_usd"))
+    flags = low_vol_flags(vol)
+    if flags:
+        res["flags"] = flags
+        _log(f"[BX_ALERT] FLAG low_vol_under_1M: {c['symbol']} order sent with 24h vol "
+             f"{('$%.0f' % vol) if vol is not None else 'unknown'} (< $1M)")
     rep["entered"].append(res)
     if res.get("status") != "not_filled":
         m = float(chk["plan"]["margin_usd"])

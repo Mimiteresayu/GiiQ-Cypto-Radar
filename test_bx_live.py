@@ -692,5 +692,14 @@ class TestCockpitRoutesBxDecisionsAway(unittest.TestCase):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+class TestLowVolFlag(unittest.TestCase):
+    def test_flag_under_1m(self):
+        import bx_live as L
+        self.assertEqual(L.low_vol_flags(250_000), ["low_vol_under_1M"])
+        self.assertEqual(L.low_vol_flags(None), ["low_vol_under_1M"])      # unknown volume is flagged too
+        self.assertEqual(L.low_vol_flags(1_000_000), [])
+        self.assertEqual(L.low_vol_flags(8_000_000), [])
+
+
 if __name__ == "__main__":
     unittest.main()
