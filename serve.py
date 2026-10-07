@@ -747,7 +747,7 @@ def _enhance_candidates(candidates: list, account: dict, meta: dict) -> list:
         hard_sl, sl_label = hard_sl_for_tier(c.get("tier", ""), {"lower": c.get("lower_4h"), "filter": c.get("filter_4h")})
         close_1d = c.get("close_1d") or 0
         # GIIQ-SoT-2 suggestion (the executor re-sizes at order time with live mid + open risk)
-        sz = (size_by_margin(equity, close_1d, hard_sl, coin_max, tier=c.get("tier", ""))
+        sz = (size_by_margin(equity, close_1d, hard_sl, coin_max, tier=c.get("tier", ""), flat_tier_size=True)
               if (equity and close_1d and hard_sl) else {"ok": False})
         if sz.get("ok"):
             size_pct, lev = round(sz["margin_pct"], 2), int(sz["leverage"])

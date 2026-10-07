@@ -379,3 +379,10 @@ used for orders.
   Same fail-closed checks as every entry (radar row-count + freshness, liq beyond Hard SL, Hard SL per tier, SL distance, price sanity,
   min order, 80% total margin). Mechanical (no desk decision), like Signum.
 - Manual dry-run: cockpit job `addon`. Tests: `test_daily_addon.py`.
+
+## Flat Base size by tier (2026-10-07, MMT)
+- Isolated margin per Base entry = **tiny 2% / small 3% / large 4% / mega 5% of NAV** (`exec_common.TIER_MARGIN_PCT`; unknown tier = tiny).
+  The desk's `size_pct` is ignored for Hyperliquid and Bitunix Base entries; the desk still sets leverage.
+- Hyperliquid: leverage is capped so margin x leverage stays <= 20% NAV per coin (mega 5% -> max 4x; large 4% -> max 5x).
+- The Railway fallback (no desk POST) keeps its 2% / 2x floor. Tiny keeps its 3x leverage cap. Daily ADD_ON top-up still adds 2%.
+- Cockpit candidate preview uses the same flat sizes. Tests: `test_flat_tier_size.py`, `test_bx_live.py`.

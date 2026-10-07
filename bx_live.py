@@ -289,12 +289,17 @@ def hl_margin_used(address: Optional[str] = None, info: Callable[[dict], Any] = 
         return None
 
 
-def desk_sizing(approval: Optional[dict], coin_max_leverage: Any = None) -> Tuple[float, int]:
+def desk_sizing(approval: Optional[dict], coin_max_leverage: Any = None, tier: Optional[str] = None) -> Tuple[float, int]:
     """GIIQ-SoT-5 B19: (size_pct, leverage) from the desk decision. size_pct clamped to 2..4 % NAV, leverage to
-    2..5x and never above the contract max leverage. Missing / zero values -> 2% / 2x."""
+    2..5x and never above the contract max leverage. Missing / zero values -> 2% / 2x.
+    MMT 2026-10-07: when a tier is given the size is FLAT by tier (tiny 2 / small 3 / large 4 / mega 5 % NAV) and the
+    desk size is ignored; the Railway fallback keeps its 2% floor."""
     a = approval or {}
     size_pct = _f(a.get("size_pct")) or DEFAULT_SIZE_PCT
     size_pct = max(SIZE_PCT_MIN, min(SIZE_PCT_MAX, size_pct))
+    if tier is not None and not str(a.get("reason") or "").startswith("RAILWAY_FALLBACK"):
+        from exec_common import tier_margin_pct
+        size_pct = tier_margin_pct(tier)
     leverage = int(_f(a.get("leverage")) or DEFAULT_LEVERAGE)
     leverage = max(LEV_MIN, min(LEV_MAX, leverage))
     cmax = _f(coin_max_leverage)
@@ -565,7 +570,7 @@ def check_entry(cand: dict, meta: dict, live: dict, nav: Optional[float], availa
         return no("NAV unavailable (HL NAV + BX equity)")
     
     # GIIQ-SoT-5: size/leverage from desk decision (B19): 2-4% NAV, 2-5x, <= contract max leverage
-    size_pct, leverage = desk_sizing(approval, meta.get("max_leverage"))
+    size_pct, leverage = desk_sizing(approval, meta.get("max_leverage"), tier=(cand.get("tier") or ""))
     if leverage < LEV_MIN:
         return no(f"leverage {leverage}x < {LEV_MIN}x minimum after coin max leverage")
     
