@@ -355,3 +355,9 @@ no top-up / ROE rule was added.
 
 Reference: `docs/reference/signum_workflow_reference.md`. It is reference only: Signum is never
 used for orders.
+
+## BX liquidity tiers (2026-10-07, MMT) — SoT id unchanged (BX universe rule, not an executor rule)
+- `bx_universe.VOL_TRADEABLE` $2M -> **$200K** (tradeable = 24h vol >= $200K and spread <= 10 bp); `VOL_WATCH_MIN` $300K -> $200K.
+- Spread limit unchanged at 10 bp. Spread depth is now measured for every contract with vol >= $200K.
+- `bx_live`: candidates and orders on coins under $1M 24h volume carry the flag `low_vol_under_1M` (never blocks).
+- Open question: `LIQ_EXIT_VOL` ($1M) still triggers `liquidity_exit` for open BX trades below $1M.

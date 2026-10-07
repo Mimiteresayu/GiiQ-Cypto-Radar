@@ -147,7 +147,7 @@ subprocess with a hard timeout (`BX_TIMEOUT_S`, default 480 s) and without `HL_A
 
 | Job | HKT | What |
 |-----|-----|------|
-| `bx_daily` | 08:20 | Bitunix catalog + tickers, HL mids (BX↔HL match), CoinGecko markets, 1D + 4H candles, depth for vol ≥ $2M, shadow book |
+| `bx_daily` | 08:20 | Bitunix catalog + tickers, HL mids (BX↔HL match), CoinGecko markets, 1D + 4H candles, depth for vol ≥ $200K, shadow book |
 | `bx_4h` | 00/04/12/16/20 :25 | 4H candles, Chase pending (N/N+1), 4H exits, 4H new-token signals |
 | `bx_1h` | hourly :27 | 1H candles for 1H-GC new tokens and open shadow positions only |
 
