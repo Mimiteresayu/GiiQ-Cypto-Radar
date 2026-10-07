@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
-"""Pending pullback worker, run in the Railway 4H :10 job (right after the 4H scan + exits).
-N / N+1 confirmation on the band TF (ADD_ON 4H, CONTINUATION 1D) — see pending_entries.py.
+"""Pending CONT / ADD_ON worker — 3-step trigger evaluation + immediate IOC entry (MMT 2026-10-07).
+
+Run in the Railway 4H :10 job (right after the 4H scan + exits).
 DISABLED by default (Cove HEALTH FAIL 2026-10-05): the pass only cancels active pendings (LIVE) and
 never evaluates or fills, unless PENDING_CONTINUATION_DISABLED=0.
 
 For each ACTIVE pending entry (created by the executor from AI-approved Chase decisions):
-  expire (7d) / cancel (band TF closed below Lower, CONTINUATION already held, ADD_ON base gone)
-  / wait (bar N detection) / trigger when bar N+1 confirms (close > Lower and > bar N close);
-  the entry is then placed at the live HL mid.
+  3-step evaluation (see pending_entries.py):
+    1. 1D breakout: 1D dual cross up above 1D Upper
+    2. 4H retrace: 4H close down to 4H Filter or Lower
+    3. 4H breakout: 4H dual cross up above 4H Upper → TRIGGER
+  On trigger: IMMEDIATE IOC entry with Hard SL (no resting orders), using the same fail-closed
+  checks as the Base executor (hl_exec.enter_long_with_sl).
+
 On trigger the SAME fail-closed SoT checks as the executor run again at fill time:
   radar freshness, all open positions liq beyond tier Hard SL, Hard SL per tier (4H radar),
   SL distance >= 1.5% from live mid, GIIQ-SoT-2 margin 2-4% NAV + 3-5x (liq below Hard SL), min notional,
@@ -67,12 +72,11 @@ from exec_common import (  # noqa: E402
     parse_ts,
     round_price,
 )
-from pending_entries import ACTIVE, ADD_ON, band, evaluate, load_pending, save_pending, summary  # noqa: E402
+from pending_entries import ACTIVE, ADD_ON, CONT, band, evaluate, load_pending, save_pending, summary  # noqa: E402
 from pending_entries import DISABLE_ENV, DISABLED_REASON, cancel_active_pending, pending_disabled  # noqa: E402
 
-# SoT size bands (margin % of equity). CONTINUATION = SoT "Continuation" 2-4%.
-# ADD_ON has no explicit SoT band yet -> same conservative 2-4% (confirm with MMT).
-PENDING_SIZE_BANDS = {"CONTINUATION": (2.0, 4.0), "ADD_ON": (2.0, 4.0)}
+# SoT size bands (margin % of equity). CONT / ADD_ON both use 2-4%.
+PENDING_SIZE_BANDS = {"CONT": (2.0, 4.0), "CONTINUATION": (2.0, 4.0), "ADD_ON": (2.0, 4.0)}
 RADAR_MAX_AGE_H = {"4h": 5.0, "1d": 26.0}
 
 
@@ -91,26 +95,6 @@ def _load_json(name: str) -> dict:
 def _radar_age_h(radar: dict, now: datetime) -> Optional[float]:
     ts = parse_ts(radar.get("ts"))
     return (now - ts).total_seconds() / 3600.0 if ts else None
-
-
-def closed_bar(hl: Any, coin: str, tf: str, now: datetime) -> Optional[dict]:
-    """Latest CLOSED candle of tf (4h / 1d) from HL candleSnapshot -> {"t","l","c"} or None."""
-    bar_ms = {"4h": 4 * 3600 * 1000, "1d": 86400 * 1000}[tf]
-    now_ms = int(now.timestamp() * 1000)
-    try:
-        bars = hl.info({"type": "candleSnapshot",
-                        "req": {"coin": coin, "interval": tf, "startTime": now_ms - 3 * bar_ms, "endTime": now_ms}})
-    except Exception as e:  # noqa: BLE001
-        _log(f"{coin}: {tf} candle fetch failed: {e}")
-        return None
-    closed = [b for b in (bars or []) if int(b.get("t", 0)) + bar_ms <= now_ms]
-    if not closed:
-        return None
-    b = closed[-1]
-    try:
-        return {"t": int(b["t"]), "l": float(b["l"]), "c": float(b["c"])}
-    except (KeyError, TypeError, ValueError):
-        return None
 
 
 def run_pending(hl: Any = None, radar_1d: Optional[dict] = None, radar_4h: Optional[dict] = None,
@@ -155,7 +139,7 @@ def _run_pending(hl: Any = None, radar_1d: Optional[dict] = None, radar_4h: Opti
             except Exception as e:  # noqa: BLE001
                 res.update(status="error", message=f"pending store write failed: {e}")
                 return res
-        res["message"] = (f"CONTINUATION/ADD_ON pending DISABLED ({DISABLED_REASON}; re-enable: {DISABLE_ENV}=0)"
+        res["message"] = (f"CONT/ADD_ON pending DISABLED ({DISABLED_REASON}; re-enable: {DISABLE_ENV}=0)"
                           + (f"; cancelled {len(gone)}" if gone else ""))
         _log(f"{mode} {res['message']}" + (f": {[e.get('id') for e in gone]}" if gone else ""))
         res["pending_active"] = summary(entries, {}, {}, {})
@@ -171,7 +155,7 @@ def _run_pending(hl: Any = None, radar_1d: Optional[dict] = None, radar_4h: Opti
     rows_4h = {r.get("symbol"): r for r in radar_4h.get("rows", []) or []}
     for tf, rd in (("1d", radar_1d), ("4h", radar_4h)):
         ok_rc, why_rc = radar_rowcount_ok(rd, tf)
-        if not ok_rc:  # fail-closed: no bar consumption, no cancels, no fills this pass
+        if not ok_rc:  # fail-closed: no state change, no fills this pass
             res.update(status="fail_closed", message=f"Radar row-count check failed: {why_rc}")
             res["alerts"].append(why_rc)
             _log(f"{mode} fail_closed: {why_rc}")
@@ -220,18 +204,21 @@ def _run_pending(hl: Any = None, radar_1d: Optional[dict] = None, radar_4h: Opti
     for rec in act:
         sym, kind = rec["symbol"], rec["kind"]
         bnd = band(kind, rows_1d.get(sym), rows_4h.get(sym))
-        bar = (bar_fn or closed_bar)(hl, sym, bnd["tf"], now)
+        # New 3-step rule: no bar fetching needed, evaluate() uses radar rows directly
         try:  # fresh live mid right before deciding
             mid = (hl.all_mids() or mids).get(sym)
         except Exception:  # noqa: BLE001
             mid = None
-        action, why, upd = evaluate(rec, bnd, mid, now, held_long, bar)
+        action, why, upd = evaluate(rec, bnd, mid, now, held_long)
         if live and upd:
             rec.update(upd)
             dirty = True
+        d1d, d4h = bnd.get("1d", {}), bnd.get("4h", {})
         check = {"id": rec["id"], "symbol": sym, "kind": kind, "action": action, "reason": why,
-                 "zone": [bnd["lower"], bnd["filter"]], "band_tf": bnd["tf"], "mid": mid, "bar": bar,
-                 "setup": upd.get("setup", rec.get("setup"))}
+                 "1d_upper": d1d.get("upper"), "1d_lower": d1d.get("lower"), "1d_close": d1d.get("close"),
+                 "4h_upper": d4h.get("upper"), "4h_filter": d4h.get("filter"), "4h_lower": d4h.get("lower"),
+                 "4h_close": d4h.get("close"), "mid": mid,
+                 "breakout_1d": rec.get("breakout_1d"), "retrace_touched": rec.get("retrace_touched")}
         res["checked"].append(check)
 
         def mark(status: str, reason: str) -> None:
@@ -249,8 +236,7 @@ def _run_pending(hl: Any = None, radar_1d: Optional[dict] = None, radar_4h: Opti
             check["result"] = "waiting"
             check["reason"] = reason
             if live:
-                rec["last_check"] = {"at": now.isoformat(), "reason": reason, "mid": mid,
-                                     "zone": [bnd["lower"], bnd["filter"]]}
+                rec["last_check"] = {"at": now.isoformat(), "reason": reason, "mid": mid}
                 dirty = True
 
         if action in ("expire", "cancel"):
@@ -262,13 +248,14 @@ def _run_pending(hl: Any = None, radar_1d: Optional[dict] = None, radar_4h: Opti
             continue
 
         # ---------------- trigger: same fail-closed SoT checks as the executor, at fill time
-        age = _radar_age_h(radar_4h, now)
-        age_b = _radar_age_h(radar_1d if bnd["tf"] == "1d" else radar_4h, now)
-        if age is None or age > RADAR_MAX_AGE_H["4h"] or age_b is None or age_b > RADAR_MAX_AGE_H[bnd["tf"]]:
-            note(f"in zone but radar stale (4h age={age}, {bnd['tf']} age={age_b}) - fail-closed")
+        # New 3-step rule always uses both 1D and 4H radar
+        age_1d = _radar_age_h(radar_1d, now)
+        age_4h = _radar_age_h(radar_4h, now)
+        if age_1d is None or age_1d > RADAR_MAX_AGE_H["1d"] or age_4h is None or age_4h > RADAR_MAX_AGE_H["4h"]:
+            note(f"triggered but radar stale (1d age={age_1d}, 4h age={age_4h}) - fail-closed")
             continue
         if not liq_safe:
-            note(f"in zone but unsafe liq on open positions {unsafe} - fail-closed")
+            note(f"triggered but unsafe liq on open positions {unsafe} - fail-closed")
             continue
         cm = meta.get(sym)
         if not cm:
@@ -289,23 +276,23 @@ def _run_pending(hl: Any = None, radar_1d: Optional[dict] = None, radar_4h: Opti
                 continue
             ok_add, why_add, room = addon_gates(pos_by_coin.get(sym), equity, mid, fixed_lev)
             if not ok_add:
-                note(f"in zone but {why_add}")
+                note(f"triggered but {why_add}")
                 continue
             lev_note = f" (ADD_ON keeps existing isolated {fixed_lev}x; {why_add})"
         ok_px, _diff, why_px = price_sane(mid, radar_ref_price(rows_4h.get(sym), rows_1d.get(sym)))
         if not ok_px:
-            note(f"in zone but {why_px}")
+            note(f"triggered but {why_px}")
             continue
         sl_dist = (mid - hard_sl) / mid * 100.0
         if sl_dist < MIN_SL_DIST_PCT:
-            note(f"in zone but SL distance {sl_dist:.2f}% to {sl_label} {hard_sl:.6g} < {MIN_SL_DIST_PCT}%")
+            note(f"triggered but SL distance {sl_dist:.2f}% to {sl_label} {hard_sl:.6g} < {MIN_SL_DIST_PCT}%")
             continue
         limit_px = round_price(mid * (1 + slip / 100.0), sz_dec)
         ref_px = max(limit_px, (pos_by_coin.get(sym) or {}).get("entry_px") or 0)  # add-on: worst of both
         sz = size_by_margin(equity, limit_px, hard_sl, coin_max, rec.get("size_pct"), rec.get("leverage"),
                             fixed_leverage=fixed_lev, max_margin_pct=room, liq_ref_px=ref_px, tier=tier)
         if not sz["ok"]:
-            note(f"in zone but {sz['reason']}")
+            note(f"triggered but {sz['reason']}")
             continue
         size_pct, leverage = sz["margin_pct"], sz["leverage"]
         qty = order_qty(equity * size_pct / 100.0 * leverage, limit_px, sz_dec)
@@ -333,7 +320,7 @@ def _run_pending(hl: Any = None, radar_1d: Optional[dict] = None, radar_4h: Opti
                   "size_pct": size_pct, "leverage": leverage, "notional_usd": round(notional, 2),
                   "margin_usd": round(margin_usd, 2), "hard_sl": hard_sl, "hard_sl_label": sl_label,
                   "sl_dist_pct": round(sl_dist, 3), "estimated_liq": est_liq, "margin_util_after_pct": round(util, 2),
-                  "zone": [bnd["lower"], bnd["filter"]], "note": lev_note.strip(),
+                  "note": lev_note.strip(),
                   "risk_margin_pct": round(margin_usd / equity * 100.0, 3), "sizing_notes": sz.get("notes"),
                   "approved_size_pct": rec.get("size_pct"), "approved_leverage": rec.get("leverage")}
         trade_id = f"{sym}_{kind}_{now.strftime('%Y%m%d_%H%M%S')}"
@@ -362,7 +349,7 @@ def _run_pending(hl: Any = None, radar_1d: Optional[dict] = None, radar_4h: Opti
                          entry_size=r.get("filled_sz") or qty, entry_leverage=leverage,
                          ai_decision_reason=rec.get("reason", ""), dry_run=False)
         elif st == "no_fill":
-            note("in zone but IOC did not fill; stays pending")
+            note("triggered but IOC did not fill; stays pending for re-arm")
         else:
             note(f"live entry {st}; stays pending")
             res["alerts"].append(f"{sym} {kind}: {st}")
