@@ -25,7 +25,7 @@ class TestEntryCandidatesLogic(unittest.TestCase):
     """Test entry candidate detection rules."""
 
     def test_base_entry_1d_dual_cross_up(self):
-        """Base entry: fresh 1D dual_cross_up (MMT 2026-10-07: no trend-colour condition)."""
+        """Base entry: 1D dual_cross_up AND 1D Green (SoT requirement, PR #6 fix)."""
         radar_1d = {
             "ts": datetime.now(timezone.utc).isoformat(),
             "rows": [
@@ -71,18 +71,18 @@ class TestEntryCandidatesLogic(unittest.TestCase):
         self.assertEqual(result["candidates"][0]["symbol"], "ATOM")
         self.assertEqual(result["candidates"][0]["type"], "Base")
 
-    def test_base_entry_needs_only_the_fresh_cross(self):
-        """MMT 2026-10-07: Base = fresh 1D dual_cross_up only. A Red-trend cross is still a Base; no green flip needed."""
+    def test_base_entry_requires_1d_green(self):
+        """Base entry requires 1D Green trend, not just dual_cross_up (Issue #3 fix, PR #6)."""
         radar_1d = {
             "ts": datetime.now(timezone.utc).isoformat(),
             "rows": [
                 {
                     "symbol": "2Z",
-                    "trend": "Red",  # Red trend: still a Base (no trend-colour condition)
+                    "trend": "Red",  # Red trend, should NOT be Base candidate
                     "close": 10.5,
                     "upper": 10.0,
                     "filter": 9.5,
-                    "dual_cross_up": True,  # fresh cross up
+                    "dual_cross_up": True,  # Crossed up but trend still Red
                     "day_ntl_vlm": 100000,
                 },
             ],
@@ -100,11 +100,8 @@ class TestEntryCandidatesLogic(unittest.TestCase):
         }
         
         result = build_candidates(radar_1d, radar_4h)
-        self.assertEqual(result["count"], 1)
-        self.assertEqual(result["candidates"][0]["type"], "Base")
-        # and no cross -> no Base, whatever the trend colour
-        radar_1d["rows"][0]["dual_cross_up"] = False
-        self.assertEqual(build_candidates(radar_1d, radar_4h)["count"], 0)
+        # Should have 0 candidates because Base requires 1D Green
+        self.assertEqual(result["count"], 0)
 
     def test_chase_entry_1d_green_4h_green_4h_dual_cross(self):
         """Chase entry: 1D Green + 4H Green + 4H dual_cross_up."""

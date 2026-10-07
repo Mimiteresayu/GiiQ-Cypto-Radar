@@ -369,9 +369,3 @@ used for orders.
 - Naming: the signal formerly called **"Chase"** is a **4H Breakout** signal (1D Green + 4H Green + 4H close crossing up through the 4H Upper).
   It is a signal, not an order. An approved 4H Breakout becomes a **CONT** (coin not held) or **ADD_ON** (coin held) pending.
   Internal data values (`type: "Chase"` in the candidates / decisions API) are unchanged so the desk and Railway keep working.
-
-## Base signal = fresh daily cross only (2026-10-07, MMT)
-- Base = the closed 1D bar's close is above the 1D Upper **and** the previous bar's close was at or below the previous Upper.
-  The earlier "1D Green" condition (PR #6) is removed for HL (`entry_candidates`, `dims_job`) and BX (`bx_shadow.classify_signal`, 1D Base only).
-  Neither the Green state nor a red->green flip is required. 4H/1H NewToken and Chase (1D Green + 4H Green + 4H cross) are unchanged.
-- At-entry guards (live price above the 1D Upper, Hard SL, SL distance >= 1.5%, caps) are unchanged.

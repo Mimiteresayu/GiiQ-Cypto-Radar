@@ -250,7 +250,7 @@ def backfill(days: int = 150) -> dict:
             S4 = s4.get(sym)
             j = S4["idx"].get(t4) if S4 else None
             d4 = state(S4, j) if (S4 and j is not None and j >= warm4) else None
-            base = bool(d1["dcu"])
+            base = d1["dcu"] and d1["trend"] == "Green"
             chase = bool(d4) and d1["trend"] == "Green" and d4["trend"] == "Green" and d4["dcu"]
             if not base and not chase:
                 continue
