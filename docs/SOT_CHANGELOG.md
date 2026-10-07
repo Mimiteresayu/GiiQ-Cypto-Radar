@@ -369,3 +369,13 @@ used for orders.
 - Naming: the signal formerly called **"Chase"** is a **4H Breakout** signal (1D Green + 4H Green + 4H close crossing up through the 4H Upper).
   It is a signal, not an order. An approved 4H Breakout becomes a **CONT** (coin not held) or **ADD_ON** (coin held) pending.
   Internal data values (`type: "Chase"` in the candidates / decisions API) are unchanged so the desk and Railway keep working.
+
+## CONT dropped, ADD_ON = Signum top-up (2026-10-07, MMT) — OFF by default
+- No CONT: a coin you do not hold enters only through the Base (fresh daily cross + Green). The 4H "Chase" CONT / ADD_ON pullback
+  pendings stay disabled (`PENDING_CONTINUATION_DISABLED`, default on) and are not used.
+- New `daily_addon.py` (08:57 HKT, after the 08:55 executor; `DAILY_ADDON_ENABLED=1` to switch on, DRY_RUN unless live): for each coin held LONG,
+  add 2% NAV margin at the position's existing isolated leverage when the latest CLOSED 1D bar's close is still above the 1D Upper,
+  the position's PRICE gain is >= +10% and the coin's notional after the add stays <= 20% NAV. Once per coin per HKT day.
+  Same fail-closed checks as every entry (radar row-count + freshness, liq beyond Hard SL, Hard SL per tier, SL distance, price sanity,
+  min order, 80% total margin). Mechanical (no desk decision), like Signum.
+- Manual dry-run: cockpit job `addon`. Tests: `test_daily_addon.py`.
