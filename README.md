@@ -383,6 +383,12 @@ now also rebuilds candidates.
   header or `?key=`; otherwise 401 (persisted to `out/scheduler_status.json`, survives restarts;
   executor `fail_closed` is reported as `fail_closed`, not `error`; exit-worker failures are `error`)
 - Included in `GET /api/desk-data` under `scheduler` key
+- `GET /api/exec/run-report?date=YYYY-MM-DD` (AI key, read-only): that HKT day's executor / pending run report
+  (executed with fill px + mid at signal + pending zone, skipped / failed with reasons). Used by `ops_cron/`.
+
+**Ops checks (no LLM):** `ops_cron/` is one Railway cron service per schedule (exit monitor every 4h, daily
+audit, desk-missing, Harbor P&L, Cove BO report, River scoreboard / veto / journal). Read-only. See
+[ops_cron/README.md](ops_cron/README.md).
 - Shows last run time, status, message/error for each job
 
 **Lock guards:** All jobs use lock files / timestamps to prevent double runs if a job is still executing when the next trigger fires.

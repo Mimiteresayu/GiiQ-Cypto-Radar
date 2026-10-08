@@ -17,3 +17,5 @@ out/pending_skips.json
 # Bitunix shadow runtime files (Railway volume only)
 out/bx_*
 out/cg_*
+# Harbor daily P&L markdown written at runtime (also stored in raw.harbor_pnl_daily)
+harbor/out/

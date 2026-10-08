@@ -121,6 +121,12 @@ Dry-run smoke test (no keys) should not crash.
 or add `HL_API_WALLET_KEY` without explicit operator approval. Strategy parameters are locked
 and must not be changed. Never add entry logic to this worker.
 
+## Ops checks (separate cron services)
+
+Read-only ops checks run as separate Railway **cron** services from `ops_cron/` (no LLM). One service per
+schedule: exit monitor every 4h, 09:22 HKT daily audit, 08:30 HKT desk-missing, Harbor P&L, Cove BO report,
+and River's three jobs. Schedules (HKT and UTC), env vars and deploy steps: [ops_cron/README.md](ops_cron/README.md).
+
 ## Narrative
 
 **Narrative stays on Grok.ai / Harbor** — this cron does **not** refresh narrative

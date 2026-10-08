@@ -1,0 +1,52 @@
+{
+  "now": "2026-10-04T04:12:00+00:00",
+  "inputs": {
+    "exit_health": {"ok": true, "http": 200, "error": "", "data": {
+      "ok": true, "n_positions": 1, "problems": [],
+      "info": [{"code": "BX_OPEN", "coin": null, "msg": "1 live BX position(s): FOOUSDT"}],
+      "checked_at": "2026-10-04T04:10:00+00:00", "summary": "OK · 1 倉 · 12:10 HKT 04-Oct"}},
+    "scheduler": {"ok": true, "http": 200, "error": "", "data": {
+      "enabled": true,
+      "jobs": {
+        "1h_scan_exits": {"last_run": "2026-10-04T04:09:30+00:00", "status": "success", "message": "1h ok; exits LIVE ok", "error": ""},
+        "4h_scan_exits": {"last_run": "2026-10-04T04:11:00+00:00", "status": "success", "message": "4h ok", "error": ""},
+        "pending_entries": {"last_run": "2026-10-04T04:11:20+00:00", "status": "success", "message": "active=0", "error": ""},
+        "1d_scan_candidates": {"last_run": "2026-10-04T00:09:00+00:00", "status": "success", "message": "candidates=7", "error": ""},
+        "executor": {"last_run": "2026-10-04T00:55:40+00:00", "status": "success", "message": "LIVE success: executed=1", "error": ""},
+        "live_radar": {"last_run": "2026-10-04T04:03:40+00:00", "status": "success", "message": "", "error": ""}
+      },
+      "next_runs_hkt": {}, "ts": "2026-10-04T04:12:00+00:00"}},
+    "hl_state": {"ok": true, "http": 200, "error": "", "data": {
+      "assetPositions": [{"type": "oneWay", "position": {"coin": "SOL", "szi": "2.5", "entryPx": "150.2",
+        "leverage": {"type": "isolated", "value": 3}, "unrealizedPnl": "4.1", "marginUsed": "125.0"}}],
+      "marginSummary": {"accountValue": "0.0", "totalMarginUsed": "125.0"}}},
+    "all_mids": {"ok": true, "http": 200, "error": "", "data": {"SOL": "155.0"}},
+    "hl_orders": {"ok": true, "http": 200, "error": "", "data": [
+      {"coin": "SOL", "side": "A", "limitPx": "133.0", "sz": "2.5", "oid": 111, "timestamp": 1791075321000,
+       "isTrigger": true, "triggerPx": "140.0", "triggerCondition": "Price below 140.0", "reduceOnly": true,
+       "isPositionTpsl": false, "orderType": "Stop Market"}]},
+    "hl_fills": {"ok": true, "http": 200, "error": "", "data": [
+      {"coin": "SOL", "px": "150.2", "sz": "2.5", "side": "B", "time": 1791075320000, "startPosition": "0.0",
+       "dir": "Open Long", "closedPnl": "0.0", "hash": "0xa1", "oid": 222, "crossed": true, "fee": "0.11", "tid": 1, "feeToken": "USDC"},
+      {"coin": "TIA", "px": "5.10", "sz": "40", "side": "A", "time": 1791083700000, "startPosition": "40",
+       "dir": "Close Long", "closedPnl": "6.0", "hash": "0xa2", "oid": 223, "crossed": true, "fee": "0.09", "tid": 2, "feeToken": "USDC"}]},
+    "bx_status": {"ok": true, "http": 200, "error": "", "data": {
+      "ok": true, "region": "asia-southeast1-eqsg3a",
+      "egress": {"ok": true, "ip": "203.0.113.7", "countries": {"ipinfo": "SG", "ipapi": "SG"}, "region": "asia-southeast1-eqsg3a", "reason": ""},
+      "live_ready": true, "live_blockers": [], "account_check": {"ok": true, "available_usdt": 400.0},
+      "jobs": {
+        "1h": {"at": "2026-10-04T04:09:00+00:00", "status": "success", "error_steps": null, "message": null},
+        "4h": {"at": "2026-10-04T04:05:00+00:00", "status": "success", "error_steps": null, "message": null},
+        "daily": {"at": "2026-10-04T00:02:00+00:00", "status": "success", "error_steps": null, "message": null},
+        "entries": {"at": "2026-10-04T00:56:00+00:00", "status": "success", "error_steps": null, "message": null}},
+      "problems": [],
+      "bx_enabled": true, "bx_live": true, "keys_present": true, "breaker": {"tripped": false},
+      "baseline_nav": 5000.0, "realized_pnl_usd": -12.5,
+      "open": [{"bx_symbol": "FOOUSDT", "kind": "Base", "entry_time": "2026-10-03T00:56:10+00:00", "entry_px": 2.0,
+                "hard_sl": 1.86, "qty": 75, "position_id": "p1"}],
+      "closed_recent": [{"bx_symbol": "BARUSDT", "exit_time": "2026-10-04T03:20:00+00:00",
+                         "exit_reason": "exit_4h_close_below_filter", "pnl_usd": -3.2}],
+      "pending": [],
+      "rules": {"margin_pct_nav": 1.0, "leverage": 3, "max_open": 2, "max_new_per_day": 1, "breaker_pct_nav": 3.0}}}
+  }
+}

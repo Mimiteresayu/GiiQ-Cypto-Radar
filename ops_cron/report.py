@@ -1,0 +1,79 @@
+"""Shared report shell. No I/O except one NAV warning on stderr."""
+from __future__ import annotations
+
+import sys
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+
+from . import rules
+
+_nav_warning_sent = False
+
+
+def shell(check: str, now: datetime, status: str, summary: str, problems: List[dict], notify: Optional[str],
+          markdown: str, **extra: Any) -> Dict[str, Any]:
+    hk = now.astimezone(rules.HKT)
+    rep: Dict[str, Any] = {
+        "check": check,
+        "run_at": now.isoformat(),
+        "run_at_hkt": hk.strftime("%Y-%m-%d %H:%M"),
+        "status": status,
+        "summary": summary[:500],
+        "problems": problems,
+        "info": extra.pop("info", []),
+        "notify": notify,
+        "markdown": markdown,
+    }
+    rep.update(extra)
+    return rep
+
+
+def problem(code: str, msg: str, coin: Optional[str] = None, source: str = "ops_cron") -> dict:
+    return {"code": code, "coin": coin, "msg": msg[:300], "source": source}
+
+
+def add_problem(problems: List[dict], code: str, msg: str, coin: Optional[str] = None,
+                source: str = "ops_cron") -> None:
+    """One row per (code, coin), the same dedupe as rules._Report.problem."""
+    if any(p.get("code") == code and p.get("coin") == coin for p in problems):
+        return
+    problems.append(problem(code, msg, coin, source))
+
+
+def known_usd(v, readable: bool) -> str:
+    """A failed or missing balance is 未知. Never a zero standing in for a missed read."""
+    if not readable or v is None:
+        return "未知"
+    return usd(v)
+
+
+def warn_nav_unverified(msg: str) -> None:
+    """One stderr line per process when NAV cannot be verified. Not an alert."""
+    global _nav_warning_sent
+    if _nav_warning_sent:
+        return
+    _nav_warning_sent = True
+    sys.stderr.write(str(msg).rstrip() + "\n")
+
+
+def reset_nav_warning() -> None:
+    global _nav_warning_sent
+    _nav_warning_sent = False
+
+
+def usd(v) -> str:
+    if v is None:
+        return "未知"
+    try:
+        return f"{float(v):,.2f}"
+    except (TypeError, ValueError):
+        return "未知"
+
+
+def pct(v) -> str:
+    if v is None:
+        return "未知"
+    try:
+        return f"{float(v):.2f}%"
+    except (TypeError, ValueError):
+        return "未知"
