@@ -206,11 +206,12 @@ def exit_check(trade: dict, now: datetime, rows: Dict[str, Optional[dict]], meta
         if r and _f(r.get("close")) is not None and _f(r.get("lower")) is not None and r["close"] < r["lower"] \
                 and int(r["bar_time"]) >= _iso_ms(trade.get("entry_time")):
             return "tier_exit_1h_lower", r["close"]
-    if rule == "4h_close_below_filter":
+    if rule in ("4h_close_below_filter", "cont_staircase_4h_filter"):
         r = rows.get("4h")
         if r and _f(r.get("close")) is not None and _f(r.get("filter")) is not None and r["close"] < r["filter"] \
                 and int(r["bar_time"]) >= _iso_ms(trade.get("entry_time")):
-            return "tier_exit_4h_filter", r["close"]
+            reason = "CONT_STAIRCASE_4h_filter" if rule == "cont_staircase_4h_filter" else "tier_exit_4h_filter"
+            return reason, r["close"]
     if trade.get("kind") == "NewToken":
         ts = _iso_ms(trade.get("time_stop_at"))
         last = _f((meta or {}).get("price")) or _f((rows.get("1h") or rows.get("4h") or {}).get("close"))

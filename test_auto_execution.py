@@ -257,7 +257,7 @@ class TestExitWorker(unittest.TestCase):
             ]
         }
 
-        should_exit, reason = _check_exit_signal("BTC", "mega", radar_1h, radar_4h)
+        should_exit, reason = _check_exit_signal("BTC", "mega", None, radar_1h, radar_4h)
         self.assertTrue(should_exit)
         self.assertIn("4H close < 4H Filter", reason)
 
@@ -276,7 +276,7 @@ class TestExitWorker(unittest.TestCase):
         }
         radar_4h = {"rows": []}
 
-        should_exit, reason = _check_exit_signal("BRETT", "small", radar_1h, radar_4h)
+        should_exit, reason = _check_exit_signal("BRETT", "small", None, radar_1h, radar_4h)
         self.assertTrue(should_exit)
         self.assertIn("1H close < 1H Lower", reason)
 
@@ -303,9 +303,45 @@ class TestExitWorker(unittest.TestCase):
             ]
         }
 
-        should_exit, reason = _check_exit_signal("ETH", "large", radar_1h, radar_4h)
+        should_exit, reason = _check_exit_signal("ETH", "large", None, radar_1h, radar_4h)
         self.assertFalse(should_exit)
         self.assertIsNone(reason)
+
+    def test_cont_staircase_exit_all_tiers(self):
+        """Test CONT_STAIRCASE positions use 4H close < Filter exit for all tiers."""
+        from exit_worker import _check_exit_signal
+
+        radar_1h = {"rows": [{"symbol": "LINK", "close": 8.5, "lower": 7.0}]}
+        radar_4h = {"rows": [{"symbol": "LINK", "close": 8.1, "filter": 8.2}]}
+
+        # CONT_STAIRCASE tiny tier should use 4H exit, not 1H
+        should_exit, reason = _check_exit_signal("LINK", "tiny", "CONT_STAIRCASE", radar_1h, radar_4h)
+        self.assertTrue(should_exit)
+        self.assertIn("CONT_STAIRCASE", reason)
+        self.assertIn("4H close < 4H Filter", reason)
+
+        # Base tiny tier should still use 1H exit
+        should_exit, reason = _check_exit_signal("LINK", "tiny", "BASE", radar_1h, radar_4h)
+        self.assertFalse(should_exit)  # 1H close not < lower
+
+    def test_base_and_addon_exits_unchanged(self):
+        """Test Base and ADD_ON exits are unchanged by CONT_STAIRCASE."""
+        from exit_worker import _check_exit_signal
+
+        # Base Mega: 4H close < Filter
+        radar_1h = {"rows": []}
+        radar_4h = {"rows": [{"symbol": "BTC", "close": 95000, "filter": 96000}]}
+        should_exit, reason = _check_exit_signal("BTC", "mega", "BASE", radar_1h, radar_4h)
+        self.assertTrue(should_exit)
+        self.assertIn("4H close < 4H Filter", reason)
+        self.assertNotIn("CONT_STAIRCASE", reason)
+
+        # ADD_ON Small: 1H close < Lower
+        radar_1h = {"rows": [{"symbol": "BRETT", "close": 0.8, "lower": 0.9}]}
+        radar_4h = {"rows": []}
+        should_exit, reason = _check_exit_signal("BRETT", "small", "ADD_ON", radar_1h, radar_4h)
+        self.assertTrue(should_exit)
+        self.assertIn("1H close < 1H Lower", reason)
 
 
 class TestSizeAndLeverageBands(unittest.TestCase):
