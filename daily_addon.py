@@ -6,7 +6,7 @@ For a coin you ALREADY HOLD LONG, once a day (08:57 HKT, after the 08:55 executo
   1. the latest CLOSED 1D bar's close is still above the 1D Upper (Signum: "close still above the upper band"),
   2. the position's ROE (unrealized PnL / margin) is >= +20%,
   3. the coin's total margin (base + add) stays <= 5.5% NAV,
-  4. it has not already been topped up today (idempotent: /api/jobs re-runs never double add).
+  4. the position has NOT been topped up before (ONCE PER POSITION, not once per day - tracked by symbol + entry).
 The add uses the position's existing isolated leverage and 2% NAV margin (the SoT floor; no desk decision is needed,
 the rule is mechanical like Signum). The same fail-closed checks as every entry apply: radar row-count + freshness,
 liquidation beyond the Hard SL for ALL open positions, Hard SL per tier, SL distance >= 1.5%, price sanity, minimum
@@ -61,24 +61,49 @@ def _state_path() -> Path:
     return Path(os.environ.get("DAILY_ADDON_STATE") or (ROOT / "out" / "daily_addon_state.json"))
 
 
-def _done_today(day: str) -> List[str]:
+def _is_position_done(sym: str) -> bool:
+    """Check if this symbol's current position has already been topped up.
+    A position is defined as holding a LONG in a symbol; it persists until fully closed."""
     try:
-        return list(json.loads(_state_path().read_text(encoding="utf-8")).get(day) or [])
+        doc = json.loads(_state_path().read_text(encoding="utf-8"))
+        return sym in doc.get("positions", {})
     except Exception:  # noqa: BLE001
-        return []
+        return False
 
 
-def _mark_done(day: str, sym: str) -> None:
+def _mark_position_done(sym: str) -> None:
+    """Mark this symbol's position as topped up. State persists until position closes."""
     p = _state_path()
     try:
         doc = json.loads(p.read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001
         doc = {}
-    doc = {day: sorted(set(doc.get(day, [])) | {sym})}      # keep only today
+    
+    positions = doc.get("positions", {})
+    positions[sym] = {"topped_up_at": datetime.now(timezone.utc).isoformat()}
+    doc["positions"] = positions
+    
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_suffix(".tmp")
     tmp.write_text(json.dumps(doc), encoding="utf-8")
     os.replace(tmp, p)
+
+
+def cleanup_closed_positions(open_symbols: set) -> None:
+    """Remove state for positions that are no longer open (cleanup on each run)."""
+    p = _state_path()
+    try:
+        doc = json.loads(p.read_text(encoding="utf-8"))
+        positions = doc.get("positions", {})
+        # Keep only positions for symbols still open
+        cleaned = {sym: v for sym, v in positions.items() if sym in open_symbols}
+        if len(cleaned) < len(positions):
+            doc["positions"] = cleaned
+            tmp = p.with_suffix(".tmp")
+            tmp.write_text(json.dumps(doc), encoding="utf-8")
+            os.replace(tmp, p)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _age_h(radar: dict, now: datetime) -> Optional[float]:
@@ -161,12 +186,16 @@ def run_daily_addons(hl: Any = None, radar_1d: Optional[dict] = None, radar_4h: 
         slip = max(0.0, min(2.0, float(os.environ.get("EXEC_ENTRY_SLIPPAGE_PCT") or 0.5)))
     except ValueError:
         slip = 0.5
-    done = set(_done_today(day))
+    
+    # Cleanup state for closed positions
+    open_symbols = {p["coin"] for p in account["positions"] if p.get("side") == "LONG"}
+    cleanup_closed_positions(open_symbols)
 
     for pos in account["positions"]:
         if pos.get("side") != "LONG":
             continue
         sym = pos["coin"]
+        
         chk = {"symbol": sym}
         res["checked"].append(chk)
 
@@ -175,8 +204,9 @@ def run_daily_addons(hl: Any = None, radar_1d: Optional[dict] = None, radar_4h: 
             chk["reason"] = why
             res["skipped"].append({"symbol": sym, "reason": why, **kw})
 
-        if sym in done:
-            skip("already topped up today")
+        # Check if this position has already been topped up (once per position lifetime)
+        if _is_position_done(sym):
+            skip("position already topped up")
             continue
         ok_sig, why_sig = topup_signal(rows_1d.get(sym))
         chk["signal"] = why_sig
@@ -186,8 +216,8 @@ def run_daily_addons(hl: Any = None, radar_1d: Optional[dict] = None, radar_4h: 
         
         # Check ROE >= +20% (unrealized PnL / margin)
         try:
-            upnl = float(pos.get("unrealizedPnl") or 0)
-            margin = float(pos.get("marginUsed") or 0)
+            upnl = float(pos.get("unrealized_pnl") or pos.get("unrealizedPnl") or 0)
+            margin = float(pos.get("margin_used") or pos.get("marginUsed") or 0)
             roe_pct = (upnl / margin * 100.0) if margin > 0 else 0
         except (TypeError, ValueError, ZeroDivisionError):
             skip("ROE calculation failed")
@@ -283,8 +313,7 @@ def run_daily_addons(hl: Any = None, radar_1d: Optional[dict] = None, radar_4h: 
         st = r.get("status")
         if st == "executed":
             cum_margin += (r.get("filled_sz") or qty) * (r.get("avg_px") or limit_px) / leverage
-            _mark_done(day, sym)
-            done.add(sym)
+            _mark_position_done(sym)
             chk["result"] = "filled"
             res["filled"].append(intent)
             log_entry_fn(trade_id=f"{sym}_ADD_ON_{now.strftime('%Y%m%d_%H%M%S')}", symbol=sym, entry_type="ADD_ON",

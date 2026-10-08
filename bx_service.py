@@ -228,6 +228,90 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _bx_manual_entry(self, body: dict) -> None:
+        """POST /api/bx/manual_entry: manual BX entry with custom size/leverage.
+        Body: {symbol, size_pct, leverage, sl_override?, dry_run (default true)}.
+        Same fail-closed checks as entries, logged MANUAL."""
+        # Check X-BX-Key in header only (reject query param)
+        if "key=" in self.path:
+            self._send(403, {"ok": False, "error": "authentication via ?key= query param not allowed"})
+            return
+        want = _key()
+        got = self.headers.get("X-BX-Key") or ""
+        if not want:
+            self._send(404, {"ok": False, "error": "BX_SERVICE_KEY not set"})
+            return
+        if not got or not hmac.compare_digest(got, want):
+            self._send(403, {"ok": False, "error": "forbidden"})
+            return
+        
+        symbol = str((body or {}).get("symbol") or "")
+        if not symbol:
+            self._send(400, {"ok": False, "error": "symbol required"})
+            return
+        
+        try:
+            size_pct = float(body.get("size_pct") or 0)
+            leverage = int(body.get("leverage") or 0)
+        except (TypeError, ValueError):
+            self._send(400, {"ok": False, "error": "size_pct and leverage must be numbers"})
+            return
+        
+        sl_override = body.get("sl_override")
+        if sl_override is not None:
+            try:
+                sl_override = float(sl_override)
+            except (TypeError, ValueError):
+                self._send(400, {"ok": False, "error": "sl_override must be a number"})
+                return
+        
+        dry_run = body.get("dry_run")
+        if dry_run is None:
+            dry_run = True
+        
+        # Create a manual "approval" with custom size/leverage
+        # Store it in decisions temporarily, then run entries with only=[symbol]
+        import bx_live
+        now = datetime.now(timezone.utc)
+        approval_rec = {
+            "symbol": symbol,
+            "decision": "LONG",
+            "source": "manual",
+            "size_pct": size_pct,
+            "leverage": leverage,
+            "reason": "manual entry via API",
+            "ts": now.isoformat()
+        }
+        if sl_override:
+            approval_rec["sl_override"] = sl_override
+        
+        # Store the manual approval
+        store_result = bx_live.store_decisions([approval_rec], "manual")
+        if not store_result.get("ok"):
+            self._send(422, store_result)
+            return
+        
+        # Run entry for this symbol only
+        # dry_run is controlled by env var EXEC_DRY_RUN or BX_DRY_RUN
+        old_dry = os.environ.get("BX_DRY_RUN", "")
+        try:
+            if dry_run:
+                os.environ["BX_DRY_RUN"] = "1"
+            else:
+                os.environ["BX_DRY_RUN"] = "0"
+            
+            entry_result = bx_live.run_entries(now=now, only=[symbol])
+            entry_result["manual"] = True
+            entry_result["dry_run"] = dry_run
+            
+            ok = bool(entry_result.get("entered") or entry_result.get("pending"))
+            self._send(200 if ok else 400, {"ok": ok, **entry_result})
+        finally:
+            if old_dry:
+                os.environ["BX_DRY_RUN"] = old_dry
+            else:
+                os.environ.pop("BX_DRY_RUN", None)
+    
     def _keyed(self) -> bool:
         want = _key()
         got = self.headers.get("X-BX-Key") or ""
@@ -293,6 +377,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200 if ok else 403, {"ok": ok, "message": msg})
             return
         if not self._keyed():
+            return
+        if u.path == "/api/bx/manual_entry":
+            self._bx_manual_entry(body)
             return
         if u.path == "/api/bx/decision":
             decs = body.get("decisions")
