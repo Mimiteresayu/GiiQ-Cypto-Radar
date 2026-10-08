@@ -1166,6 +1166,7 @@ def _build_desk_data_payload(event: str = "", now: datetime | None = None, kind:
         "hl_open_orders": orders,
         "sot": SOT_ID,
         "exec_mode": _exec_mode(),
+        "cont_staircase": _cont_staircase_flags(),
         "run_report": _today_run_report(now),
         "pending_entries": _pending_view(),
         "dimensions": _dims_compact(now),
@@ -1870,6 +1871,15 @@ def _today_run_report(now: datetime | None = None) -> dict:
             for item in r.get(k) or []:
                 out[k].append({**item, **{f"run_{a}": b for a, b in tag.items()}})
     return out
+
+
+def _cont_staircase_flags() -> dict:
+    """CONT_STAIRCASE switch as set on this service. No secrets."""
+    try:
+        from pending_entries import cont_staircase_enabled, cont_staircase_mode
+        return {"enabled": cont_staircase_enabled(), "mode": cont_staircase_mode()}
+    except Exception as e:
+        return {"enabled": False, "mode": "paper", "error": str(e)}
 
 
 def _pending_view() -> list:

@@ -202,6 +202,69 @@ class TestContStaircaseLiquidation(unittest.TestCase):
         self.assertTrue(liq_beyond_sl_long(liq, sl))  # liq < SL for long
 
 
+class TestRadarRowReachesEvaluate(unittest.TestCase):
+    """band() must forward the closed-radar staircase fields. The 20:10 HKT run waited
+    because those fields were dropped before evaluate()."""
+
+    def test_production_row_through_band_can_trigger(self):
+        from pending_entries import band, evaluate
+        row_4h = {
+            "trend": "Green", "close": 8.3062, "filter": 8.2,
+            "prev_close": 8.1, "prev_filter": 8.15,
+            "filter_rising_6": True, "bw_pct50": True,
+            "bar_time": BAR_T, "upper": 9.0, "lower": 7.5,
+        }
+        row_1d = {"trend": "Green", "close": 8.5, "lower": 7.0}
+        rec = {"id": "JUP_CONT_20261008", "symbol": "JUP", "kind": CONT_STAIRCASE,
+               "status": ACTIVE, "created_at": "2026-10-08T10:00:00Z"}
+        action, reason, _upd = evaluate(rec, band(CONT_STAIRCASE, row_1d, row_4h), 8.31, NOW, set())
+        self.assertEqual(action, "trigger", reason)
+
+    def test_row_missing_staircase_fields_waits(self):
+        from pending_entries import band, evaluate
+        row_4h = {"trend": "Green", "close": 8.3062, "filter": 8.2, "bar_time": BAR_T}
+        row_1d = {"trend": "Green", "close": 8.5, "lower": 7.0}
+        rec = {"id": "W_CONT_20261008", "symbol": "W", "kind": CONT_STAIRCASE,
+               "status": ACTIVE, "created_at": "2026-10-08T10:00:00Z"}
+        action, reason, _upd = evaluate(rec, band(CONT_STAIRCASE, row_1d, row_4h), 0.1, NOW, set())
+        self.assertEqual(action, "wait")
+        self.assertIn("missing 4H close/filter/prev values", reason)
+        self.assertIn("Filter not rising", reason)
+
+    def test_bar_that_closed_before_the_pending_does_not_fill(self):
+        rec = {"id": "JUP_CONT_20261008", "symbol": "JUP", "kind": CONT_STAIRCASE,
+               "created_at": "2026-10-08T16:30:00Z"}
+        bnd = {
+            "1d": {"trend": "Green", "close": 1.0, "lower": 0.5},
+            "4h": {"trend": "Green", "filter_rising_6": True, "bw_pct50": True,
+                   "close": 1.1, "filter": 1.0, "prev_close": 0.9, "prev_filter": 1.0,
+                   "bar_time": BAR_T},
+        }
+        action, reason, _upd = evaluate_cont_staircase(rec, bnd, 1.1, NOW, set())
+        self.assertEqual(action, "wait")
+        self.assertIn("closed before the pending was created", reason)
+
+    def test_summary_exposes_cont_staircase(self):
+        from pending_entries import summary
+        row_4h = {"trend": "Green", "close": 0.3, "filter": 0.4, "prev_close": 0.35,
+                  "prev_filter": 0.4, "filter_rising_6": False, "bw_pct50": False,
+                  "bar_time": BAR_T}
+        row_1d = {"trend": "Red", "close": 0.3, "lower": 0.2}
+        entries = [{"id": "JUP_CONT_20261008", "symbol": "JUP", "kind": CONT_STAIRCASE,
+                    "status": ACTIVE, "created_at": "2026-10-08T10:00:00Z"}]
+        out = summary(entries, {"JUP": row_1d}, {"JUP": row_4h}, {"JUP": 0.31})
+        self.assertEqual(out[0]["kind"], "CONT_STAIRCASE")
+        self.assertIn("CONT_STAIRCASE", out[0]["current_step"])
+        self.assertIs(out[0]["filter_rising_6"], False)
+        self.assertEqual(out[0]["4h_prev_filter"], 0.4)
+
+    def test_desk_payload_flags(self):
+        import serve
+        flags = serve._cont_staircase_flags()
+        self.assertEqual(set(flags), {"enabled", "mode"})
+        self.assertIn(flags["mode"], ("live", "paper"))
+
+
 if __name__ == "__main__":
     unittest.main()
 

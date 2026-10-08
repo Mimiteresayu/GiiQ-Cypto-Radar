@@ -204,10 +204,14 @@ def band(kind: str, row_1d: Optional[dict], row_4h: Optional[dict]) -> Dict[str,
             "filter": _f(d4.get("filter")),
             "close": _f(d4.get("close")),
             "prev_close": _f(d4.get("prev_close")),
+            "prev_filter": _f(d4.get("prev_filter")),
             "prev_upper": _f(d4.get("prev_upper")),
             "trend": d4.get("trend"),
             "bar_time": d4.get("bar_time"),
             "dual_cross_up": d4.get("dual_cross_up"),  # Real radar field (closed-bar)
+            # CONT_STAIRCASE reads these off the closed radar row.
+            "filter_rising_6": d4.get("filter_rising_6"),
+            "bw_pct50": d4.get("bw_pct50"),
         }
     }
 
@@ -451,8 +455,11 @@ def summary(entries: List[dict], rows_1d: Dict[str, dict], rows_4h: Dict[str, di
         mid = mids.get(e["symbol"]) if mids else None
         d1d, d4h = b.get("1d", {}), b.get("4h", {})
         
-        # Determine current step
-        if not e.get("breakout_1d"):
+        if e.get("kind") == CONT_STAIRCASE:
+            action, reason, _upd = evaluate_cont_staircase(
+                e, b, mid, datetime.now(timezone.utc), set())
+            step = f"CONT_STAIRCASE {action}: {reason}"
+        elif not e.get("breakout_1d"):
             step = "Step 1: waiting for 1D breakout"
         elif not e.get("retrace_touched"):
             step = "Step 2: waiting for 4H retrace"
@@ -475,6 +482,10 @@ def summary(entries: List[dict], rows_1d: Dict[str, dict], rows_4h: Dict[str, di
             "4h_filter": d4h.get("filter"),
             "4h_lower": d4h.get("lower"),
             "4h_close": d4h.get("close"),
+            "4h_prev_close": d4h.get("prev_close"),
+            "4h_prev_filter": d4h.get("prev_filter"),
+            "filter_rising_6": d4h.get("filter_rising_6"),
+            "bw_pct50": d4h.get("bw_pct50"),
             "4h_trend": d4h.get("trend"),
             "mid": mid,
             "size_pct": e.get("size_pct"), 

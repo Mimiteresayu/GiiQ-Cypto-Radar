@@ -96,6 +96,21 @@ class TestPreflight(unittest.TestCase):
         self.assertEqual(r["entry_guard"]["AAA"]["pending_kind"], "CONTINUATION")
         self.assertEqual(r["entry_guard"]["BBB"]["note"], "not in current candidate list")
 
+    def test_cont_staircase_field_and_pending_line(self):
+        import json as _j
+        from pathlib import Path
+        p = Path(os.environ["PENDING_PATH"])
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(_j.dumps({"entries": [{
+            "id": "JUP_CONT_20261008", "symbol": "JUP", "kind": "CONT_STAIRCASE",
+            "status": "pending", "created_at": "2026-10-08T10:00:00Z"}]}))
+        r = self.run_pf(FakeHL())
+        self.assertIn("enabled", r["cont_staircase"])
+        self.assertIn("mode", r["cont_staircase"])
+        details = [c["detail"] for c in r["checks"] if c["check"] == "pending:JUP"]
+        self.assertTrue(details and "CONT_STAIRCASE" in details[0], details)
+        self.assertNotIn(KEY, repr(r))
+
     def test_never_prints_key(self):
         r = self.run_pf(FakeHL())
         self.assertNotIn("11" * 32, repr(r))

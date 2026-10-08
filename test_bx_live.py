@@ -720,6 +720,141 @@ class TestCockpitRoutesBxDecisionsAway(unittest.TestCase):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+class TestContStaircaseBX(Tmp):
+    """BX live path: swing-low SL, 0.5% risk, 4H filter exit. No HL candle fetch."""
+
+    def _seed_trigger(self, now):
+        bar_open = int(datetime(2026, 10, 8, 8, 0, tzinfo=timezone.utc).timestamp() * 1000)
+        row4 = {"bx_symbol": "FOOUSDT", "symbol": "FOO", "trend": "Green", "close": 2.0,
+                "filter": 1.9, "prev_close": 1.85, "prev_filter": 1.90,
+                "upper": 2.2, "lower": 1.6, "filter_rising_6": True, "bw_pct50": True,
+                "bar_time": bar_open}
+        row1 = {"bx_symbol": "FOOUSDT", "symbol": "FOO", "trend": "Green", "close": 2.2,
+                "lower": 1.5, "upper": 2.4, "filter": 1.8, "bar_time": bar_open}
+        (self.tmp / "bx_radar_4h.json").write_text(json.dumps({"rows": [row4], "ts": now.isoformat()}))
+        (self.tmp / "bx_radar_1d.json").write_text(json.dumps({"rows": [row1], "ts": now.isoformat()}))
+        h4 = 14_400_000
+        bars = []
+        for i in range(13):
+            t = bar_open - (12 - i) * h4
+            low = 1.50 if i == 3 else 1.90
+            bars.append([t, 2.0, 2.1, low, 2.0, 1e6])
+        bars.append([bar_open + h4, 2.0, 2.2, 1.40, 2.05, 1e6])  # forming bar, ignored
+        bx_radar.save_candles("4h", {"FOOUSDT": bars})
+        rec = {"id": "FOO_CONT_20261008", "symbol": "FOOUSDT", "kind": "CONT_STAIRCASE", "status": "pending",
+               "created_at": "2026-10-08T10:00:00+00:00", "cand": cand(), "size_pct": 4, "leverage": 5,
+               "approved_at": "2026-10-08T00:50:00+00:00"}
+        L.save_live_pending([rec])
+        return bar_open
+
+    def _pending(self, now, env):
+        api = FakeAPI()
+        with patch.dict(os.environ, env), patch.object(L, "hl_margin_used", return_value=0.0):
+            out = L.run_live_pending(api, self.conn, now, True, [], {"FOOUSDT": meta()},
+                                     {"available": "5000"}, 10_000.0, lambda s: dict(LIVE), lambda s: TIERS)
+        return api, out
+
+    def test_trigger_places_bx_swing_low_and_three_x(self):
+        now = datetime(2026, 10, 8, 12, 10, tzinfo=timezone.utc)
+        self._seed_trigger(now)
+        api, out = self._pending(now, {"CONT_STAIRCASE_ENABLED": "1", "CONT_STAIRCASE_MODE": "live"})
+        self.assertEqual(out[0]["action"], "trigger", out)
+        self.assertTrue(api.orders(), api.calls)
+        self.assertIn(("set_leverage", "FOOUSDT", 3), api.calls)
+        self.assertTrue(str(api.orders()[0][4]).startswith("1.5"), api.orders()[0])
+        trade = L.open_live_trades(self.conn)[0]
+        self.assertEqual(trade["exit_rule"], "cont_staircase_4h_filter")
+        self.assertEqual(trade["leverage"], 3)
+
+    def test_disabled_or_paper_does_not_order(self):
+        now = datetime(2026, 10, 8, 12, 10, tzinfo=timezone.utc)
+        self._seed_trigger(now)
+        api, out = self._pending(now, {"CONT_STAIRCASE_ENABLED": "0", "CONT_STAIRCASE_MODE": "live"})
+        self.assertEqual(out[0]["action"], "wait")
+        self.assertIn("ENABLED=0", out[0]["reason"])
+        self.assertEqual(api.orders(), [])
+        api, out = self._pending(now, {"CONT_STAIRCASE_ENABLED": "1", "CONT_STAIRCASE_MODE": "paper"})
+        self.assertEqual(out[0]["action"], "wait")
+        self.assertIn("paper", out[0]["reason"])
+        self.assertEqual(api.orders(), [])
+
+    def test_migrates_continuation_then_evaluates(self):
+        now = datetime(2026, 10, 8, 12, 10, tzinfo=timezone.utc)
+        self._seed_trigger(now)
+        pend = L.load_live_pending()
+        pend[0]["kind"] = "CONTINUATION"
+        pend[0]["id"] = "JUP_CONT_20261008"
+        L.save_live_pending(pend)
+        _api, out = self._pending(now, {"CONT_STAIRCASE_ENABLED": "0", "CONT_STAIRCASE_MODE": "live"})
+        saved = L.load_live_pending()[0]
+        self.assertEqual(saved["kind"], "CONT_STAIRCASE")
+        self.assertEqual(saved["id"], "JUP_CONT_20261008")
+        self.assertEqual(out[0]["action"], "wait")
+
+    def test_risk_sizing_clamps_margin(self):
+        wide = L.check_entry(cand(hard_sl=1.50), meta(), dict(LIVE), 10_000, 5_000, [], 0.0,
+                             APPROVED, TIERS, "CONT_STAIRCASE")
+        self.assertTrue(wide["ok"], wide)
+        self.assertEqual(wide["plan"]["leverage"], 3)
+        self.assertAlmostEqual(wide["plan"]["margin_usd"], 200.0, places=2)  # 2% floor
+        tight = L.check_entry(cand(hard_sl=1.97), meta(), dict(LIVE), 10_000, 5_000, [], 0.0,
+                              APPROVED, TIERS, "CONT_STAIRCASE")
+        self.assertTrue(tight["ok"], tight)
+        self.assertEqual(tight["plan"]["leverage"], 3)
+        self.assertLess(tight["plan"]["margin_usd"], 800.0)  # 8% ceiling
+        self.assertGreater(tight["plan"]["margin_usd"], 200.0)
+
+    def test_manage_open_exits_on_4h_filter_only_after_entry(self):
+        now = datetime(2026, 10, 8, 16, 10, tzinfo=timezone.utc)
+        bar_open = int(datetime(2026, 10, 8, 12, 0, tzinfo=timezone.utc).timestamp() * 1000)
+        self.conn.execute(
+            """INSERT INTO shadow_trades(symbol, bx_symbol, kind, entry_time, entry_px, size_pct_nav,
+               leverage, hard_sl, exit_rule, status, mode, position_id, qty)
+               VALUES ('FOO','FOOUSDT','CONT_STAIRCASE','2026-10-08T12:10:00+00:00',2,2,3,1.5,
+                       'cont_staircase_4h_filter','open','live','P1',10)""")
+        self.conn.commit()
+        pos = {"positionId": "P1", "symbol": "FOOUSDT", "side": "LONG", "qty": "10", "avgOpenPrice": "2",
+               "leverage": 3, "marginMode": "ISOLATION", "liqPrice": "1.2", "unrealizedPNL": "0",
+               "fee": "0", "funding": "0"}
+        api = FakeAPI(positions=[dict(pos)])
+        early = int(datetime(2026, 10, 8, 8, 0, tzinfo=timezone.utc).timestamp() * 1000)
+        held = L.manage_open(api, self.conn, now, {"FOOUSDT": {"close": 1.8, "filter": 1.9, "bar_time": early, "low": 1.7}},
+                             {"FOOUSDT": meta()}, market=lambda s: dict(LIVE))
+        self.assertEqual(held["closed"], [])
+        closed = L.manage_open(api, self.conn, now, {"FOOUSDT": {"close": 1.8, "filter": 1.9, "bar_time": bar_open, "low": 1.7}},
+                               {"FOOUSDT": meta()}, market=lambda s: dict(LIVE))
+        self.assertEqual(closed["closed"][0]["reason"], "CONT_STAIRCASE_4h_filter")
+
+    def test_base_4h_exit_unchanged(self):
+        now = datetime(2026, 10, 8, 16, 10, tzinfo=timezone.utc)
+        bar_open = int(datetime(2026, 10, 8, 12, 0, tzinfo=timezone.utc).timestamp() * 1000)
+        self.conn.execute(
+            """INSERT INTO shadow_trades(symbol, bx_symbol, kind, entry_time, entry_px, size_pct_nav,
+               leverage, hard_sl, exit_rule, status, mode, position_id, qty)
+               VALUES ('FOO','FOOUSDT','Base','2026-10-08T08:00:00+00:00',2,2,2,1.5,
+                       '4h_close_below_filter','open','live','P9',10)""")
+        self.conn.commit()
+        pos = {"positionId": "P9", "symbol": "FOOUSDT", "side": "LONG", "qty": "10", "avgOpenPrice": "2",
+               "leverage": 2, "marginMode": "ISOLATION", "liqPrice": "1.2", "unrealizedPNL": "0",
+               "fee": "0", "funding": "0"}
+        api = FakeAPI(positions=[pos])
+        rep = L.manage_open(api, self.conn, now, {"FOOUSDT": {"close": 1.8, "filter": 1.9, "bar_time": bar_open, "low": 1.7}},
+                            {"FOOUSDT": meta()}, market=lambda s: dict(LIVE))
+        self.assertEqual(rep["closed"][0]["reason"], "exit_4h_close_below_filter")
+
+    def test_shadow_exit_bar_close_and_base_rule(self):
+        entry = "2026-10-08T12:10:00+00:00"
+        bar_open = int(datetime(2026, 10, 8, 12, 0, tzinfo=timezone.utc).timestamp() * 1000)
+        now = datetime(2026, 10, 8, 16, 10, tzinfo=timezone.utc)
+        row = {"close": 1.8, "filter": 1.9, "bar_time": bar_open, "low": 1.7}
+        hit = bx_shadow.exit_check({"exit_rule": "cont_staircase_4h_filter", "entry_time": entry,
+                                    "hard_sl": 1.5, "kind": "CONT_STAIRCASE"}, now, {"4h": row}, None)
+        self.assertEqual(hit[0], "CONT_STAIRCASE_4h_filter")
+        base = bx_shadow.exit_check({"exit_rule": "4h_close_below_filter", "entry_time": entry,
+                                     "hard_sl": 1.5, "kind": "Base"}, now, {"4h": row}, None)
+        self.assertIsNone(base)  # bar opened before entry; existing rule is unchanged
+
+
 class TestLowVolFlag(unittest.TestCase):
     def test_flag_under_1m(self):
         import bx_live as L

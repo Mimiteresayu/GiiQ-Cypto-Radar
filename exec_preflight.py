@@ -62,8 +62,11 @@ def _log(msg: str) -> None:
 def run_preflight(hl: Any = None, signed_probe: bool = True, now: Optional[datetime] = None) -> Dict[str, Any]:
     now = now or datetime.now(timezone.utc)
     checks: List[Dict[str, Any]] = []
+    from pending_entries import cont_staircase_enabled, cont_staircase_mode
     res: Dict[str, Any] = {"ok": True, "mode": "LIVE" if is_live_mode() else "DRY_RUN",
-                           "ts": now.isoformat(), "checks": checks, "warnings": [], "sot": SOT_ID}
+                           "ts": now.isoformat(), "checks": checks, "warnings": [], "sot": SOT_ID,
+                           "cont_staircase": {"enabled": cont_staircase_enabled(),
+                                              "mode": cont_staircase_mode()}}
 
     def add(name: str, ok: bool, detail: str, blocking: bool = True) -> None:
         checks.append({"check": name, "ok": ok, "detail": detail, "blocking": blocking})
@@ -261,12 +264,22 @@ def run_preflight(hl: Any = None, signed_probe: bool = True, now: Optional[datet
             pmids = {}
         pend = pending_summary(load_pending(), rows_1d, rows_4h, pmids)
         res["pending"] = pend
+
+        def _g(v: Any) -> str:
+            try:
+                return f"{float(v):.4g}"
+            except (TypeError, ValueError):
+                return "n/a"
+
         for p in pend:
-            # New 3-step display: show current step and key band levels
+            extra = ""
+            if p.get("kind") == "CONT_STAIRCASE":
+                extra = (f" | CONT_STAIRCASE rising6={p.get('filter_rising_6')} bw50={p.get('bw_pct50')} "
+                         f"prev {_g(p.get('4h_prev_close'))}/{_g(p.get('4h_prev_filter'))}")
             add(f"pending:{p['symbol']}", True,
-                f"{p['kind']} {p['current_step']} | 1D: {p['1d_close']:.4g} ({p['1d_trend']}) "
-                f"| 4H: {p['4h_close']:.4g} ({p['4h_trend']}, filter {p['4h_filter']:.4g}) "
-                f"| mid {p['mid']:.4g if p.get('mid') else 'N/A'} | exp {p['expires_at']}", blocking=False)
+                f"{p['kind']} {p['current_step']} | 1D: {_g(p.get('1d_close'))} ({p.get('1d_trend')}) "
+                f"| 4H: {_g(p.get('4h_close'))} ({p.get('4h_trend')}, filter {_g(p.get('4h_filter'))}) "
+                f"| mid {_g(p.get('mid'))} | exp {p.get('expires_at')}{extra}", blocking=False)
         if not pend:
             add("pending", True, "no active 3-step pending entries", blocking=False)
     except Exception as e:  # noqa: BLE001

@@ -171,6 +171,17 @@ class TestGcRow(unittest.TestCase):
         self.assertEqual(r["bar_time"], closed[-1][0])          # forming bar ignored
         self.assertEqual(r["bars"], 200)
 
+    def test_4h_row_carries_cont_staircase_fields(self):
+        bars = daily_bars(200, tf_ms=H4, drift=0.002)
+        r = R.gc_row("FOO", bars, "4h", NOW, sgr.compute_gc)
+        self.assertIn("prev_close", r)
+        self.assertIn("prev_filter", r)
+        self.assertIsInstance(r["filter_rising_6"], bool)
+        self.assertIsInstance(r["bw_pct50"], bool)
+        closed = [b for b in bars if b[0] + H4 <= NOW]
+        self.assertEqual(R.swing_low(bars, 12, "4h", NOW), min(b[3] for b in closed[-12:]))
+        self.assertIsNone(R.swing_low(closed[:5], 12, "4h", NOW))
+
     def test_too_short_history(self):
         self.assertIsNone(R.gc_row("NEW", daily_bars(100), "1d", NOW, sgr.compute_gc))
         self.assertIsNotNone(R.gc_row("NEW", daily_bars(100, tf_ms=H4), "4h", NOW, sgr.compute_gc))

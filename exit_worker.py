@@ -194,23 +194,26 @@ def check_exits(exit_type: str = "all", hl: Any = None, radar_1h: Optional[dict]
         if pos["side"] != "LONG":
             result["holds"].append({"coin": coin, "reason": "short: report only"})
             continue
+        trade = trade_map.get(coin)
+        strategy = trade.get("entry_type") if trade else None
+        # Hourly job is the Small/Tiny tier exit (1H close < Lower) plus tier SL align.
+        # CONT_STAIRCASE is only judged on the 4H job, and its swing-low SL is never moved.
+        if exit_type == "hourly" and strategy == "CONT_STAIRCASE":
+            result["holds"].append({"coin": coin, "tier": tier, "strategy": "CONT_STAIRCASE",
+                                    "reason": "hourly tier exit skips CONT_STAIRCASE",
+                                    "sl_note": "CONT_STAIRCASE SL fixed at entry, never re-aligned"})
+            continue
         if exit_type == "hourly" and tier not in ("small", "tiny"):
             result["holds"].append({"coin": coin, "reason": "not hourly tier"})
             continue
         if exit_type == "4h" and tier not in ("mega", "large"):
             # CONT_STAIRCASE positions are checked in the 4H job regardless of tier
-            trade = trade_map.get(coin)
-            strategy = trade.get("entry_type") if trade else None
             if strategy != "CONT_STAIRCASE":
                 result["holds"].append({"coin": coin, "reason": "not 4H tier"})
                 continue
         sz_dec = int((meta.get(coin) or {}).get("szDecimals", 0))
         triggers = trigger_orders_for(orders, coin)
         r4h = _row(radar_4h, coin)
-        
-        # Get strategy from trade log
-        trade = trade_map.get(coin)
-        strategy = trade.get("entry_type") if trade else None
         
         # CONT_STAIRCASE positions must NOT use tier-based Hard SL realignment
         if strategy == "CONT_STAIRCASE":
@@ -237,7 +240,10 @@ def check_exits(exit_type: str = "all", hl: Any = None, radar_1h: Optional[dict]
                         result["sl_actions"].append(a)
             continue
 
-        row_px = (_row(radar_1h, coin) if tier in ("small", "tiny") else r4h) or {}
+        if strategy == "CONT_STAIRCASE":
+            row_px = r4h or {}
+        else:
+            row_px = (_row(radar_1h, coin) if tier in ("small", "tiny") else r4h) or {}
         current_px = row_px.get("close", 0) or 0
         mae, mfe, r_mult = _compute_mae_mfe_r(pos["entry_px"], current_px, pos["unrealized_pnl"], pos["position_value"])
         intent = {"coin": coin, "tier": tier, "size": pos["size"], "exit_price": current_px, "exit_reason": reason,
