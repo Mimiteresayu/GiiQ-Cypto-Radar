@@ -373,6 +373,7 @@ def _execute(
     for symbol in approved_list:
         cand = next((c for c in candidates if c.get("symbol") == symbol), None)
         if not cand:
+            _log(f"{mode} SKIP {symbol}: approved but not in candidate snapshot")
             continue
         decision = decisions.get(symbol, {})
         entry_type = cand.get("type", "Base")
@@ -497,7 +498,8 @@ def _execute(
 
         r1d = next((r for r in radar_1d.get("rows", []) if r.get("symbol") == symbol), None)
         upper_ref, upper_label = entry_upper_ref(cand, r1d, r4h)
-        if not above_upper_at_entry(mid, upper_ref):
+        # MMT 2026-10-08: Remove live mid > 1D Upper guard for Base entries
+        if entry_type != "Base" and not above_upper_at_entry(mid, upper_ref):
             why = (f"below {upper_label} at entry (live mid {mid:.6g} <= {upper_ref:.6g})" if upper_ref
                    else f"no {upper_label} available for at-entry guard")
             skip(why, size_pct=size_pct, leverage=leverage, mid=mid, upper_ref=upper_ref)

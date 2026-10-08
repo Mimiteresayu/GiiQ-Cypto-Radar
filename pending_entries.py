@@ -17,7 +17,7 @@ Rules (MMT, 2026-10-07, replacing old N/N+1 pullback):
     with Hard SL, using the same fail-closed checks as the Base executor.
   
 Created only from AI-approved decisions (approved size_pct / leverage kept, re-clamped to SoT bands
-at fill time). Cancelled when 1D close < 1D Lower or after PENDING_TTL_DAYS (30).
+at fill time). Cancelled when 1D close < 1D Lower (NO time-based expiry - MMT 2026-10-08).
 Idempotent: one record per (symbol, kind, HKT decision date); filled/cancelled records are never
 re-armed; a CONT whose coin is already held is cancelled; an ADD_ON whose base position is gone is
 cancelled.
@@ -203,7 +203,7 @@ def create_pending(entries: List[dict], symbol: str, kind: str, decision: dict, 
     rec = {
         "id": pid, "symbol": symbol, "kind": kind, "status": ACTIVE,
         "created_at": now.isoformat(),
-        "expires_at": (now + timedelta(days=PENDING_TTL_DAYS)).isoformat(),
+        "expires_at": None,  # MMT 2026-10-08: No time-based expiry
         "decision_date": now.astimezone(HKT).strftime("%Y-%m-%d"),
         "size_pct": decision.get("size_pct"), "leverage": decision.get("leverage"),
         "reason": decision.get("reason", ""),
@@ -229,10 +229,7 @@ def evaluate(rec: dict, bnd: Dict[str, Any], mid: Optional[float], now: datetime
     fields the caller persists in LIVE mode. Missing/misaligned data -> wait without state change
     (fail-closed, retried next 4H run)."""
     
-    exp = parse_ts(rec.get("expires_at"))
-    if exp and now >= exp:
-        return "expire", f"expired after {PENDING_TTL_DAYS} days", {}
-    
+    # MMT 2026-10-08: No time-based expiry (only cancel on 1D < Lower, CONT held, ADD_ON base gone)
     sym, kind = rec.get("symbol"), rec.get("kind")
     if kind in (CONTINUATION, CONT) and sym in held_long:
         return "cancel", "coin already held (not adding a CONT)", {}

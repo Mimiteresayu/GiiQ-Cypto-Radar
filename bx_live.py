@@ -931,7 +931,7 @@ def run_entries(now: Optional[datetime] = None, trade_api=None, egress: Optional
                 else:
                     rep["pending"].append(create_live_pending(pend, c, appr, now))
                 continue
-            _try_enter(api, conn, c, meta_all, acct, nav, book, now, market, tiers_fn, rep)
+            _try_enter(api, conn, c, meta_all, acct, nav, book, now, market, tiers_fn, rep, fallback=fallback_map)
         save_live_pending(pend)
     finally:
         if own:
@@ -939,7 +939,7 @@ def run_entries(now: Optional[datetime] = None, trade_api=None, egress: Optional
     return rep
 
 
-def _try_enter(api, conn, c, meta_all, acct, nav, book, now, market, tiers_fn, rep, kind=None) -> bool:
+def _try_enter(api, conn, c, meta_all, acct, nav, book, now, market, tiers_fn, rep, kind=None, fallback=None) -> bool:
     """book = {"margin_used": HL+BX margin in use (None = unknown), "available": BX available USDT}; updated after
     each fill so several approvals in one run share the same 80% cap and the same free balance."""
     meta = meta_all.get(c["symbol"]) or {}
@@ -950,7 +950,7 @@ def _try_enter(api, conn, c, meta_all, acct, nav, book, now, market, tiers_fn, r
         rep["skipped"].append({"symbol": c["symbol"], "reason": f"market data failed: {str(e)[:120]}"})
         return False
     chk = check_entry(c, meta, live, nav, book.get("available"), open_live_trades(conn),
-                      book.get("margin_used"), approval_for(c["symbol"], now), tiers)
+                      book.get("margin_used"), approval_for(c["symbol"], now, fallback=fallback), tiers)
     if not chk["ok"]:
         rep["skipped"].append({"symbol": c["symbol"], "reason": chk["reason"]})
         return False
