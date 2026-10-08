@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Daily ADD_ON top-up, Signum-style (MMT 2026-10-07). Replaces the CONT / ADD_ON pullback pendings.
+"""Daily ADD_ON top-up, Signum-style (MMT 2026-10-07, updated 2026-10-08). Replaces the CONT / ADD_ON pullback pendings.
 
 There is no CONT any more: a coin you do not hold enters only through the Base (fresh daily cross).
 For a coin you ALREADY HOLD LONG, once a day (08:57 HKT, after the 08:55 executor) this adds to the winner when
   1. the latest CLOSED 1D bar's close is still above the 1D Upper (Signum: "close still above the upper band"),
-  2. the position's PRICE gain vs entry is >= +10% (exec_common.ADDON_MIN_PRICE_GAIN_PCT, as in SoT-3),
-  3. the coin's notional after the add stays <= 20% NAV (exec_common.addon_gates),
+  2. the position's ROE (unrealized PnL / margin) is >= +20%,
+  3. the coin's total margin (base + add) stays <= 5.5% NAV,
   4. it has not already been topped up today (idempotent: /api/jobs re-runs never double add).
 The add uses the position's existing isolated leverage and 2% NAV margin (the SoT floor; no desk decision is needed,
 the rule is mechanical like Signum). The same fail-closed checks as every entry apply: radar row-count + freshness,
@@ -36,6 +36,8 @@ from exec_common import (  # noqa: E402
 
 ENABLE_ENV = "DAILY_ADDON_ENABLED"
 TOPUP_MARGIN_PCT = 2.0          # SoT floor: 2% NAV isolated margin per top-up
+MIN_ROE_PCT = 20.0              # MMT 2026-10-08: ROE >= +20% to trigger top-up
+MAX_TOTAL_COIN_MARGIN_PCT = 5.5 # MMT 2026-10-08: total coin margin cap (base + add)
 RADAR_MAX_AGE_H = {"1d": 26.0, "4h": 5.0}
 
 
@@ -181,6 +183,20 @@ def run_daily_addons(hl: Any = None, radar_1d: Optional[dict] = None, radar_4h: 
         if not ok_sig:
             skip(why_sig)
             continue
+        
+        # Check ROE >= +20% (unrealized PnL / margin)
+        try:
+            upnl = float(pos.get("unrealizedPnl") or 0)
+            margin = float(pos.get("marginUsed") or 0)
+            roe_pct = (upnl / margin * 100.0) if margin > 0 else 0
+        except (TypeError, ValueError, ZeroDivisionError):
+            skip("ROE calculation failed")
+            continue
+        if roe_pct < MIN_ROE_PCT - 1e-9:
+            skip(f"ROE {roe_pct:+.1f}% < +{MIN_ROE_PCT:g}% required")
+            continue
+        chk["roe_pct"] = round(roe_pct, 2)
+        
         try:  # fresh live mid right before deciding
             mid = (hl.all_mids() or mids).get(sym)
         except Exception:  # noqa: BLE001
@@ -189,6 +205,19 @@ def run_daily_addons(hl: Any = None, radar_1d: Optional[dict] = None, radar_4h: 
         if not fixed_lev:
             skip("existing position leverage unknown")
             continue
+        
+        # Check total coin margin cap (5.5% NAV instead of addon_gates' 20% notional)
+        try:
+            current_margin = float(pos.get("marginUsed") or 0)
+            current_margin_pct = (current_margin / equity * 100.0) if equity > 0 else 0
+            room_margin_pct = MAX_TOTAL_COIN_MARGIN_PCT - current_margin_pct
+            if room_margin_pct < TOPUP_MARGIN_PCT - 1e-9:
+                skip(f"total coin margin {current_margin_pct:.2f}% + {TOPUP_MARGIN_PCT:g}% > {MAX_TOTAL_COIN_MARGIN_PCT:g}% cap")
+                continue
+        except (TypeError, ValueError):
+            skip("margin calculation failed")
+            continue
+        
         ok_add, why_add, room = addon_gates(pos, equity, mid, fixed_lev)
         if not ok_add:
             skip(why_add)

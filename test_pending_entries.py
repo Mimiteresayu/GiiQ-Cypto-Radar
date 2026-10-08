@@ -63,7 +63,7 @@ class TestEvaluate(unittest.TestCase):
         """Create a pending record with 3-step state."""
         r = {"id": "x", "symbol": "AAA", "kind": kind, "status": "pending", 
              "created_at": created.isoformat(),
-             "expires_at": (created + timedelta(days=7)).isoformat(),
+             "expires_at": None,  # MMT 2026-10-08: No time-based expiry
              "breakout_1d": breakout_1d,
              "retrace_touched": retrace_touched,
              "last_retrace_bar_t": last_retrace_bar_t}
@@ -163,12 +163,13 @@ class TestEvaluate(unittest.TestCase):
         self.assertEqual(a, "cancel")
         self.assertIn("below 1D Lower", why)
 
-    def test_expiry(self):
-        """Expired records are cancelled."""
-        r = self.rec(created=NOW - timedelta(days=8))
+    def test_no_time_expiry(self):
+        """No time-based expiry (MMT 2026-10-08)."""
+        r = self.rec(created=NOW - timedelta(days=60), breakout_1d=True)
         bnd = self.bnd()
         a, why, upd = pe.evaluate(r, bnd, 1.0, NOW, self.HELD)
-        self.assertEqual(a, "expire")
+        # Should NOT expire based on time alone
+        self.assertNotEqual(a, "expire")
 
     def test_cont_coin_already_held_cancels(self):
         """CONT when coin already held -> cancel."""
@@ -219,7 +220,7 @@ class TestEvaluate(unittest.TestCase):
         self.assertTrue(c1)
         self.assertFalse(c2)
         self.assertEqual(len(entries), 1)
-        self.assertEqual(r1["expires_at"], (NOW + timedelta(days=30)).isoformat())
+        self.assertIsNone(r1["expires_at"])  # MMT 2026-10-08: No expiry
         # Original values preserved (not overwritten by second call)
         self.assertEqual(r1["size_pct"], 3)
         self.assertEqual(r1["leverage"], 2)
@@ -257,7 +258,7 @@ class TestRealRadarShape(unittest.TestCase):
         return {
             "id": "test", "symbol": "AAA", "kind": pe.CONT, "status": "pending",
             "created_at": (NOW - timedelta(days=1)).isoformat(),
-            "expires_at": (NOW + timedelta(days=6)).isoformat(),
+            "expires_at": None,  # MMT 2026-10-08: No time-based expiry
             "breakout_1d": breakout_1d,
             "retrace_touched": retrace_touched,
             "last_retrace_bar_t": last_retrace_bar_t,

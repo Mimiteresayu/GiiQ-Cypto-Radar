@@ -459,13 +459,21 @@ def size_by_margin(nav: float, entry_px: float, hard_sl: float, coin_max_leverag
     flat = bool(flat_tier_size) and tier is not None
     m = SOT2_MAX_MARGIN_PCT
     a_sz = _f(ai_size_pct)
-    if flat:  # MMT 2026-10-07: tiny 2% / small 3% / large 4% / mega 5% of NAV, whatever the desk sent
-        m = tier_margin_pct(tier)
-        notes.append(f"flat tier size {m:g}% NAV ({(tier or 'unknown')})")
-    elif a_sz is not None and a_sz > 0:
+    
+    # MMT 2026-10-08: When AI gives size_pct, use it but cap at tier maximum
+    if a_sz is not None and a_sz > 0:
         if a_sz < SOT2_MIN_MARGIN_PCT:
             notes.append(f"AI size {a_sz:g}% < {SOT2_MIN_MARGIN_PCT:g}% floor -> {SOT2_MIN_MARGIN_PCT:g}%")
         m = min(m, max(SOT2_MIN_MARGIN_PCT, a_sz))
+        # Cap at tier maximum (tiny 2 / small 3 / large 4 / mega 5)
+        if tier is not None:
+            tier_max = tier_margin_pct(tier)
+            if m > tier_max:
+                notes.append(f"AI size {m:g}% > tier max {tier_max:g}% ({tier}) -> capped at {tier_max:g}%")
+                m = tier_max
+    elif flat:  # Fallback: flat tier size (no AI size given)
+        m = tier_margin_pct(tier)
+        notes.append(f"flat tier size {m:g}% NAV ({(tier or 'unknown')})")
     if max_margin_pct is not None:
         m = min(m, max_margin_pct)
     tiny = tier is not None and is_tiny_tier(tier)

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Bitunix shadow book — simulated entries / exits for BX-only signals. NO ORDERS, NO KEYS.
 
-Harbor-approved rules (2026-09-29):
-  Signals      same locked GC rules as HL. Base = 1D close crosses above 1D Upper + 1D Green.
+Harbor-approved rules (2026-09-29, updated 2026-10-08):
+  Signals      same locked GC rules as HL. Base = 1D dual cross up above 1D Upper (NO Green requirement).
                Chase = 1D Green + 4H Green + 4H cross above 4H Upper -> simulated pending pullback
                (CONTINUATION / ADD_ON, N / N+1 confirmation via pending_entries.evaluate, 7-day TTL).
                New tokens (history too short for a 1D GC): 4H cross + 4H Green; 1H cross + 1H Green when even
