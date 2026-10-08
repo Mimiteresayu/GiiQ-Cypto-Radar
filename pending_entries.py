@@ -46,10 +46,26 @@ ADD_ON = "ADD_ON"
 CONTINUATION = "CONTINUATION"
 # New: terminology CONT replaces CONTINUATION everywhere user-facing
 CONT = "CONT"
+# CONT-Staircase: MMT 2026-10-08 approved continuation rule
+CONT_STAIRCASE = "CONT_STAIRCASE"
 ACTIVE = "pending"
-PENDING_KINDS = (ADD_ON, CONTINUATION, CONT)
+PENDING_KINDS = (ADD_ON, CONTINUATION, CONT, CONT_STAIRCASE)
 DISABLE_ENV = "PENDING_CONTINUATION_DISABLED"
 DISABLED_REASON = "disabled by Cove HEALTH FAIL 2026-10-05"
+# CONT_STAIRCASE controls (MMT 2026-10-08)
+CONT_STAIRCASE_ENABLED_ENV = "CONT_STAIRCASE_ENABLED"
+CONT_STAIRCASE_MODE_ENV = "CONT_STAIRCASE_MODE"
+
+
+def cont_staircase_enabled() -> bool:
+    """CONT_STAIRCASE is OFF by default (CONT_STAIRCASE_ENABLED not set or 0). Set to 1 to enable."""
+    return (os.environ.get(CONT_STAIRCASE_ENABLED_ENV) or "").strip() == "1"
+
+
+def cont_staircase_mode() -> str:
+    """CONT_STAIRCASE mode: live | paper. Returns 'live' or 'paper'. Defaults to 'paper'."""
+    mode = (os.environ.get(CONT_STAIRCASE_MODE_ENV) or "paper").strip().lower()
+    return "live" if mode == "live" else "paper"
 
 
 def pending_disabled() -> bool:
@@ -92,6 +108,26 @@ def cancel_old_style_pending(entries: List[dict], now: datetime) -> List[dict]:
                     close_reason="OLD_STYLE_REPLACED_BY_3STEP")
             gone.append(e)
     return gone
+
+
+def migrate_cont_to_staircase(entries: List[dict], now: datetime) -> List[dict]:
+    """Migrate active CONT pendings to CONT_STAIRCASE type (MMT 2026-10-08).
+    
+    Returns list of migrated records.
+    """
+    migrated = []
+    for e in entries:
+        if e.get("status") == ACTIVE and e.get("kind") in (CONT, CONTINUATION):
+            e["kind"] = CONT_STAIRCASE
+            e["migrated_at"] = now.isoformat()
+            e["migration_note"] = "migrated from CONT to CONT_STAIRCASE (MMT 2026-10-08)"
+            # Clear old 3-step state fields (CONT_STAIRCASE doesn't use them)
+            e.pop("breakout_1d", None)
+            e.pop("breakout_date_1d", None)
+            e.pop("retrace_touched", None)
+            e.pop("last_retrace_bar_t", None)
+            migrated.append(e)
+    return migrated
 
 
 def enforce_disabled(now: Optional[datetime] = None) -> Dict[str, Any]:
@@ -229,6 +265,10 @@ def evaluate(rec: dict, bnd: Dict[str, Any], mid: Optional[float], now: datetime
     fields the caller persists in LIVE mode. Missing/misaligned data -> wait without state change
     (fail-closed, retried next 4H run)."""
     
+    # CONT_STAIRCASE uses different logic
+    if rec.get("kind") == CONT_STAIRCASE:
+        return evaluate_cont_staircase(rec, bnd, mid, now, held_long)
+    
     # MMT 2026-10-08: No time-based expiry (only cancel on 1D < Lower, CONT held, ADD_ON base gone)
     sym, kind = rec.get("symbol"), rec.get("kind")
     if kind in (CONTINUATION, CONT) and sym in held_long:
@@ -325,6 +365,81 @@ def evaluate(rec: dict, bnd: Dict[str, Any], mid: Optional[float], now: datetime
                           f"enter at live mid {mid:.6g}"), {}
     
     return "wait", "waiting for 4H dual cross up above 4H Upper", {}
+
+
+def evaluate_cont_staircase(rec: dict, bnd: Dict[str, Any], mid: Optional[float], now: datetime,
+                            held_long: set) -> Tuple[str, str, Dict[str, Any]]:
+    """CONT-Staircase trigger evaluation (MMT 2026-10-08).
+    
+    Trigger conditions (closed 4H bar):
+    1. 1D trend Green
+    2. 4H trend Green
+    3. 4H Filter rising on each of last 6 closed bars
+    4. 4H band width <= 180-bar median
+    5. Entry signal: close > Filter and prev_close <= prev_Filter
+    
+    Cancel when:
+    - 1D close < 1D Lower
+    - Coin already held (CONT only; can't stack)
+    """
+    sym = rec.get("symbol")
+    
+    # CONT_STAIRCASE can't be stacked if coin already held
+    if sym in held_long:
+        return "cancel", "coin already held (CONT_STAIRCASE can't stack)", {}
+    
+    d1d = bnd.get("1d", {})
+    d4h = bnd.get("4h", {})
+    
+    # Cancel on 1D close < 1D Lower
+    if d1d.get("close") and d1d.get("lower") and d1d.get("close") < d1d.get("lower"):
+        return "cancel", f"1D closed {d1d.get('close'):.6g} below 1D Lower {d1d.get('lower'):.6g}", {}
+    
+    # Need valid 4H bar time
+    bar_t_4h = d4h.get("bar_time")
+    if not bar_t_4h:
+        return "wait", "no 4H bar time", {}
+    bar_t_4h = int(bar_t_4h)
+    
+    created = parse_ts(rec.get("created_at"))
+    if created and bar_t_4h + BAR_MS["4h"] <= int(created.timestamp() * 1000):
+        return "wait", "latest 4H bar closed before the pending was created", {}
+    
+    # Check all trigger conditions
+    reasons = []
+    
+    # 1. 1D trend Green
+    if not d1d.get("trend") or d1d.get("trend") != "Green":
+        reasons.append(f"1D trend {d1d.get('trend')} not Green")
+    
+    # 2. 4H trend Green
+    if not d4h.get("trend") or d4h.get("trend") != "Green":
+        reasons.append(f"4H trend {d4h.get('trend')} not Green")
+    
+    # 3. 4H Filter rising on each of last 6 closed bars
+    if not d4h.get("filter_rising_6"):
+        reasons.append("4H Filter not rising on each of last 6 bars")
+    
+    # 4. 4H band width <= 180-bar median
+    if not d4h.get("bw_pct50"):
+        reasons.append("4H band width not <= 180-bar median")
+    
+    # 5. Entry signal: close > Filter and prev_close <= prev_Filter
+    if not all([d4h.get("close"), d4h.get("filter"), d4h.get("prev_close"), d4h.get("prev_filter")]):
+        reasons.append("missing 4H close/filter/prev values")
+    else:
+        close_above = d4h.get("close") > d4h.get("filter")
+        prev_below = d4h.get("prev_close") <= d4h.get("prev_filter")
+        if not (close_above and prev_below):
+            reasons.append(f"no Filter cross-up (close {d4h.get('close'):.6g} vs filter {d4h.get('filter'):.6g}, prev {d4h.get('prev_close'):.6g} vs {d4h.get('prev_filter'):.6g})")
+    
+    if reasons:
+        return "wait", "; ".join(reasons), {}
+    
+    # All conditions met - TRIGGER!
+    return "trigger", (f"CONT-Staircase trigger: 1D Green, 4H Green, Filter rising 6 bars, BW<=median, "
+                      f"close {d4h.get('close'):.6g} crossed up Filter {d4h.get('filter'):.6g}; "
+                      f"enter at live mid {mid:.6g}"), {}
 
 
 def summary(entries: List[dict], rows_1d: Dict[str, dict], rows_4h: Dict[str, dict],

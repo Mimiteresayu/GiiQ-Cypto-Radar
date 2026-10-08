@@ -987,6 +987,25 @@ def scan_symbol(coin: str, tf: str, ctx: Optional[Dict[str, Any]] = None) -> Opt
     except (TypeError, ValueError):
         oi_f = None
 
+    # CONT-Staircase filter fields (MMT 2026-10-08)
+    filter_rising_6 = None
+    bw_pct50 = None
+    if i >= 6:
+        # Check if filter rising on each of last 6 bars
+        filter_rising_6 = all(gc[i-j]["filter"] > gc[i-j-1]["filter"] for j in range(6))
+    
+    # Band width percentile (180-bar lookback)
+    if i >= 60:  # need sufficient history
+        lookback_end = max(0, i - 180)
+        bw_current = (upper - lower) / filt if filt > 0 else None
+        if bw_current is not None:
+            bw_history = [(gc[j]["upper"] - gc[j]["lower"]) / gc[j]["filter"] 
+                          for j in range(lookback_end, i) if gc[j]["filter"] > 0]
+            if len(bw_history) >= 60:
+                bw_history_sorted = sorted(bw_history)
+                bw_median = bw_history_sorted[len(bw_history_sorted) // 2]
+                bw_pct50 = bw_current <= bw_median if bw_median > 0 else None
+
     return {
         "symbol": coin,
         "close": round(close, 8),
@@ -1007,6 +1026,10 @@ def scan_symbol(coin: str, tf: str, ctx: Optional[Dict[str, Any]] = None) -> Opt
         "prev_cross_age_bars": prev_cross_age_bars,
         "bars": len(bars),
         "bar_time": bars[i]["t"],  # open time of the LAST CLOSED bar (top-level = closed SoT)
+        "prev_close": round(prev_close, 8),  # CONT-Staircase needs prev values
+        "prev_filter": round(prev_filt, 8),
+        "filter_rising_6": filter_rising_6,  # CONT-Staircase: filter rising last 6 bars
+        "bw_pct50": bw_pct50,  # CONT-Staircase: band width <= 180-bar median
         # live = forming bar at scan time (display only; never a signal input).
         # serve.py live_radar refreshes it every 10 min from allMids.
         "live": live,

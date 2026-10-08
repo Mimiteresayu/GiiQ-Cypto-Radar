@@ -88,8 +88,20 @@ def _row(radar: dict, coin: str) -> Optional[dict]:
     return None
 
 
-def _check_exit_signal(coin: str, tier: str, radar_1h: dict, radar_4h: dict) -> Tuple[bool, Optional[str]]:
-    """Primary exit per tier (closed bars from radar)."""
+def _check_exit_signal(coin: str, tier: str, strategy: Optional[str], radar_1h: dict, radar_4h: dict) -> Tuple[bool, Optional[str]]:
+    """Primary exit per tier (closed bars from radar).
+    
+    CONT_STAIRCASE positions use special exit: 4H close < 4H Filter (for ALL tiers).
+    Other positions use tier-based exits.
+    """
+    # CONT_STAIRCASE override: always use 4H close < Filter exit
+    if strategy == "CONT_STAIRCASE":
+        r4h = _row(radar_4h, coin)
+        if r4h and r4h.get("close") and r4h.get("filter") and r4h["close"] < r4h["filter"]:
+            return True, "CONT_STAIRCASE: 4H close < 4H Filter (trailing exit)"
+        return False, None
+    
+    # Tier-based exits for Base/ADD_ON positions
     if tier in ("mega", "large"):
         r4h = _row(radar_4h, coin)
         if r4h and r4h.get("close") and r4h.get("filter") and r4h["close"] < r4h["filter"]:
@@ -186,23 +198,43 @@ def check_exits(exit_type: str = "all", hl: Any = None, radar_1h: Optional[dict]
             result["holds"].append({"coin": coin, "reason": "not hourly tier"})
             continue
         if exit_type == "4h" and tier not in ("mega", "large"):
-            result["holds"].append({"coin": coin, "reason": "not 4H tier"})
-            continue
+            # CONT_STAIRCASE positions are checked in the 4H job regardless of tier
+            trade = trade_map.get(coin)
+            strategy = trade.get("entry_type") if trade else None
+            if strategy != "CONT_STAIRCASE":
+                result["holds"].append({"coin": coin, "reason": "not 4H tier"})
+                continue
         sz_dec = int((meta.get(coin) or {}).get("szDecimals", 0))
         triggers = trigger_orders_for(orders, coin)
         r4h = _row(radar_4h, coin)
-        hard_sl, sl_label = hard_sl_for_tier(tier, r4h)
-        should_exit, reason = _check_exit_signal(coin, tier, radar_1h, radar_4h)
+        
+        # Get strategy from trade log
+        trade = trade_map.get(coin)
+        strategy = trade.get("entry_type") if trade else None
+        
+        # CONT_STAIRCASE positions must NOT use tier-based Hard SL realignment
+        if strategy == "CONT_STAIRCASE":
+            # CONT_STAIRCASE: SL is fixed at entry (swing low), never re-aligned
+            should_exit, reason = _check_exit_signal(coin, tier, strategy, radar_1h, radar_4h)
+        else:
+            # Normal tier-based logic with Hard SL realignment
+            hard_sl, sl_label = hard_sl_for_tier(tier, r4h)
+            should_exit, reason = _check_exit_signal(coin, tier, strategy, radar_1h, radar_4h)
 
         if not should_exit:
-            result["holds"].append({"coin": coin, "tier": tier, "reason": "no exit signal", "hard_sl": hard_sl, "hard_sl_label": sl_label})
-            if hard_sl:
-                try:
-                    a = _align_sl(hl, live, coin, pos["size"], hard_sl, pos["liquidation_px"], triggers, sz_dec)
-                except Exception as e:  # noqa: BLE001
-                    a = {"action": "sl_error", "coin": coin, "error": str(e)}
-                if a:
-                    result["sl_actions"].append(a)
+            if strategy == "CONT_STAIRCASE":
+                result["holds"].append({"coin": coin, "tier": tier, "strategy": "CONT_STAIRCASE", 
+                                      "reason": "no exit signal (CONT_STAIRCASE: waiting for 4H close < Filter)", 
+                                      "sl_note": "CONT_STAIRCASE SL fixed at entry, never re-aligned"})
+            else:
+                result["holds"].append({"coin": coin, "tier": tier, "reason": "no exit signal", "hard_sl": hard_sl, "hard_sl_label": sl_label})
+                if hard_sl:
+                    try:
+                        a = _align_sl(hl, live, coin, pos["size"], hard_sl, pos["liquidation_px"], triggers, sz_dec)
+                    except Exception as e:  # noqa: BLE001
+                        a = {"action": "sl_error", "coin": coin, "error": str(e)}
+                    if a:
+                        result["sl_actions"].append(a)
             continue
 
         row_px = (_row(radar_1h, coin) if tier in ("small", "tiny") else r4h) or {}

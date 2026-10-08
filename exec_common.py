@@ -109,6 +109,20 @@ def hard_sl_for_tier(tier: str, row_4h: Optional[dict]) -> Tuple[Optional[float]
     return _f(row_4h.get("filter")), "4H Filter"
 
 
+def swing_low_4h_bars(coin: str, n_bars: int = 12) -> Optional[float]:
+    """Fetch last n_bars closed 4H bars and return lowest low (for CONT-Staircase SL)."""
+    try:
+        from scan_gc_radar import fetch_candles
+        bars = fetch_candles(coin, "4h")
+        if not bars or len(bars) < n_bars + 1:
+            return None
+        # Use last n_bars closed bars (skip the forming bar at index -1)
+        closed_bars = bars[-(n_bars + 1):-1]
+        return min(b["low"] for b in closed_bars)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def entry_upper_ref(cand: dict, row_1d: Optional[dict], row_4h: Optional[dict]) -> Tuple[Optional[float], str]:
     """Signal-TF Upper for the at-entry guard (latest CLOSED-bar scan).
 

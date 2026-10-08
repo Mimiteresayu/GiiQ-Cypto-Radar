@@ -73,11 +73,18 @@ from exec_common import (  # noqa: E402
     round_price,
 )
 from pending_entries import ACTIVE, ADD_ON, CONT, band, evaluate, load_pending, save_pending, summary  # noqa: E402
+from pending_entries import CONT_STAIRCASE, migrate_cont_to_staircase  # noqa: E402
+from pending_entries import cont_staircase_enabled, cont_staircase_mode  # noqa: E402
 from pending_entries import DISABLE_ENV, DISABLED_REASON, cancel_active_pending, pending_disabled  # noqa: E402
 from pending_entries import cancel_old_style_pending  # noqa: E402
 
 # SoT size bands (margin % of equity). CONT / ADD_ON both use 2-4%.
 PENDING_SIZE_BANDS = {"CONT": (2.0, 4.0), "CONTINUATION": (2.0, 4.0), "ADD_ON": (2.0, 4.0)}
+# CONT_STAIRCASE uses risk-based sizing: 0.5% NAV risk, margin clamped 2-8% NAV
+CONT_STAIRCASE_RISK_PCT = 0.5
+CONT_STAIRCASE_LEVERAGE = 3
+CONT_STAIRCASE_MIN_MARGIN_PCT = 2.0
+CONT_STAIRCASE_MAX_MARGIN_PCT = 8.0
 RADAR_MAX_AGE_H = {"4h": 5.0, "1d": 26.0}
 
 
@@ -134,6 +141,16 @@ def _run_pending(hl: Any = None, radar_1d: Optional[dict] = None, radar_4h: Opti
             _log(f"{mode} Cancelled {len(old_gone)} old-style (N/N+1) pendings: {[e.get('id') for e in old_gone]}")
         except Exception as e:  # noqa: BLE001
             res.update(status="error", message=f"pending store write failed during old-style cleanup: {e}")
+            return res
+    
+    # Migrate CONT pendings to CONT_STAIRCASE (MMT 2026-10-08, once per pending)
+    migrated = migrate_cont_to_staircase(entries, now)
+    if migrated and live and persist:
+        try:
+            save_pending(entries)
+            _log(f"{mode} Migrated {len(migrated)} CONT pendings to CONT_STAIRCASE: {[e.get('id') for e in migrated]}")
+        except Exception as e:  # noqa: BLE001
+            res.update(status="error", message=f"pending store write failed during CONT->STAIRCASE migration: {e}")
             return res
     
     if pending_disabled():
@@ -260,6 +277,17 @@ def _run_pending(hl: Any = None, radar_1d: Optional[dict] = None, radar_4h: Opti
             continue
 
         # ---------------- trigger: same fail-closed SoT checks as the executor, at fill time
+        # CONT_STAIRCASE enabled check
+        if kind == CONT_STAIRCASE:
+            if not cont_staircase_enabled():
+                note("CONT_STAIRCASE triggered but CONT_STAIRCASE_ENABLED=0 (not enabled)")
+                continue
+            staircase_mode = cont_staircase_mode()
+            if staircase_mode == "paper":
+                _log(f"CONT_STAIRCASE {sym}: paper mode - would trigger but not executing (CONT_STAIRCASE_MODE=paper)")
+                note("CONT_STAIRCASE triggered but CONT_STAIRCASE_MODE=paper (log only)")
+                continue
+        
         # New 3-step rule always uses both 1D and 4H radar
         age_1d = _radar_age_h(radar_1d, now)
         age_4h = _radar_age_h(radar_4h, now)
@@ -275,10 +303,21 @@ def _run_pending(hl: Any = None, radar_1d: Optional[dict] = None, radar_4h: Opti
             continue
         sz_dec, coin_max = int(cm.get("szDecimals", 0)), cm.get("maxLeverage")
         tier = rec.get("tier") or "unknown"
-        hard_sl, sl_label = hard_sl_for_tier(tier, rows_4h.get(sym))
-        if not hard_sl or hard_sl <= 0:
-            note(f"no Hard SL level ({sl_label})")
-            continue
+        
+        # CONT_STAIRCASE uses swing low SL, others use tier-based Hard SL
+        if kind == CONT_STAIRCASE:
+            from exec_common import swing_low_4h_bars
+            hard_sl = swing_low_4h_bars(sym, 12)
+            sl_label = "SW12 (lowest low of last 12 4H bars)"
+            if not hard_sl or hard_sl <= 0:
+                note(f"CONT_STAIRCASE: no swing low SL available")
+                continue
+        else:
+            hard_sl, sl_label = hard_sl_for_tier(tier, rows_4h.get(sym))
+            if not hard_sl or hard_sl <= 0:
+                note(f"no Hard SL level ({sl_label})")
+                continue
+        
         # GIIQ-SoT-5: daily entry cap removed
         fixed_lev, room, lev_note = None, None, ""
         if kind == ADD_ON:
@@ -301,13 +340,46 @@ def _run_pending(hl: Any = None, radar_1d: Optional[dict] = None, radar_4h: Opti
             continue
         limit_px = round_price(mid * (1 + slip / 100.0), sz_dec)
         ref_px = max(limit_px, (pos_by_coin.get(sym) or {}).get("entry_px") or 0)  # add-on: worst of both
-        sz = size_by_margin(equity, limit_px, hard_sl, coin_max, rec.get("size_pct"), rec.get("leverage"),
-                            fixed_leverage=fixed_lev, max_margin_pct=room, liq_ref_px=ref_px, tier=tier)
-        if not sz["ok"]:
-            note(f"triggered but {sz['reason']}")
-            continue
-        size_pct, leverage = sz["margin_pct"], sz["leverage"]
-        qty = order_qty(equity * size_pct / 100.0 * leverage, limit_px, sz_dec)
+        
+        # CONT_STAIRCASE uses risk-based sizing (0.5% NAV risk, 3x leverage, margin 2-8%)
+        if kind == CONT_STAIRCASE:
+            # Risk sizing: notional = 0.5% NAV / SL distance
+            risk_notional = equity * CONT_STAIRCASE_RISK_PCT / 100.0 / (sl_dist / 100.0)
+            # Apply coin notional cap (20% NAV)
+            max_notional = equity * MAX_COIN_NOTIONAL_NAV_PCT / 100.0
+            risk_notional = min(risk_notional, max_notional)
+            # Compute margin at 3x leverage
+            margin_usd_unclamped = risk_notional / CONT_STAIRCASE_LEVERAGE
+            margin_pct_unclamped = margin_usd_unclamped / equity * 100.0
+            # Clamp margin to 2-8% NAV
+            margin_pct = max(CONT_STAIRCASE_MIN_MARGIN_PCT, 
+                           min(CONT_STAIRCASE_MAX_MARGIN_PCT, margin_pct_unclamped))
+            margin_usd = equity * margin_pct / 100.0
+            notional = margin_usd * CONT_STAIRCASE_LEVERAGE
+            # Check liquidation is beyond SL
+            liq = isolated_liq_price_long(limit_px, CONT_STAIRCASE_LEVERAGE, coin_max)
+            if not liq or not liq_beyond_sl_long(liq, hard_sl):
+                note(f"CONT_STAIRCASE: liquidation {liq:.6g} not beyond SL {hard_sl:.6g}")
+                continue
+            leverage = CONT_STAIRCASE_LEVERAGE
+            size_pct = margin_pct
+            lev_note = f" (CONT_STAIRCASE: 0.5% NAV risk, 3x leverage, margin {margin_pct:.1f}% clamped to 2-8%)"
+            qty = order_qty(notional, limit_px, sz_dec)
+            est_liq = liq
+            sz_notes = f"risk {CONT_STAIRCASE_RISK_PCT}% NAV / {sl_dist:.2f}% SL = ${risk_notional:.2f} notional; margin {margin_pct:.1f}% at {leverage}x"
+        else:
+            sz = size_by_margin(equity, limit_px, hard_sl, coin_max, rec.get("size_pct"), rec.get("leverage"),
+                                fixed_leverage=fixed_lev, max_margin_pct=room, liq_ref_px=ref_px, tier=tier)
+            if not sz["ok"]:
+                note(f"triggered but {sz['reason']}")
+                continue
+            size_pct, leverage = sz["margin_pct"], sz["leverage"]
+            qty = order_qty(equity * size_pct / 100.0 * leverage, limit_px, sz_dec)
+            notional = qty * mid
+            margin_usd = notional / leverage
+            est_liq = sz["liq"]
+            sz_notes = sz.get("notes")
+        
         notional = qty * mid
         min_usd = min_order_usd(equity)
         if notional < min_usd:
@@ -327,13 +399,12 @@ def _run_pending(hl: Any = None, radar_1d: Optional[dict] = None, radar_4h: Opti
         if not ok_coin:
             note(f"coin notional {coin_pct:.1f}% NAV > {MAX_COIN_NOTIONAL_NAV_PCT:g}% cap")
             continue
-        est_liq = sz["liq"]
         intent = {"id": rec["id"], "symbol": sym, "kind": kind, "mid": mid, "limit_px": limit_px, "qty": qty,
                   "size_pct": size_pct, "leverage": leverage, "notional_usd": round(notional, 2),
                   "margin_usd": round(margin_usd, 2), "hard_sl": hard_sl, "hard_sl_label": sl_label,
                   "sl_dist_pct": round(sl_dist, 3), "estimated_liq": est_liq, "margin_util_after_pct": round(util, 2),
                   "note": lev_note.strip(),
-                  "risk_margin_pct": round(margin_usd / equity * 100.0, 3), "sizing_notes": sz.get("notes"),
+                  "risk_margin_pct": round(margin_usd / equity * 100.0, 3), "sizing_notes": sz_notes,
                   "approved_size_pct": rec.get("size_pct"), "approved_leverage": rec.get("leverage")}
         trade_id = f"{sym}_{kind}_{now.strftime('%Y%m%d_%H%M%S')}"
         if not live:
@@ -356,6 +427,7 @@ def _run_pending(hl: Any = None, radar_1d: Optional[dict] = None, radar_4h: Opti
                            "hard_sl": hard_sl, "leverage": leverage, "at": now.isoformat()}
             res["filled"].append(intent)
             held_long.add(sym)
+            # Tag CONT_STAIRCASE in trade log for exit_worker to recognize
             log_entry_fn(trade_id=trade_id, symbol=sym, entry_type=kind, tier=tier, trend_1d="", trend_4h="",
                          sl_dist_pct=sl_dist, entry_price=r.get("avg_px") or limit_px,
                          entry_size=r.get("filled_sz") or qty, entry_leverage=leverage,
