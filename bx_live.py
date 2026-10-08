@@ -533,10 +533,11 @@ def bx_radar_fresh(radar_1d: dict, radar_4h: dict, now: datetime) -> Tuple[bool,
 
 def check_entry(cand: dict, meta: dict, live: dict, nav: Optional[float], available: Optional[float],
                 open_live: List[dict], margin_used_total: Optional[float], approval: Optional[dict],
-                tiers: List[dict]) -> Dict[str, Any]:
+                tiers: List[dict], strategy: Optional[str] = None) -> Dict[str, Any]:
     """GIIQ-SoT-5: size/leverage from desk decision, daily cap and max-open removed, total margin cap (HL+BX).
     margin_used_total = HL + BX margin already in use (USD); None -> refuse (fail closed).
-    Pure pilot checks for one entry. live = {price, ask, bid, spread_bp, vol24h}. -> {ok, reason, plan}."""
+    Pure pilot checks for one entry. live = {price, ask, bid, spread_bp, vol24h}. -> {ok, reason, plan}.
+    strategy: CONT_STAIRCASE uses special risk-based sizing."""
     sym = cand["symbol"]
 
     def no(reason: str) -> Dict[str, Any]:
@@ -569,14 +570,32 @@ def check_entry(cand: dict, meta: dict, live: dict, nav: Optional[float], availa
     if not nav or nav <= 0:
         return no("NAV unavailable (HL NAV + BX equity)")
     
-    # GIIQ-SoT-5: size/leverage from desk decision (B19): 2-4% NAV, 2-5x, <= contract max leverage
-    size_pct, leverage = desk_sizing(approval, meta.get("max_leverage"), tier=(cand.get("tier") or ""))
-    if leverage < LEV_MIN:
-        return no(f"leverage {leverage}x < {LEV_MIN}x minimum after coin max leverage")
-    
-    margin = size_pct / 100.0 * nav
-    notional = margin * leverage
-    note = ""
+    # CONT_STAIRCASE uses risk-based sizing (0.5% NAV risk, 3x leverage, margin 2-8%)
+    from pending_entries import CONT_STAIRCASE
+    if strategy == CONT_STAIRCASE:
+        risk_pct = 0.5
+        leverage = 3
+        risk_notional = nav * risk_pct / 100.0 / (dist / 100.0)
+        # Cap at 20% NAV
+        max_notional = nav * 20.0 / 100.0
+        risk_notional = min(risk_notional, max_notional)
+        margin = risk_notional / leverage
+        margin_pct = margin / nav * 100.0
+        # Clamp to 2-8%
+        margin_pct = max(2.0, min(8.0, margin_pct))
+        margin = nav * margin_pct / 100.0
+        notional = margin * leverage
+        size_pct = margin_pct
+        note = f"CONT_STAIRCASE: 0.5% risk / {dist:.2f}% SL = {margin_pct:.1f}% margin at 3x"
+    else:
+        # GIIQ-SoT-5: size/leverage from desk decision (B19): 2-4% NAV, 2-5x, <= contract max leverage
+        size_pct, leverage = desk_sizing(approval, meta.get("max_leverage"), tier=(cand.get("tier") or ""))
+        if leverage < LEV_MIN:
+            return no(f"leverage {leverage}x < {LEV_MIN}x minimum after coin max leverage")
+        
+        margin = size_pct / 100.0 * nav
+        notional = margin * leverage
+        note = ""
     
     # Downsize to 0.5% of 24h volume if needed
     cap = MAX_SIZE_OF_VOL * float(live.get("vol24h") or 0)
@@ -747,6 +766,9 @@ def execute_entry(trade_api, cand: dict, meta: dict, plan: dict, now: datetime, 
         _log(f"[BX_ALERT] {sym} entry closed at once: {problems}")
         return res
     entry_px = _f(pos.get("avgOpenPrice")) or float(plan["limit_price"])
+    # CONT_STAIRCASE uses 4H close < Filter exit (MMT 2026-10-08)
+    from pending_entries import CONT_STAIRCASE
+    exit_rule = "cont_staircase_4h_filter" if kind == CONT_STAIRCASE else "4h_close_below_filter"
     conn.execute(
         """INSERT INTO shadow_trades(signal_id, symbol, bx_symbol, kind, gc_tf, tier, counted, entry_time, entry_px,
            size_pct_nav, leverage, hard_sl, exit_rule, fees_bp, slip_bp, status, note, mode, order_id, client_id,
@@ -754,7 +776,7 @@ def execute_entry(trade_api, cand: dict, meta: dict, plan: dict, now: datetime, 
            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'open', ?, 'live', ?,?,?,?,?)""",
         (cand.get("signal_id"), cand.get("coin") or sym, sym, kind or cand.get("type"), cand.get("gc_tf"),
          cand.get("tier"), int(counted), now.isoformat(), entry_px,
-         round(plan["margin_usd"] / plan["nav"] * 100, 4), leverage, sl, "4h_close_below_filter", 6.0, None,
+         round(plan["margin_usd"] / plan["nav"] * 100, 4), leverage, sl, exit_rule, 6.0, None,
          f"hkt={hkt_date(now)}; live pilot; desk {plan.get('desk_size_pct')}%/{plan.get('desk_leverage')}x; {plan.get('note') or ''}".strip("; "), 
          res["order_id"], cid, pid, filled, sl_id))
     conn.commit()
@@ -1099,19 +1121,44 @@ def _try_enter_pending(api, conn, c, meta_all, acct, nav, now, market, tiers_fn,
         rep["skipped"].append({"symbol": c["symbol"], "reason": f"market data failed: {str(e)[:120]}"})
         return False
     
-    # Get size/leverage from the pending record's approval
-    approval = {"decision": "approve", "source": "claude", "ts": rec.get("approved_at"),
-                "size_pct": rec.get("size_pct"), "leverage": rec.get("leverage")} if rec.get("approved_at") else None
+    # CONT_STAIRCASE-specific logic (MMT 2026-10-08)
+    from pending_entries import CONT_STAIRCASE
+    if rec.get("kind") == CONT_STAIRCASE:
+        # Calculate swing-low SL for CONT_STAIRCASE
+        from exec_common import swing_low_4h_bars
+        sl = swing_low_4h_bars(c["symbol"], 12)
+        if not sl or sl <= 0:
+            rep["skipped"].append({"symbol": c["symbol"], "reason": "CONT_STAIRCASE: no swing low SL available"})
+            return False
+        price = _f(live.get("price"))
+        if not price or sl >= price:
+            rep["skipped"].append({"symbol": c["symbol"], "reason": f"CONT_STAIRCASE: invalid SL {sl} vs price {price}"})
+            return False
+        sl_dist_pct = (price - sl) / price * 100.0
+        if sl_dist_pct < MIN_SL_DIST_PCT:
+            rep["skipped"].append({"symbol": c["symbol"], "reason": f"CONT_STAIRCASE: SL {sl_dist_pct:.2f}% < {MIN_SL_DIST_PCT}%"})
+            return False
+        # Override candidate SL with swing-low
+        c["hard_sl"] = sl
+        c["hard_sl_rule"] = "SW12 (CONT_STAIRCASE)"
+        # CONT_STAIRCASE uses fixed 0.5% risk sizing, 3x leverage
+        # Override approval sizing
+        approval = {"decision": "approve", "source": "claude", "ts": rec.get("approved_at"),
+                    "size_pct": None, "leverage": 3}  # size_pct=None triggers risk-based calc below
+    else:
+        # Get size/leverage from the pending record's approval
+        approval = {"decision": "approve", "source": "claude", "ts": rec.get("approved_at"),
+                    "size_pct": rec.get("size_pct"), "leverage": rec.get("leverage")} if rec.get("approved_at") else None
 
     # total margin in use, HL + BX combined (exchange values)
     hl_m = hl_margin_used()
     margin_used_total = (hl_m + bx_margin_in_use(acct)) if hl_m is not None else None
     chk = check_entry(c, meta, live, nav, _f(acct.get("available")), open_live_trades(conn),
-                      margin_used_total, approval, tiers)
+                      margin_used_total, approval, tiers, rec.get("kind"))
     if not chk["ok"]:
         rep["skipped"].append({"symbol": c["symbol"], "reason": chk["reason"]})
         return False
-    res = execute_entry(api, c, meta, chk["plan"], now, conn, counted=True, kind="Chase")
+    res = execute_entry(api, c, meta, chk["plan"], now, conn, counted=True, kind=rec.get("kind") or "Chase")
     rep["entered"].append(res)
     return res.get("status") == "filled"
 

@@ -257,7 +257,7 @@ class TestExitWorker(unittest.TestCase):
             ]
         }
 
-        should_exit, reason = _check_exit_signal("BTC", "mega", radar_1h, radar_4h)
+        should_exit, reason = _check_exit_signal("BTC", "mega", None, radar_1h, radar_4h)
         self.assertTrue(should_exit)
         self.assertIn("4H close < 4H Filter", reason)
 
@@ -276,7 +276,7 @@ class TestExitWorker(unittest.TestCase):
         }
         radar_4h = {"rows": []}
 
-        should_exit, reason = _check_exit_signal("BRETT", "small", radar_1h, radar_4h)
+        should_exit, reason = _check_exit_signal("BRETT", "small", None, radar_1h, radar_4h)
         self.assertTrue(should_exit)
         self.assertIn("1H close < 1H Lower", reason)
 
@@ -303,7 +303,7 @@ class TestExitWorker(unittest.TestCase):
             ]
         }
 
-        should_exit, reason = _check_exit_signal("ETH", "large", radar_1h, radar_4h)
+        should_exit, reason = _check_exit_signal("ETH", "large", None, radar_1h, radar_4h)
         self.assertFalse(should_exit)
         self.assertIsNone(reason)
 
