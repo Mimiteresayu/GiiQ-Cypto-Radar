@@ -1,0 +1,1 @@
+{"_note":"backtest reference for streak p-value; source giiq-quant/strategies/giiq_bo/results.json base.OOS (old research rule, 959 trades). Replace with AIQ-0020 v1.1 rerun when ready.","base":{"OOS":{"win_rate":0.3316,"n_trades":959}}}
