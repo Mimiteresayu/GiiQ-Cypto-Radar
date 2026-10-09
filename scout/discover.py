@@ -4,7 +4,7 @@ Discovers candidates from public, no-key sources:
 1. HL vaults (filter + rank by risk-adjusted return, then screen top N)
 2. Funding spreads (HL, Binance, Bybit, OKX)
 3. Open-source bots (GitHub search API)
-Outputs: out/YYYY-MM-DD.json (full data) + out/latest.md (<= 1 page summary)
+Outputs: out/YYYY-MM-DD.json (full data) + out/gate.json (PASS rows) + out/latest.md (<= 1 page summary)
 """
 import json
 import sys
@@ -15,6 +15,8 @@ import argparse
 import os
 import subprocess
 from datetime import datetime, timedelta, timezone
+
+from notify import is_gate_pass, write_gate
 
 HL_API = 'https://api.hyperliquid.xyz/info'
 HL_STATS = 'https://stats-data.hyperliquid.xyz/Mainnet'
@@ -481,7 +483,7 @@ def generate_summary(data):
     lines.append('')
     
     # PASS candidates first
-    passes = [c for c in data['hl_vaults'] if c.get('screen_result', {}).get('verdict', '').startswith('PASS') and not c.get('suspect')]
+    passes = [c for c in data['hl_vaults'] if is_gate_pass(c)]
     suspects = [c for c in data['hl_vaults'] if c.get('suspect')]
     
     if passes:
@@ -755,6 +757,9 @@ def main():
     with open(md_path, 'w') as f:
         f.write(summary)
     print(f'Wrote {md_path}')
+
+    gate_path = write_gate(out_dir, data)
+    print(f'Wrote {gate_path}')
     
     print('Discovery complete!')
     

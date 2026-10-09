@@ -82,6 +82,7 @@ NOTE lines (not fails) flag:
 
 **Outputs:**
 - `out/YYYY-MM-DD.json`: full data (all candidates, screen results, funding table, bot list, errors)
+- `out/gate.json`: machine-readable gate result (`date`, `pass_count`, `passes`). A candidate is PASS only when `screen.py` sets `gate1_pass` true and the row is not SUSPECT. The issue step reads this file, not the markdown.
 - `out/latest.md`: ≤ 1 page summary
   - PASS list first with key numbers (copy PF, beta share, net long %, MDD)
   - SUSPECT list (needs manual check): copy PF >10 or MDD <1% with <30 round trips
@@ -96,14 +97,16 @@ NOTE lines (not fails) flag:
 `.github/workflows/scout_screen.yml`
 
 - **Schedule:** cron `30 1 * * 1-5` (09:30 HKT weekdays)
-- **Manual trigger:** `workflow_dispatch`
-- **PR trigger:** runs on pull requests that touch `scout/**` or `.github/workflows/scout_screen.yml`
+- **Manual trigger:** `workflow_dispatch` with input `dry_run` (default false). `dry_run` still runs the screen and prints the issue payload; it does not open or comment on an issue.
+- **PR trigger:** runs on pull requests that touch `scout/**` or `.github/workflows/scout_screen.yml` (unit tests, then the screen). Pull requests do not open issues.
 - **Timeout:** 20 minutes
-- **Environment:** Python 3.11, only stdlib + `requests` (installed in the job, not via repo requirements.txt)
-- **On schedule/dispatch:** commits `scout/out/` back to the `scout-out` branch with `GITHUB_TOKEN` (permissions: `contents: write`, `issues: write`) using a commit message containing `[skip ci]`
-- **On pull_request:** just uploads the outputs as an artifact (no commit)
-- **On failure (schedule/dispatch):** opens a GitHub issue titled `scout screen failed <date>`
-- **No secrets, no exchange keys, no orders**
+- **Environment:** Python 3.11, only stdlib + `requests` (installed in the job, not via repo requirements.txt). The notify step is stdlib only.
+- **On schedule/dispatch:** commits `scout/out/` back to the `scout-out` branch with `GITHUB_TOKEN` (permissions: `contents: write` on the screen job, `issues: write` for the issue step) using a commit message containing `[skip ci]`
+- **On pull_request:** uploads the outputs as an artifact (no commit, no issue)
+- **PASS issue:** if `gate.json` has at least one PASS candidate, open a GitHub issue titled `Scout PASS <YYYY-MM-DD>: <N> candidate(s)`, labelled `scout-pass` (created if missing). The body is the PASS rows (name, address, copy-route PF, max drawdown, TVL, and the other gate metrics) plus links to `scout/out/latest.md` on `scout-out` and the Actions run. If an open `scout-pass` issue for that date already exists, comment on it instead of opening another.
+- **No PASS:** do nothing. No issue, no comment.
+- **Stale issue:** if the screen step fails, is cancelled, or produces no usable output, open an issue labelled `scout-stale` (same-day duplicate becomes a comment). A clean run with zero PASS candidates is not stale.
+- **No secrets, no exchange keys, no orders.** Issue writes use the built-in `GITHUB_TOKEN` only.
 
 **Rationale for `scout-out` branch:** Daily commits to `main` would trigger Railway redeploys of the live services (`cockpit`, `bx-exec`). To avoid this, the workflow pushes daily outputs to a separate branch `scout-out` instead. The PR against `main` will include the initial workflow setup, but all automated commits go to `scout-out`.
 
@@ -118,7 +121,7 @@ Current rejections:
 
 ## Workflow Integration
 
-**10:20 routine (LLM):** reads `out/latest.md` from the `scout-out` branch. If no candidates pass gate 1, one sentence to Cove. If any pass, review each (max 2 hours per candidate), then hand to Cove by 19:00 HKT.
+**10:20 routine (LLM):** reads `out/latest.md` from the `scout-out` branch. If no candidates pass gate 1, one sentence to Cove. If any pass, review each (max 2 hours per candidate), then hand to Cove by 19:00 HKT. The schedule also opens the `scout-pass` issue when there is a PASS, which is the Cove notification; a no-PASS day does not open one.
 
 **Cove:** runs IS/OOS and the month-block permutation test on candidates that pass gate 1.
 
