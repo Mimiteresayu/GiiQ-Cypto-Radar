@@ -343,6 +343,60 @@ class TestExitWorker(unittest.TestCase):
         self.assertTrue(should_exit)
         self.assertIn("1H close < 1H Lower", reason)
 
+    def test_hourly_skips_cont_staircase_sl_and_keeps_addon_align(self):
+        """Hourly tier exits skip CONT_STAIRCASE. ADD_ON still aligns its tier Hard SL."""
+        from unittest.mock import patch
+        import exit_worker
+
+        radar_1h = {"rows": [
+            {"symbol": "JUP", "close": 0.7, "lower": 0.5},
+            {"symbol": "BRETT", "close": 1.2, "lower": 0.9},
+        ]}
+        radar_4h = {"rows": [
+            {"symbol": "JUP", "close": 0.7, "filter": 0.6, "lower": 0.5},
+            {"symbol": "BRETT", "close": 1.2, "filter": 1.0, "lower": 0.8},
+        ]}
+
+        class HL:
+            def perp_state(self):
+                def pos(coin):
+                    return {"position": {"coin": coin, "szi": "10", "entryPx": "1",
+                                         "positionValue": "10", "unrealizedPnl": "0", "liquidationPx": "0.2"}}
+                return {"assetPositions": [pos("JUP"), pos("BRETT")]}
+
+            def open_orders(self):
+                return []
+
+            def meta(self):
+                return {"JUP": {"szDecimals": 1}, "BRETT": {"szDecimals": 1}}
+
+        trades = [
+            {"symbol": "JUP", "entry_type": "CONT_STAIRCASE"},
+            {"symbol": "BRETT", "entry_type": "ADD_ON"},
+        ]
+
+        def run(exit_type):
+            with patch.object(exit_worker, "_is_live_mode", return_value=False), \
+                 patch.object(exit_worker, "get_open_trades", return_value=trades), \
+                 patch.object(exit_worker, "tier_for", return_value="tiny"), \
+                 patch("hl_exec.trigger_orders_for", return_value=[]):
+                return exit_worker.check_exits(exit_type, hl=HL(), radar_1h=radar_1h, radar_4h=radar_4h)
+
+        hourly = run("hourly")
+        jup = next(h for h in hourly["holds"] if h["coin"] == "JUP")
+        self.assertIn("skips CONT_STAIRCASE", jup["reason"])
+        self.assertIn("never re-aligned", jup["sl_note"])
+        self.assertFalse(any(a.get("coin") == "JUP" for a in hourly["sl_actions"]))
+        brett = [a for a in hourly["sl_actions"] if a.get("coin") == "BRETT"]
+        self.assertEqual(len(brett), 1)
+        self.assertEqual(brett[0]["trigger"], 1.0)  # ADD_ON tiny Hard SL stays the 4H Filter
+
+        four = run("4h")
+        self.assertFalse(any(a.get("coin") == "JUP" for a in four["sl_actions"]))
+        jup4 = next(h for h in four["holds"] if h.get("coin") == "JUP")
+        self.assertIn("never re-aligned", jup4["sl_note"])
+        self.assertTrue(any(h.get("coin") == "BRETT" and h.get("reason") == "not 4H tier" for h in four["holds"]))
+
 
 class TestSizeAndLeverageBands(unittest.TestCase):
     """Test SoT size and leverage enforcement."""

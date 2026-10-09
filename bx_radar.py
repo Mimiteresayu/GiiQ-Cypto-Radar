@@ -117,6 +117,20 @@ def gc_row(symbol: str, bars: List[list], tf: str, now_ms: int, gc_fn: Callable)
         if closes[j - 1] <= gc[j - 1]["upper"] and closes[j] > gc[j]["upper"]:
             last_cross = int(closed[j][0])
             break
+    # Same CONT_STAIRCASE fields as scan_gc_radar.scan_symbol (closed bars only).
+    filter_rising_6 = None
+    bw_pct50 = None
+    if i >= 6:
+        filter_rising_6 = all(gc[i - j]["filter"] > gc[i - j - 1]["filter"] for j in range(6))
+    if i >= 60:
+        lookback_end = max(0, i - 180)
+        bw_current = (up - lo) / filt if filt > 0 else None
+        if bw_current is not None:
+            bw_history = [(gc[j]["upper"] - gc[j]["lower"]) / gc[j]["filter"]
+                          for j in range(lookback_end, i) if gc[j]["filter"] > 0]
+            if len(bw_history) >= 60:
+                bw_median = sorted(bw_history)[len(bw_history) // 2]
+                bw_pct50 = bw_current <= bw_median if bw_median > 0 else None
     return {
         "symbol": symbol, "tf": tf,
         "close": round(c, 10), "high": round(highs[i], 10), "low": round(lows[i], 10),
@@ -125,10 +139,22 @@ def gc_row(symbol: str, bars: List[list], tf: str, now_ms: int, gc_fn: Callable)
         "above_upper": c > up,
         "dual_cross_up": c > up and pc <= pup,                      # LOCKED entry math
         "dual_cross_down_filter": c < filt and pc >= pfilt,
+        "prev_close": round(pc, 10),
+        "prev_filter": round(pfilt, 10),
+        "filter_rising_6": filter_rising_6,
+        "bw_pct50": bw_pct50,
         "last_cross_up_at": last_cross,
         "bar_time": int(closed[i][0]), "bars": len(closed),
         "bx_high_max": round(max(highs), 10),
     }
+
+
+def swing_low(bars: List[list], n: int, tf: str, now_ms: int) -> Optional[float]:
+    """Lowest low of the last `n` CLOSED bars. Used for CONT_STAIRCASE SL on BX candles."""
+    closed = [b for b in bars or [] if int(b[0]) + BAR_MS[tf] <= now_ms]
+    if len(closed) < n:
+        return None
+    return min(float(b[3]) for b in closed[-n:])
 
 
 # ---------------------------------------------------------------------------------------------

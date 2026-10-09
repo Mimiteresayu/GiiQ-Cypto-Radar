@@ -310,13 +310,18 @@ def desk_sizing(approval: Optional[dict], coin_max_leverage: Any = None, tier: O
 
 def rules_summary() -> Dict[str, Any]:
     """The live BX rules as shown to the desk (/api/ai/candidates bx.rules) and in /api/bx/status."""
+    from pending_entries import cont_staircase_enabled, cont_staircase_mode
     return {"sot": "GIIQ-SoT-5", "veto": ["V1", "V2", "V3", "V5"], "approve_max": None,
             "sizing": "desk", "size_pct_range": [SIZE_PCT_MIN, SIZE_PCT_MAX], "leverage_range": [LEV_MIN, LEV_MAX],
             "default_size_pct": DEFAULT_SIZE_PCT, "default_leverage": DEFAULT_LEVERAGE,
             "leverage_cap": "never above the contract max_leverage",
             "total_margin_cap_pct_nav": BX_TOTAL_MARGIN_CAP_PCT, "total_margin_scope": "HL + BX combined",
             "max_size_of_24h_vol": MAX_SIZE_OF_VOL, "min_sl_dist_pct": MIN_SL_DIST_PCT,
-            "breaker_pct_nav": BREAKER_PCT_NAV, "fallback": "no Claude POST -> approve all at 2%/2x (RAILWAY_FALLBACK)"}
+            "breaker_pct_nav": BREAKER_PCT_NAV, "fallback": "no Claude POST -> approve all at 2%/2x (RAILWAY_FALLBACK)",
+            "cont_staircase": {"enabled": cont_staircase_enabled(), "mode": cont_staircase_mode(),
+                               "sl": "lowest low of last 12 closed 4H bars", "risk_pct_nav": 0.5,
+                               "leverage": 3, "margin_pct_clamp": [2.0, 8.0],
+                               "exit": "first 4H close < 4H Filter"}}
 
 
 # ---------------------------------------------------------------------------------------------
@@ -638,6 +643,14 @@ def check_entry(cand: dict, meta: dict, live: dict, nav: Optional[float], availa
 def exit_reason(trade: dict, row4h: Optional[dict], meta: Optional[dict], live: Optional[dict],
                 now: datetime) -> Optional[str]:
     entry_ms = _iso_ms(trade.get("entry_time"))
+    # CONT_STAIRCASE: first 4H bar that CLOSES after entry with close < Filter. No time cap, no liquidity exit.
+    if trade.get("exit_rule") == "cont_staircase_4h_filter":
+        if row4h and _f(row4h.get("close")) is not None and _f(row4h.get("filter")) is not None \
+                and row4h["close"] < row4h["filter"]:
+            bar_close = int(row4h.get("bar_time") or 0) + 4 * 3600 * 1000
+            if bar_close > entry_ms:
+                return "CONT_STAIRCASE_4h_filter"
+        return None
     if row4h and _f(row4h.get("close")) is not None and _f(row4h.get("filter")) is not None \
             and int(row4h.get("bar_time") or 0) >= entry_ms and row4h["close"] < row4h["filter"]:
         return "exit_4h_close_below_filter"
@@ -1081,8 +1094,13 @@ def run_manage(job: str, now: Optional[datetime] = None, trade_api=None, egress:
 def run_live_pending(api, conn, now, gate_ok, gate_why, meta_all, acct, nav, market, tiers_fn) -> List[dict]:
     import bx_radar
     import bx_shadow as S
-    from pending_entries import band, evaluate
+    from pending_entries import (CONT_STAIRCASE, band, cont_staircase_enabled, cont_staircase_mode,
+                                 evaluate, migrate_cont_to_staircase)
     pend = load_live_pending()
+    migrated = migrate_cont_to_staircase(pend, now)
+    if migrated:
+        save_live_pending(pend)
+        _log(f"[BX_LIVE] Migrated {len(migrated)} CONT pendings to CONT_STAIRCASE: {[e.get('id') for e in migrated]}")
     r1d = S._rows_by_symbol(bx_radar.load_radar("1d"))
     r4h = S._rows_by_symbol(bx_radar.load_radar("4h"))
     held = {t["bx_symbol"] for t in open_live_trades(conn)}
@@ -1095,13 +1113,20 @@ def run_live_pending(api, conn, now, gate_ok, gate_why, meta_all, acct, nav, mar
         action, reason, upd = evaluate(rec, bnd, mid, now, held)
         rec.update(upd)
         rec["last_check"] = now.isoformat()
+        if rec.get("kind") == CONT_STAIRCASE:
+            _log(f"[BX_LIVE] CONT_STAIRCASE {sym}: {action} ({reason[:240]})")
+            if action == "trigger" and not cont_staircase_enabled():
+                action, reason = "wait", reason + " | CONT_STAIRCASE_ENABLED=0 (not sent)"
+            elif action == "trigger" and cont_staircase_mode() != "live":
+                action, reason = "wait", reason + " | CONT_STAIRCASE_MODE=paper (not sent)"
         if action in ("expire", "cancel"):
             rec["status"] = "expired" if action == "expire" else "cancelled"
         elif action == "trigger":
             if not gate_ok:
                 reason += f" | not sent: {'; '.join(gate_why)}"
             else:
-                c = dict(rec.get("cand") or {"symbol": sym})
+                c = dict(rec.get("cand") or {})
+                c.setdefault("symbol", sym)
                 sub: Dict[str, Any] = {"skipped": [], "entered": []}
                 # the approval is the one given when the pending was created
                 if _try_enter_pending(api, conn, c, meta_all, acct, nav, now, market, tiers_fn, sub, rec):
@@ -1124,9 +1149,10 @@ def _try_enter_pending(api, conn, c, meta_all, acct, nav, now, market, tiers_fn,
     # CONT_STAIRCASE-specific logic (MMT 2026-10-08)
     from pending_entries import CONT_STAIRCASE
     if rec.get("kind") == CONT_STAIRCASE:
-        # Calculate swing-low SL for CONT_STAIRCASE
-        from exec_common import swing_low_4h_bars
-        sl = swing_low_4h_bars(c["symbol"], 12)
+        # Swing-low SL from BX 4H candles (not the HL candle feed).
+        import bx_radar
+        now_ms = int(now.timestamp() * 1000)
+        sl = bx_radar.swing_low(bx_radar.load_candles("4h").get(c["symbol"]) or [], 12, "4h", now_ms)
         if not sl or sl <= 0:
             rep["skipped"].append({"symbol": c["symbol"], "reason": "CONT_STAIRCASE: no swing low SL available"})
             return False
