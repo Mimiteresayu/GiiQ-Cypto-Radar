@@ -1,0 +1,8 @@
+{
+    "hyperliquid_01": {
+        "exchange": "hyperliquid",
+        "wallet_address": "0xYOUR_MAIN_ACCOUNT_ADDRESS",
+        "private_key": "0xYOUR_HL_API_WALLET_PRIVATE_KEY",
+        "is_vault": false
+    }
+}

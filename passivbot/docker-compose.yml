@@ -1,0 +1,22 @@
+# Local analogue of upstream `docker compose --profile live up passivbot-live`.
+#   cp api-keys.json.example api-keys.json   # fill locally, never commit
+#   docker compose --profile live up --build passivbot-live
+services:
+  passivbot-live:
+    profiles:
+      - live
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: giiq-passivbot-live:c48-1
+    container_name: giiq-passivbot-live
+    restart: "no"
+    environment:
+      PB_USER: hyperliquid_01
+      PB_API_KEYS_PATH: /data/api-keys.json
+      PB_LOG_DIR: /data/logs
+      PB_MONITOR_ROOT: /data/monitor
+    volumes:
+      - ./api-keys.json:/data/api-keys.json:ro
+      - ./data/logs:/data/logs
+      - ./data/monitor:/data/monitor
