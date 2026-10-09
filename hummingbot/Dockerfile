@@ -15,7 +15,7 @@ RUN rm -rf /home/hummingbot/logs \
     && ln -s /home/hummingbot/data/logs /home/hummingbot/logs \
     && /opt/conda/envs/hummingbot/bin/python /home/hummingbot/giiq/giiq_entrypoint.py --check-config
 
-VOLUME ["/home/hummingbot/data"]
+# Data dir is a Railway Volume mounted at /home/hummingbot/data (Railway rejects Dockerfile VOLUME).
 
 ENTRYPOINT ["/opt/conda/envs/hummingbot/bin/python", "/home/hummingbot/giiq/giiq_entrypoint.py"]
 CMD []
