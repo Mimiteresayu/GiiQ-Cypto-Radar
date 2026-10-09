@@ -22,9 +22,10 @@ R1D = radar([{"symbol": "AAA", "close": 1.0, "upper": 0.95}])
 R4H = radar([{"symbol": "AAA", "filter": 0.90, "lower": 0.80, "close": 1.0}])
 
 
-def pos(entry="0.9", size="50"):
+def pos(entry="0.9", size="50", upnl="5.0"):
+    """Position with ROE ~20% by default (upnl 5 / margin 25 = 20%)"""
     return {"coin": "AAA", "szi": size, "entryPx": entry, "liquidationPx": "0.3", "marginUsed": "25",
-            "leverage": {"type": "isolated", "value": 2}}
+            "unrealizedPnl": upnl, "leverage": {"type": "isolated", "value": 2}}
 
 
 class T(unittest.TestCase):
@@ -85,14 +86,41 @@ class T(unittest.TestCase):
         self.assertEqual([f["symbol"] for f in res["filled"]], ["AAA"])
         self.log.assert_called_once()
         n = len(hl.calls)
-        res2 = self.run_it(hl)                                         # same day again: idempotent
+        res2 = self.run_it(hl)                                         # same position again: idempotent
         self.assertEqual(len(hl.calls), n)
-        self.assertEqual(res2["skipped"][0]["reason"], "already topped up today")
+        self.assertIn("already topped up", res2["skipped"][0]["reason"])
 
     def test_stale_radar_fails_closed(self):
         old = {"ts": "2026-10-05T00:00:00+00:00", "rows": R1D["rows"]}
         res = self.run_it(self.hl(), r1d=old)
         self.assertEqual(res["status"], "fail_closed")
+    
+    def test_once_per_position_not_once_per_day(self):
+        """Top-up happens ONCE PER POSITION, not once per day (MMT 2026-10-08 follow-up).
+        A position means 'while holding the symbol'. If you hold AAA for weeks, only one top-up.
+        If you close AAA completely and re-enter, you get one more top-up."""
+        os.environ.update({"EXEC_DRY_RUN": "0", "HL_API_PRIVATE_KEY": "0x" + "1" * 64})
+        
+        # First run: top up AAA position
+        hl1 = self.hl(p=pos(entry="0.9", size="50"))
+        res1 = self.run_it(hl1)
+        self.assertEqual([f["symbol"] for f in res1["filled"]], ["AAA"])
+        
+        # Second run: still holding AAA (entry may have changed after add) -> should skip
+        hl2 = self.hl(p=pos(entry="0.95", size="90"))  # avg entry changed after add
+        res2 = self.run_it(hl2)
+        self.assertEqual(len(res2["filled"]), 0)
+        self.assertIn("already topped up", res2["skipped"][0]["reason"])
+        
+        # Third run: Closed AAA and re-entered (simulated by new HL with fresh state per symbol)
+        # In real life, when position closes, cleanup_closed_positions removes the state
+        hl3 = self.hl(p=pos(entry="0.85", size="50"))
+        # Simulate position close by manually cleaning state
+        import daily_addon as D
+        D.cleanup_closed_positions(set())  # No open positions, clears all
+        res3 = self.run_it(hl3)
+        self.assertEqual([f["symbol"] for f in res3["filled"]], ["AAA"])
+        self.assertEqual(hl3.names()[:3], ["set_leverage", "open_long_ioc", "place_stop_loss"])
 
 
 if __name__ == "__main__":

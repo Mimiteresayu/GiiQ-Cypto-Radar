@@ -2589,6 +2589,9 @@ class Handler(SimpleHTTPRequestHandler):
         if path == "/api/exec/preflight":
             self._exec_preflight()
             return
+        if path == "/api/hl/manual_entry":
+            self._hl_manual_entry()
+            return
         if path == "/api/jobs/run":
             # Password-gated manual trigger. executor/exit workers are FORCED DRY_RUN here.
             if self._need_auth():
@@ -2986,6 +2989,65 @@ class Handler(SimpleHTTPRequestHandler):
             return
         self._send_json(200, {"ok": res.get("status") in ("success", "fail_closed"), "date": today, "result": res})
 
+    def _hl_manual_entry(self) -> None:
+        """POST /api/hl/manual_entry (X-AI-Key header ONLY): Manual LONG entry for HL.
+        Body: {"symbol": "BTC", "size_pct": 3.0, "leverage": 4, "sl_override": 42000.0, "dry_run": true}.
+        dry_run defaults to true. Same fail-closed checks as executor. Logged as MANUAL."""
+        # Reject query param auth, only accept X-AI-Key header
+        key_header = self.headers.get("X-AI-Key") or ""
+        if "key=" in self.path:
+            self._send_json(403, {"ok": False, "error": "authentication via ?key= query param not allowed"})
+            return
+        if not AI_DECISION_KEY:
+            self._send_json(404, {"ok": False, "error": "AI endpoints disabled"})
+            return
+        if not key_header or not hmac.compare_digest(key_header, AI_DECISION_KEY):
+            self._send_json(403, {"ok": False, "error": "forbidden"})
+            return
+        
+        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            body = json.loads((self.rfile.read(length) if length else b"{}").decode() or "{}")
+        except Exception:
+            self._send_json(400, {"ok": False, "error": "invalid json"})
+            return
+        
+        symbol = str((body or {}).get("symbol") or "")
+        if not symbol:
+            self._send_json(400, {"ok": False, "error": "symbol required"})
+            return
+        
+        try:
+            size_pct = float(body.get("size_pct") or 0)
+            leverage = int(body.get("leverage") or 0)
+        except (TypeError, ValueError):
+            self._send_json(400, {"ok": False, "error": "size_pct and leverage must be numbers"})
+            return
+        
+        sl_override = body.get("sl_override")
+        if sl_override is not None:
+            try:
+                sl_override = float(sl_override)
+            except (TypeError, ValueError):
+                self._send_json(400, {"ok": False, "error": "sl_override must be a number"})
+                return
+        
+        dry_run = body.get("dry_run")
+        if dry_run is None:
+            dry_run = True
+        
+        import manual_order
+        result = manual_order.manual_entry_hl(
+            symbol=symbol,
+            size_pct=size_pct,
+            leverage=leverage,
+            sl_override=sl_override,
+            dry_run=dry_run
+        )
+        
+        status_code = 200 if result.get("ok") else 400
+        self._send_json(status_code, result)
+    
     def _bx_run(self) -> None:
         """POST /api/bx/run (keyed, X-AI-Key): manual Bitunix entry run for the listed symbols only.
         Body {"confirm": true, "symbols": ["BRUSDT"]}. Forwarded to bx-exec, which applies the same gates as the
